@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NoIDE",
+  "version": "0.1.0",
+  "identifier": "com.opsync.noide",
+  "build": {
+    "beforeDevCommand": {
+      "cwd": "../ui",
+      "script": "./scripts/trunk-dev.sh"
+    },
+    "devUrl": "http://127.0.0.1:1430",
+    "beforeBuildCommand": {
+      "cwd": "../ui",
+      "script": "./scripts/trunk-build.sh"
+    },
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "NoIDE",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "decorations": true,
+        "visible": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png"]
+  }
+}

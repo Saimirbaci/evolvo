@@ -1,0 +1,13 @@
+[build]
+target = "index.html"
+dist = "dist"
+public_url = "/"
+
+[serve]
+port = 1430
+open = false
+addresses = ["127.0.0.1"]
+disable_address_lookup = true
+
+[watch]
+ignore = ["../src-tauri"]

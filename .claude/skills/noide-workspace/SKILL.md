@@ -1,0 +1,104 @@
+---
+name: noide-workspace
+description: Inspect, synthesize, or reset the local NoIDE workspace at ~/.noide/noide_workspace/ (or $NOIDE_WORKSPACE_ROOT). Use when the user asks to "seed test feedback", "show what's in the workspace", "reset the workspace", "create a fixture workspace", or needs to reason about the on-disk state of feedback/sandbox jobs/attachments.
+---
+
+# NoIDE Workspace Skill
+
+The NoIDE workspace is a directory of JSON files. This skill is the map.
+
+## Where it is
+
+```
+${NOIDE_WORKSPACE_ROOT:-$HOME/.noide/noide_workspace}/
+├── feedback/            {id}.json
+├── sandbox_jobs/        {id}.json
+└── attachments/{feedback_id}/
+    ├── canvas.png
+    ├── paste-N.png
+    └── voice.{webm|ogg|m4a|wav}
+```
+
+IDs: `feedback` → `fb-<unix_ms>`. Sandbox jobs → whatever `sandbox.rs` generates (check there, don't assume).
+
+## Schemas
+
+All JSON uses **camelCase** keys. Authoritative definitions: `app/src-tauri/src/types.rs`.
+
+Minimum valid `FeedbackRecord`:
+
+```json
+{
+  "id": "fb-1000",
+  "feedbackType": "bug",
+  "status": "new",
+  "pageRoute": "/",
+  "feedbackText": "example",
+  "windowWidth": 1024,
+  "windowHeight": 768,
+  "createdAtUnixMs": 1000,
+  "updatedAtUnixMs": 1000
+}
+```
+
+Missing optional fields (`annotations`, `pastedImages`, `screenshotFilename`, `voiceFilename`, `voiceTranscript`, `sandboxJobId`) are tolerated on decode — see the `tolerates_extra_fields` test.
+
+Minimum valid `SandboxJobRecord`:
+
+```json
+{
+  "id": "job-1",
+  "feedbackId": "fb-1000",
+  "title": "Fix",
+  "summary": "Summary",
+  "status": "pending",
+  "notes": [],
+  "createdAtUnixMs": 0,
+  "updatedAtUnixMs": 0
+}
+```
+
+Enums (snake_case wire values):
+- `feedbackType`: `bug | feature_request | improvement | confusion | compliment`
+- `status` (feedback): `new | triaged | in_sandbox | resolved | rejected`
+- `status` (sandbox job): `pending | triaging | planned | implementing | build_ready | merging | promoted | rejected | failed`
+
+## Common operations
+
+### Inspect
+
+```bash
+WS="${NOIDE_WORKSPACE_ROOT:-$HOME/.noide/noide_workspace}"
+ls "$WS/feedback" 2>/dev/null | wc -l
+for f in "$WS/feedback"/*.json; do
+  jq -r '[.id, .status, .feedbackType, .pageRoute] | @tsv' "$f"
+done
+```
+
+### Seed a fixture workspace
+
+Use a throwaway path via `NOIDE_WORKSPACE_ROOT`, never the real `~/.noide/noide_workspace`:
+
+```bash
+export NOIDE_WORKSPACE_ROOT="$(mktemp -d)/noide"
+mkdir -p "$NOIDE_WORKSPACE_ROOT/feedback" "$NOIDE_WORKSPACE_ROOT/sandbox_jobs"
+# write a minimum-valid FeedbackRecord as above
+```
+
+### Reset
+
+Destructive — always confirm with the user first. Prefer a fresh `$NOIDE_WORKSPACE_ROOT` over `rm -rf`.
+
+## Rules
+
+- **Never `rm -rf`** a workspace without explicit user confirmation in the current turn.
+- **Never edit feedback JSON to rewrite what a user wrote** — status/updatedAtUnixMs/sandboxJobId only.
+- **Never introduce new filenames** in `attachments/` that wouldn't pass `sanitise_filename` (keep to `[A-Za-z0-9._-]`).
+- **Never add a new top-level directory** under the workspace without updating `WorkspaceLayout::directories()` in `store.rs` — the `init_workspace` call creates exactly that set.
+- **Never hardcode `~/.noide`** outside `store::default_workspace_root()`.
+
+## When to escalate
+
+- Schema changes → `staff-architect-self-evolving-software`
+- Attachment-handling changes → `staff-architect-self-evolving-software` (security boundary)
+- `jq`-based bulk edits to a workspace → refuse; route through Tauri commands so the user can replay.

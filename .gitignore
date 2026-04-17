@@ -1,0 +1,10 @@
+target/
+dist/
+.tools/
+.env
+workspace/
+*.log
+
+# Tauri-generated
+app/src-tauri/gen/schemas/
+
