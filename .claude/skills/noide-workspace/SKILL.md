@@ -7,6 +7,17 @@ description: Inspect, synthesize, or reset the local NoIDE workspace at ~/.noide
 
 The NoIDE workspace is a directory of JSON files. This skill is the map.
 
+## Product invariants (always hold)
+
+Authoritative text: `.claude/rules/common/product-invariants.md`.
+
+- **I-P1.** Sandbox pipeline is permanent — never delete `sandbox_jobs/` wholesale, never "flatten" it into `feedback/`.
+- **I-P2.** Feedback Overlay is always reachable — workspace shape must never encode a "feedback disabled" state.
+- **I-P3.** The drawing board is always reachable — canvas attachments (`attachments/{id}/canvas.png`) are one concrete artifact of this, but the product guarantee is the affordance, not the file.
+- **I-P4.** Sandboxes are saveable and forkable into another app. A workspace — or a subset of it scoped to one sandbox job plus its feedback and attachments — must be exportable as a self-contained bundle that can seed a new NoIDE app under a fresh `NOIDE_WORKSPACE_ROOT`. Never synthesize workspace data with host-absolute paths or machine-specific identifiers that would block this.
+
+When seeding fixtures or proposing layout changes, verify all four hold.
+
 ## Where it is
 
 ```

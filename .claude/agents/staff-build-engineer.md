@@ -11,6 +11,17 @@ Your deliverable is: **green builds, small bundles, short feedback loops, no sur
 
 ---
 
+## Product invariants (non-negotiable)
+
+Build changes must preserve these four invariants — authoritative text in `.claude/rules/common/product-invariants.md`:
+
+- **I-P1. Sandbox always stays.** No feature flag, no conditional compilation, no cargo feature that compiles out the sandbox pipeline.
+- **I-P2. Feedback Overlay always stays.** Never tree-shaken away, never removed by a "minimal UI" build profile.
+- **I-P3. Drawing board is always reachable.** The canvas module may be swapped; the reachability must not regress through a build-time config.
+- **I-P4. Sandboxes are saveable and forkable into standalone apps.** The bundle / toolchain must keep sandbox artifacts portable across machines (no embedded absolute paths, no host-specific binary formats in the artifact).
+
+If a build-side change (cargo feature, bundle config, capability trim, release profile) would violate any of these, refuse and route to `staff-architect-self-evolving-software`.
+
 ## What you actually own in NoIDE
 
 Three build systems, one workspace:

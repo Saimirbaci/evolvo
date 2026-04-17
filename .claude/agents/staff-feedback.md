@@ -49,6 +49,17 @@ There is no `priority`, no `duplicate_count`, no `resolution_note` field. If you
 
 ---
 
+## Product invariants (non-negotiable)
+
+Before anything else, these four invariants always hold — see `.claude/rules/common/product-invariants.md` for the authoritative text:
+
+- **I-P1. Sandbox always stays.** The feedback → sandbox-job pipeline is permanent. A fix must never remove, bypass, or silently no-op it.
+- **I-P2. Feedback Overlay always stays.** The in-app feedback surface is reachable from every screen. A fix that hides it on some route is wrong.
+- **I-P3. The drawing board is always reachable.** The canvas *implementation* may be rewritten or replaced; the *affordance* (get back to a blank drawing surface at any time) must always exist.
+- **I-P4. Sandboxes are saveable and forkable into standalone apps.** Sandbox state is persistable as a self-contained, portable artifact that can be renamed / cloned into a new app.
+
+If a feedback row asks for something that would break any of these, it's not in your lane — close with a `WONT_FIX:` note explaining which invariant it collides with, or escalate to `staff-architect-self-evolving-software` if the user seems to want a policy change.
+
 ## Your Working Protocol
 
 ### Step 0 — Orient

@@ -36,6 +36,20 @@ Today the pipeline is **observational** — transitions are driven by explicit u
 
 ---
 
+## Product invariants (non-negotiable — outrank everything below)
+
+These are product-level invariants. They are the outer ring of your invariant system — I1–I7 below operate *inside* them. Authoritative text: `.claude/rules/common/product-invariants.md`.
+
+- **I-P1. Sandbox always stays.** Every design you sign off on preserves the sandbox pipeline as a first-class, non-removable feature.
+- **I-P2. Feedback Overlay always stays.** The in-app feedback surface is reachable from every screen, in every mode, across every proposed rewrite.
+- **I-P3. The drawing board is always reachable.** The canvas *code* is replaceable at will — the *affordance* to return to a blank drawing surface at any time is not.
+- **I-P4. Sandboxes are saveable and forkable into standalone apps.** A user can save a sandbox and rename / clone it into a new NoIDE-shaped app with its own identity. This is a load-bearing product capability, not a future feature. Design choices around storage, IDs, state machine, and capabilities must keep it implementable:
+  - Sandbox artifacts are self-contained (jobs + the feedback rows that fed them + their attachments), serialised in a portable shape.
+  - No host-absolute paths, no embedded workspace roots, no single-machine identifiers inside the artifact.
+  - Forking mints a new app identity (new workspace root, new bundle identifier if bundled) — it never mutates the parent.
+
+If a proposal collides with any of these, you reject it — even if I1–I7 would otherwise be satisfiable. These are the contract with the user.
+
 ## Invariants you enforce
 
 These are non-negotiable. Every design document, code change, and capability addition is measured against them.

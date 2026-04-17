@@ -109,6 +109,17 @@ app/ui/src/
 - Canvas pastes/screenshots go through the clipboard + canvas→PNG path; the base64 encode happens in WASM before `submit_feedback`. Large images will dominate the IPC payload — keep attachments sane (soft-cap at a few MB).
 - `.noide/noide_workspace/` is outside the repo. Use `NOIDE_WORKSPACE_ROOT` to point at a temp dir for reproducible runs.
 
+## Product invariants (read this first)
+
+See `.claude/rules/common/product-invariants.md` for authoritative text. In short:
+
+- **Sandbox always stays.** The feedback → sandbox-job pipeline is permanent.
+- **Feedback Overlay always stays.** Reachable from every screen, every mode.
+- **The drawing board is always reachable.** The canvas module may be rewritten or replaced; the affordance to return to a blank drawing surface must always exist.
+- **Sandboxes are saveable and forkable into standalone apps.** Sandbox state is a portable, self-contained artifact that can be renamed / cloned into a new NoIDE-shaped app with its own identity.
+
+These outrank refactor aesthetics and most feature requests. Changes that violate them are product decisions — escalate.
+
 ## Rules & agents
 
 Project rules live under `.claude/rules/` — read them before editing:
