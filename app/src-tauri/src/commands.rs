@@ -298,6 +298,48 @@ pub fn retry_sandbox_job(
     start_implementation_run(&store, &engine, &refreshed)
 }
 
+/// Launch the app built in a sandbox job's worktree. Only valid after the
+/// job has reached a state where a worktree exists and the agent has
+/// finished writing code (see `SandboxJobStatus::can_run`). The spawned
+/// process runs in the background with its own `NOIDE_WORKSPACE_ROOT` so it
+/// cannot see or mutate the host NoIDE's workspace.
+#[tauri::command]
+pub fn run_sandbox_job(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<SandboxJobRecord, String> {
+    let store = state.store();
+    let engine = SandboxEngine::new(&store);
+
+    let job = store
+        .load_sandbox_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("sandbox job not found: {}", payload.id))?;
+
+    if !job.status.can_run() {
+        return Err(format!(
+            "job {} is in status {:?} — Advance it first before running the iteration",
+            job.id, job.status
+        ));
+    }
+    if job.worktree_path.is_none() {
+        return Err(format!(
+            "job {} has no worktree yet — Advance it first",
+            job.id
+        ));
+    }
+
+    let _ = engine.append_note(&job.id, "run requested — spawning iteration app");
+    runner::launch_iteration_run(store.clone(), job.id.clone());
+
+    // Return the current record (with the note appended) so the UI can
+    // refresh without a second round-trip.
+    store
+        .load_sandbox_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("sandbox job disappeared after run: {}", payload.id))
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotePayload {

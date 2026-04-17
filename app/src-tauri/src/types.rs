@@ -79,6 +79,14 @@ impl SandboxJobStatus {
     pub fn can_retry(self) -> bool {
         matches!(self, Self::Failed | Self::Implementing)
     }
+
+    /// Launching the built iteration only makes sense once the agent has
+    /// finished writing code to the worktree — i.e. `BuildReady` (default
+    /// after a successful Advance) or `Promoted` (after a reviewer approved
+    /// it). `Merging` counts too since the worktree is intact.
+    pub fn can_run(self) -> bool {
+        matches!(self, Self::BuildReady | Self::Merging | Self::Promoted)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

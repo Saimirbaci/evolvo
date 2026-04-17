@@ -274,9 +274,11 @@ fn SandboxPage() -> impl IntoView {
 fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView {
     let can_approve = record.status.can_approve();
     let can_retry = record.status.can_retry();
+    let can_run = record.status.can_run() && record.worktree_path.is_some();
     let approve_id = record.id.clone();
     let reject_id = record.id.clone();
     let retry_id = record.id.clone();
+    let run_id = record.id.clone();
     let approve_click = move |_| {
         let id = approve_id.clone();
         spawn_local(async move {
@@ -295,6 +297,13 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
         let id = retry_id.clone();
         spawn_local(async move {
             let _ = interop::retry_sandbox_job(&id).await;
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+    let run_click = move |_| {
+        let id = run_id.clone();
+        spawn_local(async move {
+            let _ = interop::run_sandbox_job(&id).await;
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
@@ -370,6 +379,14 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
                     on:click=approve_click
                 >
                     "Advance"
+                </button>
+                <button
+                    class="secondary-btn"
+                    prop:disabled=!can_run
+                    on:click=run_click
+                    title="Launch the app built in this iteration's worktree"
+                >
+                    "Run"
                 </button>
             </div>
         </div>

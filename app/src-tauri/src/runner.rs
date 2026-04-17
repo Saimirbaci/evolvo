@@ -35,6 +35,9 @@ const INPUTS_DIR: &str = "inputs";
 const LOG_FILE: &str = "claude.log";
 const PROMPT_FILE: &str = "prompt.md";
 const METADATA_FILE: &str = "run.json";
+const RUN_LOG_FILE: &str = "iteration-run.log";
+const RUN_WORKSPACE_DIR: &str = "run_workspace";
+const DEFAULT_RUN_SCRIPT: &str = "scripts/run-iteration.sh";
 
 /// Locate the NoIDE source repo that should be forked into the sandbox.
 pub fn resolve_source_repo() -> Option<PathBuf> {
@@ -323,6 +326,18 @@ Because future iterations rely on the repo's own documentation for context, any 
 - `.claude/skills/*` (if present) — same treatment: keep them accurate or remove them.
 
 The next iteration's agent will read these files first. Leaving them stale is the single biggest way to sabotage iteration N+1.
+
+## Keep the iteration runnable — `scripts/run-iteration.sh`
+
+The reviewer UI has a **Run** button that launches the app built in this iteration's worktree. It invokes `scripts/run-iteration.sh` at the worktree root if present, otherwise falls back to `cargo tauri dev` in `app/src-tauri`.
+
+If you rewrite the stack (e.g. move off Tauri/Leptos) you MUST create or update `scripts/run-iteration.sh` so the Run button still works. The script should:
+
+- Start the current app in the foreground (the runner streams its stdout/stderr into a log file).
+- Respect `NOIDE_WORKSPACE_ROOT` if the app stores any state — the runner sets that env var to a per-iteration workspace directory so runs stay isolated from the host NoIDE.
+- Exit non-zero on startup failure so the reviewer sees a useful error in the sandbox notes.
+
+If you kept the default stack, you can skip the script and rely on the `cargo tauri dev` fallback.
 "#,
     )
 }
@@ -586,6 +601,152 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
     });
 }
 
+pub fn iteration_run_log_path(workspace_root: &Path, job_id: &str) -> PathBuf {
+    job_workspace_dir(workspace_root, job_id).join(RUN_LOG_FILE)
+}
+
+pub fn iteration_run_workspace(workspace_root: &Path, job_id: &str) -> PathBuf {
+    job_workspace_dir(workspace_root, job_id).join(RUN_WORKSPACE_DIR)
+}
+
+/// What command to execute when the reviewer clicks "Run" on a completed
+/// iteration. We prefer `scripts/run-iteration.sh` at the worktree root so
+/// the agent can rewrite the stack freely and still expose a stable entry
+/// point. If the script isn't there, fall back to `cargo tauri dev` against
+/// the default NoIDE shell location (`app/src-tauri`).
+pub struct ResolvedRunCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub source: &'static str,
+}
+
+pub fn resolve_run_command(worktree: &Path) -> ResolvedRunCommand {
+    let script = worktree.join(DEFAULT_RUN_SCRIPT);
+    if script.exists() {
+        return ResolvedRunCommand {
+            program: "bash".into(),
+            args: vec![script.display().to_string()],
+            cwd: worktree.to_path_buf(),
+            source: "scripts/run-iteration.sh",
+        };
+    }
+    ResolvedRunCommand {
+        program: "cargo".into(),
+        args: vec!["tauri".into(), "dev".into()],
+        cwd: worktree.join("app").join("src-tauri"),
+        source: "cargo tauri dev (fallback)",
+    }
+}
+
+/// Spawn the iteration's app from its sandbox worktree and stream output to
+/// `iteration-run.log` under the job workspace. Fire-and-forget: the call
+/// returns as soon as the child is handed off to a dedicated thread; the
+/// status the user sees in the UI reflects the sandbox state machine, not
+/// the run process itself. The child gets its own `NOIDE_WORKSPACE_ROOT`
+/// pointed at the per-job `run_workspace/` dir so it can't clobber the host
+/// NoIDE's feedback / sandbox data.
+pub fn launch_iteration_run(store: Store, job_id: String) {
+    std::thread::spawn(move || {
+        let engine = SandboxEngine::new(&store);
+
+        let Some(job) = store.load_sandbox_job(&job_id).ok().flatten() else {
+            let _ = engine.append_note(&job_id, "run requested but sandbox job record is missing");
+            return;
+        };
+        let Some(worktree_str) = job.worktree_path.clone() else {
+            let _ = engine.append_note(
+                &job_id,
+                "run requested but this job has no worktree yet — advance it first",
+            );
+            return;
+        };
+        let worktree = PathBuf::from(&worktree_str);
+        if !worktree.exists() {
+            let _ = engine.append_note(
+                &job_id,
+                &format!("run requested but worktree is gone: {worktree_str}"),
+            );
+            return;
+        }
+
+        let root = store.layout().root().to_path_buf();
+        let log_path = iteration_run_log_path(&root, &job_id);
+        let run_workspace = iteration_run_workspace(&root, &job_id);
+        let _ = fs::create_dir_all(&run_workspace);
+
+        let log_handle = match fs::File::create(&log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = engine.append_note(
+                    &job_id,
+                    &format!("failed to open run log {}: {e}", log_path.display()),
+                );
+                return;
+            }
+        };
+        let log_for_err = match log_handle.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = engine.append_note(
+                    &job_id,
+                    &format!("failed to clone run log handle: {e}"),
+                );
+                return;
+            }
+        };
+
+        let cmd = resolve_run_command(&worktree);
+        let _ = engine.append_note(
+            &job_id,
+            &format!(
+                "launching iteration run via {} ({} {}) in {} — log {}",
+                cmd.source,
+                cmd.program,
+                cmd.args.join(" "),
+                cmd.cwd.display(),
+                log_path.display(),
+            ),
+        );
+
+        let status = Command::new(&cmd.program)
+            .args(&cmd.args)
+            .current_dir(&cmd.cwd)
+            .env("NOIDE_WORKSPACE_ROOT", &run_workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_handle))
+            .stderr(Stdio::from(log_for_err))
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                let _ = engine.append_note(
+                    &job_id,
+                    &format!("iteration run exited cleanly — see {}", log_path.display()),
+                );
+            }
+            Ok(s) => {
+                let _ = engine.append_note(
+                    &job_id,
+                    &format!(
+                        "iteration run exited with status {s} — see {}",
+                        log_path.display()
+                    ),
+                );
+            }
+            Err(e) => {
+                let _ = engine.append_note(
+                    &job_id,
+                    &format!(
+                        "failed to launch iteration run ({e}) — ensure `{}` is installed and in PATH",
+                        cmd.program
+                    ),
+                );
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +885,33 @@ mod tests {
         assert!(prompt.contains("Iteration: `10`"));
         assert!(prompt.contains("Maturation phase"));
         assert!(prompt.contains("minimal, focused change"));
+    }
+
+    #[test]
+    fn resolve_run_command_prefers_iteration_script_when_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().to_path_buf();
+        fs::create_dir_all(worktree.join("scripts")).unwrap();
+
+        // Without the script, we fall back to cargo tauri dev.
+        let fallback = resolve_run_command(&worktree);
+        assert_eq!(fallback.program, "cargo");
+        assert_eq!(fallback.args, vec!["tauri".to_string(), "dev".to_string()]);
+        assert!(fallback.cwd.ends_with("app/src-tauri"));
+
+        // With the script present, we prefer it.
+        fs::write(worktree.join("scripts").join("run-iteration.sh"), b"#!/bin/sh\n").unwrap();
+        let chosen = resolve_run_command(&worktree);
+        assert_eq!(chosen.program, "bash");
+        assert!(chosen.args[0].ends_with("scripts/run-iteration.sh"));
+        assert_eq!(chosen.cwd, worktree);
+    }
+
+    #[test]
+    fn iteration_run_log_path_nests_under_job_workspace() {
+        let root = PathBuf::from("/tmp/ws");
+        let p = iteration_run_log_path(&root, "job-7");
+        assert!(p.ends_with("sandbox_workspaces/job-7/iteration-run.log"));
     }
 
     #[test]
