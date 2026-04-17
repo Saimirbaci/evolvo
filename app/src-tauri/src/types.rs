@@ -86,6 +86,23 @@ pub struct SandboxJobRecord {
     pub notes: Vec<String>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+    /// Set once the sandbox pipeline has forked the source repo into a
+    /// worktree for this job. Stored as an absolute path string so the UI
+    /// can display it; not used for path resolution on the backend.
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    /// Branch name inside the source repo that the worktree was checked
+    /// out to (e.g. `sandbox/job-1700000000000`).
+    #[serde(default)]
+    pub branch_name: Option<String>,
+    /// Absolute path to the `claude.log` file that captures the agent's
+    /// stdout + stderr. Useful for displaying a tail in the UI.
+    #[serde(default)]
+    pub log_path: Option<String>,
+    /// Absolute path of the source repo that was forked. Helps reviewers
+    /// understand where the worktree came from.
+    #[serde(default)]
+    pub source_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

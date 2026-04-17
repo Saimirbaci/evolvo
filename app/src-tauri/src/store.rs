@@ -331,6 +331,10 @@ mod tests {
             notes: vec![],
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
+            worktree_path: None,
+            branch_name: None,
+            log_path: None,
+            source_repo: None,
         };
         store.save_sandbox_job(&job).unwrap();
         assert_eq!(store.list_sandbox_jobs().unwrap().len(), 1);

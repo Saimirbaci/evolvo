@@ -128,6 +128,14 @@ pub struct SandboxJobRecord {
     pub notes: Vec<String>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub branch_name: Option<String>,
+    #[serde(default)]
+    pub log_path: Option<String>,
+    #[serde(default)]
+    pub source_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

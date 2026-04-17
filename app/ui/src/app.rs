@@ -289,6 +289,12 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
+
+    let branch = record.branch_name.clone();
+    let worktree = record.worktree_path.clone();
+    let log = record.log_path.clone();
+    let notes = record.notes.clone();
+
     view! {
         <div class="list-card">
             <div class="list-card-head">
@@ -297,6 +303,39 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
             </div>
             <div class="list-card-meta">{format_time(record.created_at_unix_ms)}</div>
             <div class="list-card-body">{record.summary.clone()}</div>
+
+            {match branch {
+                Some(b) => view! {
+                    <div class="list-card-meta"><strong>"branch: "</strong>{b}</div>
+                }.into_any(),
+                None => view! { <span></span> }.into_any(),
+            }}
+            {match worktree {
+                Some(w) => view! {
+                    <div class="list-card-meta"><strong>"worktree: "</strong><code>{w}</code></div>
+                }.into_any(),
+                None => view! { <span></span> }.into_any(),
+            }}
+            {match log {
+                Some(l) => view! {
+                    <div class="list-card-meta"><strong>"log: "</strong><code>{l}</code></div>
+                }.into_any(),
+                None => view! { <span></span> }.into_any(),
+            }}
+
+            {if notes.is_empty() {
+                view! { <span></span> }.into_any()
+            } else {
+                view! {
+                    <details class="list-card-notes">
+                        <summary>{format!("Activity ({} entries)", notes.len())}</summary>
+                        <ul>
+                            {notes.into_iter().map(|n| view! { <li>{n}</li> }).collect_view()}
+                        </ul>
+                    </details>
+                }.into_any()
+            }}
+
             <div class="list-card-actions">
                 <button class="secondary-btn" on:click=reject_click>"Reject"</button>
                 <button

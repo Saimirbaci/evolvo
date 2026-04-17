@@ -1,12 +1,13 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tauri::State;
 
+use crate::runner;
 use crate::sandbox::{SandboxEngine, Transition};
 use crate::state::AppState;
 use crate::store::StoreError;
 use crate::types::{
     current_time_unix_ms, AppHealth, EntityIdPayload, FeedbackRecord, FeedbackStatus,
-    SandboxJobRecord, SubmitFeedbackPayload,
+    SandboxJobRecord, SandboxJobStatus, SubmitFeedbackPayload,
 };
 
 const APP_NAME: &str = "NoIDE";
@@ -169,6 +170,16 @@ pub fn load_sandbox_job(
         .map_err(store_error)
 }
 
+/// "Advance" button entry point. Behaviour depends on the job's current
+/// status:
+/// - `Pending` → fork the source repo into a sandbox worktree, spawn
+///   `claude -p … --permission-mode acceptEdits` in it, and return with
+///   status `Implementing`. The run continues on a background thread;
+///   the job will flip to `BuildReady` or `Failed` when claude exits.
+/// - `BuildReady` → advance to `Promoted` via the regular state machine
+///   (merging back to main is out of scope for this step).
+/// - anything else → the normal state-machine transition, which will
+///   surface an error if invalid.
 #[tauri::command]
 pub fn approve_sandbox_job(
     state: State<'_, AppState>,
@@ -176,9 +187,56 @@ pub fn approve_sandbox_job(
 ) -> Result<SandboxJobRecord, String> {
     let store = state.store();
     let engine = SandboxEngine::new(&store);
-    engine
-        .transition(&payload.id, Transition::Approve)
-        .map_err(store_error)
+
+    let job = store
+        .load_sandbox_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("sandbox job not found: {}", payload.id))?;
+    match job.status {
+        SandboxJobStatus::Pending => start_implementation_run(&store, &engine, &job),
+        _ => engine
+            .transition(&payload.id, Transition::Approve)
+            .map_err(store_error),
+    }
+}
+
+fn start_implementation_run(
+    store: &crate::store::Store,
+    engine: &SandboxEngine<'_>,
+    job: &SandboxJobRecord,
+) -> Result<SandboxJobRecord, String> {
+    // Must have the linked feedback to build a useful prompt.
+    let feedback = store
+        .load_feedback(&job.feedback_id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("feedback {} not found for job {}", job.feedback_id, job.id))?;
+
+    let prepared = runner::prepare_run(store, job, &feedback).map_err(|e| {
+        // Record the failure on the job so the reviewer sees why nothing
+        // happened, then surface the error to the frontend.
+        let msg = store_error(e);
+        let _ = engine.append_note(&job.id, &format!("failed to prepare run: {msg}"));
+        let _ = engine.force_status(&job.id, SandboxJobStatus::Failed);
+        msg
+    })?;
+
+    // Persist artifact paths + flip to Implementing BEFORE spawning the
+    // background thread so the UI reflects reality if the process crashes.
+    let _ = engine
+        .set_run_artifacts(
+            &job.id,
+            prepared.worktree.display().to_string(),
+            prepared.branch.clone(),
+            prepared.log_file.display().to_string(),
+            prepared.source_repo.display().to_string(),
+        )
+        .map_err(store_error)?;
+    let updated = engine
+        .force_status(&job.id, SandboxJobStatus::Implementing)
+        .map_err(store_error)?;
+
+    runner::launch_claude(store.clone(), job.id.clone(), prepared);
+    Ok(updated)
 }
 
 #[tauri::command]

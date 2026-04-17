@@ -84,6 +84,10 @@ impl<'a> SandboxEngine<'a> {
             notes: Vec::new(),
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
+            worktree_path: None,
+            branch_name: None,
+            log_path: None,
+            source_repo: None,
         };
         self.store.save_sandbox_job(&job)?;
 
@@ -126,6 +130,48 @@ impl<'a> SandboxEngine<'a> {
             job.updated_at_unix_ms = current_time_unix_ms();
             self.store.save_sandbox_job(&job)?;
         }
+        Ok(job)
+    }
+
+    /// Unconditional status write for the async runner. The `transition`
+    /// path enforces the human-review state machine; this one is reserved
+    /// for machine-driven transitions (claude started / finished / failed)
+    /// and must only be called from trusted paths.
+    pub fn force_status(
+        &self,
+        job_id: &str,
+        status: SandboxJobStatus,
+    ) -> Result<SandboxJobRecord, StoreError> {
+        let mut job = self
+            .store
+            .load_sandbox_job(job_id)?
+            .ok_or_else(|| format!("sandbox job not found: {job_id}"))?;
+        job.status = status;
+        job.updated_at_unix_ms = current_time_unix_ms();
+        self.store.save_sandbox_job(&job)?;
+        Ok(job)
+    }
+
+    /// Record the worktree / branch / log / source paths produced by the
+    /// runner when a job first enters `Implementing`.
+    pub fn set_run_artifacts(
+        &self,
+        job_id: &str,
+        worktree_path: String,
+        branch_name: String,
+        log_path: String,
+        source_repo: String,
+    ) -> Result<SandboxJobRecord, StoreError> {
+        let mut job = self
+            .store
+            .load_sandbox_job(job_id)?
+            .ok_or_else(|| format!("sandbox job not found: {job_id}"))?;
+        job.worktree_path = Some(worktree_path);
+        job.branch_name = Some(branch_name);
+        job.log_path = Some(log_path);
+        job.source_repo = Some(source_repo);
+        job.updated_at_unix_ms = current_time_unix_ms();
+        self.store.save_sandbox_job(&job)?;
         Ok(job)
     }
 }

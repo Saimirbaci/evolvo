@@ -482,6 +482,41 @@ button {
   margin-top: 4px;
 }
 
+.list-card-meta code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: rgba(15, 23, 42, 0.05);
+  padding: 1px 6px;
+  border-radius: 4px;
+  word-break: break-all;
+}
+
+.list-card-notes {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.list-card-notes summary {
+  cursor: pointer;
+  padding: 4px 0;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.list-card-notes ul {
+  margin: 6px 0 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.list-card-notes li {
+  line-height: 1.4;
+}
+
 .empty-state {
   color: var(--muted);
   font-size: 14px;
