@@ -8,6 +8,7 @@ const WORKSPACE_DIR_NAME: &str = "noide_workspace";
 const FEEDBACK_DIR: &str = "feedback";
 const SANDBOX_JOBS_DIR: &str = "sandbox_jobs";
 const ATTACHMENTS_DIR: &str = "attachments";
+const ITERATION_FILE: &str = "iteration.json";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -169,6 +170,31 @@ impl Store {
 
     pub fn list_sandbox_jobs(&self) -> Result<Vec<SandboxJobRecord>, StoreError> {
         list_json_entities::<SandboxJobRecord>(&self.layout.sandbox_jobs_dir())
+    }
+
+    /// Allocate the next iteration number for this workspace. The counter is
+    /// stored in `iteration.json` at the workspace root as
+    /// `{"nextIteration": N}`. A fresh workspace returns `1` on first call
+    /// and increments monotonically thereafter. Reads-modify-writes are not
+    /// concurrency-safe — the pipeline serialises on the Tauri invoke thread,
+    /// so that's fine for now; if that ever changes, wrap in a file lock.
+    pub fn allocate_iteration(&self) -> Result<u32, StoreError> {
+        self.init_workspace()?;
+        let path = self.layout.root.join(ITERATION_FILE);
+        let current: u32 = if path.exists() {
+            let bytes = fs::read(&path)?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            v.get("nextIteration")
+                .and_then(|x| x.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let next = current.saturating_add(1);
+        let body = serde_json::json!({ "nextIteration": next });
+        fs::write(&path, serde_json::to_string_pretty(&body)?)?;
+        Ok(current)
     }
 
     pub fn save_attachment(
@@ -335,6 +361,7 @@ mod tests {
             branch_name: None,
             log_path: None,
             source_repo: None,
+            iteration: 0,
         };
         store.save_sandbox_job(&job).unwrap();
         assert_eq!(store.list_sandbox_jobs().unwrap().len(), 1);
@@ -358,6 +385,15 @@ mod tests {
         let all = store.list_feedback().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "good");
+    }
+
+    #[test]
+    fn allocate_iteration_starts_at_one_and_increments() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        assert_eq!(store.allocate_iteration().unwrap(), 1);
+        assert_eq!(store.allocate_iteration().unwrap(), 2);
+        assert_eq!(store.allocate_iteration().unwrap(), 3);
     }
 
     #[test]

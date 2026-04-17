@@ -140,6 +140,8 @@ pub struct SandboxJobRecord {
     pub log_path: Option<String>,
     #[serde(default)]
     pub source_repo: Option<String>,
+    #[serde(default)]
+    pub iteration: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

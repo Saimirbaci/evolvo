@@ -303,6 +303,7 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
     let worktree = record.worktree_path.clone();
     let log = record.log_path.clone();
     let notes = record.notes.clone();
+    let iteration = record.iteration;
 
     view! {
         <div class="list-card">
@@ -311,6 +312,13 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
                 <span class="list-card-status">{record.status.label()}</span>
             </div>
             <div class="list-card-meta">{format_time(record.created_at_unix_ms)}</div>
+            {if iteration > 0 {
+                view! {
+                    <div class="list-card-meta"><strong>"iteration: "</strong>{iteration}</div>
+                }.into_any()
+            } else {
+                view! { <span></span> }.into_any()
+            }}
             <div class="list-card-body">{record.summary.clone()}</div>
 
             {match branch {

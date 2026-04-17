@@ -259,12 +259,89 @@ pub struct StagedAttachment {
 
 /// Construct the prompt handed to Claude Code. Kept public so tests (and
 /// future tooling) can assert it contains the right invariants.
+/// Returns the tailored guidance block for a given iteration number. The
+/// meta-app starts empty: iteration 1 is the user describing the app they
+/// actually want (via canvas + text + voice), and the agent has wide latitude
+/// to rearchitect the codebase. As the iteration number grows, the agent's
+/// freedom narrows — by ~iteration 10 the default is minor, surgical fixes
+/// unless the user explicitly asks for a structural change.
+///
+/// Regardless of iteration, the four product invariants (Feedback Overlay,
+/// Canvas / drawing board, Inbox, Sandbox pipeline) MUST survive every pass.
+pub fn iteration_guidance(iteration: u32) -> String {
+    let n = iteration.max(1);
+    let (phase, latitude) = match n {
+        1..=3 => (
+            "Bootstrap phase",
+            "You have wide latitude to make drastic architectural and source-code changes. \
+             Treat the existing NoIDE shell as scaffolding: rip out, rename, restructure, and replace code \
+             as needed to realise the app the user has described in the canvas, voice, and text. \
+             Follow the user's described app (ERP, IDE, fitness tracker, whatever they drew) as faithfully as you can.",
+        ),
+        4..=6 => (
+            "Shaping phase",
+            "Significant changes are still welcome when they move the app toward the user's described vision, \
+             but prefer cohesive feature additions over wholesale rewrites. Refactor when it clearly serves the feedback.",
+        ),
+        7..=9 => (
+            "Consolidation phase",
+            "Prefer targeted changes that extend or refine existing features. Only restructure code if the feedback \
+             explicitly calls for it or the current shape blocks the change.",
+        ),
+        _ => (
+            "Maturation phase",
+            "Default to minor, surgical changes. Do NOT refactor unrelated code, rename modules, or restructure the app \
+             unless the user explicitly asks for it in this feedback.",
+        ),
+    };
+
+    format!(
+        r#"# Iteration {n} — {phase}
+
+This NoIDE instance is a self-evolving meta-app. Each approved sandbox job is one iteration in the life of the app the user is building on top of the NoIDE shell.
+
+**Latitude for this iteration:** {latitude}
+
+## Invariants you MUST preserve on every iteration, no matter what
+
+Whatever the app becomes, the shell must keep these four surfaces reachable and functional:
+
+1. **Feedback Overlay** — reachable from every screen, every mode. The user must always be able to open the feedback panel and submit new feedback.
+2. **Canvas / drawing board** — the user must always be able to return to a blank drawing surface to sketch the next iteration.
+3. **Inbox** — the list/overview of submitted feedback must remain visible and navigable.
+4. **Sandbox pipeline** — the feedback → sandbox-job state machine (and the Advance / Retry / Reject affordances) must keep working end-to-end so the *next* iteration can happen.
+
+If your change would break any of these four surfaces in the resulting app, it is wrong — redesign the change to preserve them. These invariants are load-bearing; they are what makes iteration N+1 possible.
+
+## Context hygiene — update docs and agents alongside the code
+
+Because future iterations rely on the repo's own documentation for context, any non-trivial change to the app MUST also update:
+
+- `CLAUDE.md` — reflect the new architecture, stack, commands, domain model. Remove stale sections rather than layering on top.
+- `.claude/rules/` — update conventions that no longer match the code (or add new ones). Delete rules for layers that no longer exist.
+- `.claude/agents/*` — if an agent's description, responsibilities, or tools no longer match the current codebase, update its frontmatter and body. If a whole agent is obsolete, delete it; if the app now needs a new specialist, add one.
+- `.claude/skills/*` (if present) — same treatment: keep them accurate or remove them.
+
+The next iteration's agent will read these files first. Leaving them stale is the single biggest way to sabotage iteration N+1.
+"#,
+    )
+}
+
 pub fn build_implementation_prompt(
     feedback: &FeedbackRecord,
     job: &SandboxJobRecord,
     attachments: &[StagedAttachment],
     log_file: &Path,
 ) -> String {
+    let iteration = if job.iteration == 0 { 1 } else { job.iteration };
+    let guidance = iteration_guidance(iteration);
+    let work_step_4 = if iteration <= 3 {
+        "4. Make the change the user described. On this iteration you are allowed — and expected — to restructure the codebase to fit the app the user drew. Touch as much as you need; just keep the four invariants above intact."
+    } else if iteration <= 9 {
+        "4. Make a change that clearly resolves the feedback and moves the app toward the user's described vision. Refactor when it serves the goal; don't refactor for its own sake."
+    } else {
+        "4. Make the minimal, focused change that actually resolves the feedback. Do not refactor unrelated code unless the user explicitly asks for it."
+    };
     let feedback_type = format!("{:?}", feedback.feedback_type);
     let route = if feedback.page_route.is_empty() {
         "/".into()
@@ -291,10 +368,13 @@ pub fn build_implementation_prompt(
     format!(
         r#"You are running inside a sandboxed git worktree of the NoIDE project. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Advance" on the resulting sandbox job. Your job: implement the change.
 
+{guidance}
+
 # Sandbox job
 
 - Job ID: `{job_id}`
 - Branch: `{branch}`
+- Iteration: `{iteration}`
 - Title: {title}
 - Feedback type: {feedback_type}
 - Submitted from route: {route}
@@ -305,18 +385,17 @@ pub fn build_implementation_prompt(
 
 # How to work
 
-1. Read `CLAUDE.md` and skim the relevant files under `app/` to orient yourself.
-2. Read every file listed under Attachments above — the screenshot is often the clearest statement of intent.
-3. When the work calls for a specialist, delegate via the Agent tool to one of the project agents defined in `.claude/agents/`:
-   - `staff-architect-self-evolving-software` — invariants, state machine, promotion policy.
-   - `staff-build-engineer` — Rust, Tauri, Leptos wiring, build health.
-   - `staff-feedback` — turning raw feedback into well-shaped changes.
-4. Make the minimal, focused change that actually resolves the feedback. Do not refactor unrelated code.
-5. Run the appropriate check before finishing:
+1. Read `CLAUDE.md` and skim the relevant files under `app/` to orient yourself. Also skim `.claude/rules/` and `.claude/agents/` so you know what docs you will be expected to update.
+2. Read every file listed under Attachments above — the screenshot is often the clearest statement of intent of the app the user is building.
+3. When the work calls for a specialist, delegate via the Agent tool to one of the project agents defined in `.claude/agents/` (use whichever agents exist in this iteration of the repo — names may have changed).
+{work_step_4}
+5. If the app's architecture, stack, domain model, or command surface changed materially: update `CLAUDE.md`, the relevant files under `.claude/rules/`, and the affected `.claude/agents/*.md` (and `.claude/skills/*` if present) so the next iteration's agent starts with accurate context. Stale docs are treated as a bug.
+6. Run the appropriate checks before finishing. The exact commands depend on the current stack — read `CLAUDE.md` for the build contract. For today's Rust + Leptos + Tauri shell the defaults are:
    - Backend: `cargo check -p noide_desktop`
    - UI: `cargo check -p noide_ui --target wasm32-unknown-unknown`
-6. Commit your work with `git add -A && git commit` so the reviewer can diff the branch. Use a conventional-commit subject line like `feat(ui): …` or `fix(sandbox): …`.
-7. Print a short summary (5-10 lines) of what you changed and which files were touched. Keep it focused — the reviewer reads this first.
+   If you rewrote the stack, run the equivalent checks for the new stack and update `CLAUDE.md` to document them.
+7. Commit your work with `git add -A && git commit` so the reviewer can diff the branch. Use a conventional-commit subject line like `feat(ui): …` or `fix(sandbox): …`.
+8. Print a short summary (5-10 lines) of what you changed, which files were touched, and — if invariants were at risk — how you preserved Feedback Overlay / Canvas / Inbox / Sandbox. Keep it focused — the reviewer reads this first.
 
 # Safety
 
@@ -325,11 +404,14 @@ pub fn build_implementation_prompt(
 - If a dependency is missing or the task is impossible in this environment, say so plainly and exit — do not fake success.
 - Your full transcript is being captured at `{log_file}` for reviewer audit.
 "#,
+        guidance = guidance,
         job_id = job.id,
         branch = branch_name(&job.id),
+        iteration = iteration,
         title = job.title,
         feedback_text = feedback.feedback_text,
         log_file = log_file.display(),
+        work_step_4 = work_step_4,
     )
 }
 
@@ -355,6 +437,17 @@ pub fn prepare_run(
     job: &SandboxJobRecord,
     feedback: &FeedbackRecord,
 ) -> Result<PreparedRun, StoreError> {
+    // Lazily allocate an iteration number for this job. We work on a local
+    // copy so the caller's `&SandboxJobRecord` signature stays intact; the
+    // allocated iteration is persisted back onto the stored record so the
+    // UI (and any retry) sees a stable value.
+    let mut job = job.clone();
+    if job.iteration == 0 {
+        let n = store.allocate_iteration()?;
+        job.iteration = n;
+        store.save_sandbox_job(&job)?;
+    }
+    let job = &job;
     let source = resolve_source_repo().ok_or_else(|| {
         StoreError::Other(
             "could not locate NoIDE source repo — set NOIDE_SOURCE_REPO or run from within the repo"
@@ -382,6 +475,7 @@ pub fn prepare_run(
     let metadata = serde_json::json!({
         "job_id": job.id,
         "feedback_id": feedback.id,
+        "iteration": job.iteration,
         "branch": branch,
         "worktree": worktree.display().to_string(),
         "source_repo": source.display().to_string(),
@@ -531,6 +625,7 @@ mod tests {
             branch_name: None,
             log_path: None,
             source_repo: None,
+            iteration: 0,
         }
     }
 
@@ -575,6 +670,60 @@ mod tests {
             Path::new("/tmp/claude.log"),
         );
         assert!(!prompt.contains("## Attachments"));
+    }
+
+    #[test]
+    fn iteration_guidance_shifts_with_iteration() {
+        let early = iteration_guidance(1);
+        assert!(early.contains("Iteration 1"));
+        assert!(early.contains("Bootstrap"));
+        assert!(early.contains("wide latitude"));
+
+        let mid = iteration_guidance(5);
+        assert!(mid.contains("Iteration 5"));
+        assert!(mid.contains("Shaping"));
+
+        let late = iteration_guidance(12);
+        assert!(late.contains("Iteration 12"));
+        assert!(late.contains("Maturation"));
+        assert!(late.contains("minor, surgical"));
+
+        // Invariants section appears in every phase.
+        for g in [&early, &mid, &late] {
+            assert!(g.contains("Feedback Overlay"));
+            assert!(g.contains("Canvas"));
+            assert!(g.contains("Inbox"));
+            assert!(g.contains("Sandbox"));
+            assert!(g.contains("CLAUDE.md"));
+            assert!(g.contains(".claude/agents"));
+        }
+    }
+
+    #[test]
+    fn prompt_defaults_unallocated_iteration_to_one() {
+        let prompt = build_implementation_prompt(
+            &mk_feedback(),
+            &mk_job(), // iteration: 0
+            &[],
+            Path::new("/tmp/claude.log"),
+        );
+        assert!(prompt.contains("Iteration: `1`"));
+        assert!(prompt.contains("Bootstrap phase"));
+    }
+
+    #[test]
+    fn prompt_uses_job_iteration_when_set() {
+        let mut job = mk_job();
+        job.iteration = 10;
+        let prompt = build_implementation_prompt(
+            &mk_feedback(),
+            &job,
+            &[],
+            Path::new("/tmp/claude.log"),
+        );
+        assert!(prompt.contains("Iteration: `10`"));
+        assert!(prompt.contains("Maturation phase"));
+        assert!(prompt.contains("minimal, focused change"));
     }
 
     #[test]

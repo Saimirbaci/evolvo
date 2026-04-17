@@ -110,6 +110,13 @@ pub struct SandboxJobRecord {
     /// understand where the worktree came from.
     #[serde(default)]
     pub source_repo: Option<String>,
+    /// 1-indexed iteration number for the evolving meta-app. Iteration 1 is
+    /// the first change ever applied to a fresh NoIDE shell; later iterations
+    /// progressively narrow the agent's freedom. `0` means "not yet
+    /// allocated" — old records that pre-date the counter deserialize to 0
+    /// and are treated as iteration 1 when they run.
+    #[serde(default)]
+    pub iteration: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

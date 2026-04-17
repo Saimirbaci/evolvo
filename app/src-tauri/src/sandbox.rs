@@ -88,6 +88,7 @@ impl<'a> SandboxEngine<'a> {
             branch_name: None,
             log_path: None,
             source_repo: None,
+            iteration: 0,
         };
         self.store.save_sandbox_job(&job)?;
 
