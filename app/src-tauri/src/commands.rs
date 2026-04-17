@@ -251,6 +251,53 @@ pub fn reject_sandbox_job(
         .map_err(store_error)
 }
 
+/// Re-run the implementation for a job that previously failed or got stuck.
+/// Destroys the prior worktree + branch + job workspace so the fresh run
+/// starts from the current HEAD of the source repo, then dispatches through
+/// the same pipeline as the first Advance. Only valid when the job is in a
+/// state where a retry is meaningful (see `SandboxJobStatus::can_retry`).
+#[tauri::command]
+pub fn retry_sandbox_job(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<SandboxJobRecord, String> {
+    let store = state.store();
+    let engine = SandboxEngine::new(&store);
+
+    let job = store
+        .load_sandbox_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("sandbox job not found: {}", payload.id))?;
+    if !job.status.can_retry() {
+        return Err(format!(
+            "job {} is in status {:?} which does not support retry",
+            job.id, job.status
+        ));
+    }
+
+    let source = runner::resolve_source_repo().ok_or_else(|| {
+        "could not locate NoIDE source repo — set NOIDE_SOURCE_REPO or run from within the repo"
+            .to_string()
+    })?;
+    let workspace_root = store.layout().root().to_path_buf();
+    runner::cleanup_previous_run(&source, &workspace_root, &job.id).map_err(|e| {
+        let msg = store_error(e);
+        let _ = engine.append_note(&job.id, &format!("retry cleanup failed: {msg}"));
+        msg
+    })?;
+
+    // Drop a breadcrumb so the reviewer can tell this is attempt N rather
+    // than the original run. `start_implementation_run` will overwrite the
+    // worktree/branch/log pointers when `prepare_run` succeeds below.
+    let _ = engine.append_note(&job.id, "retry requested — previous run torn down");
+
+    let refreshed = store
+        .load_sandbox_job(&job.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("sandbox job not found after cleanup: {}", job.id))?;
+    start_implementation_run(&store, &engine, &refreshed)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotePayload {

@@ -89,6 +89,10 @@ impl SandboxJobStatus {
     pub fn can_approve(self) -> bool {
         matches!(self, Self::Pending | Self::Planned | Self::BuildReady)
     }
+
+    pub fn can_retry(self) -> bool {
+        matches!(self, Self::Failed | Self::Implementing)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

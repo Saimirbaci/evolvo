@@ -273,8 +273,10 @@ fn SandboxPage() -> impl IntoView {
 #[component]
 fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView {
     let can_approve = record.status.can_approve();
+    let can_retry = record.status.can_retry();
     let approve_id = record.id.clone();
     let reject_id = record.id.clone();
+    let retry_id = record.id.clone();
     let approve_click = move |_| {
         let id = approve_id.clone();
         spawn_local(async move {
@@ -286,6 +288,13 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
         let id = reject_id.clone();
         spawn_local(async move {
             let _ = interop::reject_sandbox_job(&id).await;
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+    let retry_click = move |_| {
+        let id = retry_id.clone();
+        spawn_local(async move {
+            let _ = interop::retry_sandbox_job(&id).await;
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
@@ -338,6 +347,15 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
 
             <div class="list-card-actions">
                 <button class="secondary-btn" on:click=reject_click>"Reject"</button>
+                {if can_retry {
+                    view! {
+                        <button class="secondary-btn" on:click=retry_click>
+                            "Retry"
+                        </button>
+                    }.into_any()
+                } else {
+                    view! { <span></span> }.into_any()
+                }}
                 <button
                     class="primary-btn"
                     prop:disabled=!can_approve

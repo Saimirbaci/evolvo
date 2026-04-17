@@ -109,6 +109,65 @@ pub fn branch_name(job_id: &str) -> String {
     format!("sandbox/{job_id}")
 }
 
+/// Tear down any previous worktree + branch + job workspace left over from an
+/// earlier attempt, so `prepare_run` can start from a clean slate. All steps
+/// are best-effort: missing worktrees/branches are not errors, but a failure
+/// to remove an existing worktree (e.g. a lock held by another `git` process)
+/// is surfaced so the caller can refuse to retry rather than silently drift.
+pub fn cleanup_previous_run(
+    source: &Path,
+    workspace_root: &Path,
+    job_id: &str,
+) -> Result<(), StoreError> {
+    let worktree = worktree_path(workspace_root, job_id);
+    let branch = branch_name(job_id);
+
+    if worktree.exists() {
+        let output = Command::new("git")
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(&worktree)
+            .current_dir(source)
+            .output()
+            .map_err(|e| StoreError::Other(format!("failed to spawn git: {e}")))?;
+        if !output.status.success() {
+            // Fall back to a direct fs delete so a stale record in
+            // `.git/worktrees/` can't permanently block retries. Git will
+            // re-sync on the next `worktree add`.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "git worktree remove exited {}: {} — falling back to fs delete",
+                output.status,
+                stderr.trim()
+            );
+            if worktree.exists() {
+                fs::remove_dir_all(&worktree).ok();
+            }
+            let _ = Command::new("git")
+                .arg("worktree")
+                .arg("prune")
+                .current_dir(source)
+                .output();
+        }
+    }
+
+    // `git branch -D` returns non-zero when the branch is missing; that's
+    // fine — we're doing best-effort cleanup.
+    let _ = Command::new("git")
+        .arg("branch")
+        .arg("-D")
+        .arg(&branch)
+        .current_dir(source)
+        .output();
+
+    let job_dir = job_workspace_dir(workspace_root, job_id);
+    if job_dir.exists() {
+        fs::remove_dir_all(&job_dir)?;
+    }
+    Ok(())
+}
+
 /// Create a detached git worktree of `source` at `dest` on a new branch.
 pub fn create_worktree(source: &Path, dest: &Path, branch: &str) -> Result<(), StoreError> {
     if let Some(parent) = dest.parent() {
@@ -380,18 +439,26 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
         let _ = engine.append_note(
             &job_id,
             &format!(
-                "claude code starting (permission-mode=acceptEdits) in worktree {} — streaming to {}",
+                "claude code starting (permission-mode=acceptEdits, auth=subscription) in worktree {} — streaming to {}",
                 prepared.worktree.display(),
                 prepared.log_file.display(),
             ),
         );
 
+        // Force the Claude Max subscription auth path by scrubbing
+        // `ANTHROPIC_API_KEY` from the child environment. The CLI prefers the
+        // API key whenever it's present, which silently breaks users whose
+        // key has no balance but who are separately logged in via
+        // `claude login`. Scrubbing `ANTHROPIC_AUTH_TOKEN` as well for the
+        // same reason (internal Anthropic tooling override).
         let status = Command::new("claude")
             .arg("-p")
             .arg(&prepared.prompt)
             .arg("--permission-mode")
             .arg("acceptEdits")
             .current_dir(&prepared.worktree)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_handle))
             .stderr(Stdio::from(log_for_err))

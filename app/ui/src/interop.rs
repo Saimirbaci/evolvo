@@ -91,3 +91,7 @@ pub async fn approve_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
 pub async fn reject_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
     invoke_command_with_args("reject_sandbox_job", &IdArg { id }).await
 }
+
+pub async fn retry_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
+    invoke_command_with_args("retry_sandbox_job", &IdArg { id }).await
+}

@@ -16,6 +16,7 @@ fn main() {
             commands::load_sandbox_job,
             commands::approve_sandbox_job,
             commands::reject_sandbox_job,
+            commands::retry_sandbox_job,
             commands::append_sandbox_note,
             commands::open_workspace_path,
         ])

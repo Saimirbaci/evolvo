@@ -72,6 +72,13 @@ impl SandboxJobStatus {
     pub fn can_approve(self) -> bool {
         matches!(self, Self::Pending | Self::Planned | Self::BuildReady)
     }
+
+    /// Retry is meaningful when a prior run ended badly (Failed) or the job
+    /// is stuck mid-Implementing because the underlying process crashed or
+    /// the reviewer interrupted it. `can_retry` gates the UI's Retry button.
+    pub fn can_retry(self) -> bool {
+        matches!(self, Self::Failed | Self::Implementing)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
