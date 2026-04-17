@@ -18,6 +18,14 @@ pub enum FeedbackType {
     Improvement,
     Confusion,
     Compliment,
+    /// The user wants the agent to build a **new app from scratch** on top
+    /// of the NoIDE shell. Regardless of iteration number, a `NewApp` feedback
+    /// unlocks full "bootstrap" latitude in the prompt — the agent should
+    /// treat the existing code as scaffolding and produce the app the user
+    /// described in the canvas + text + voice, preserving only the four
+    /// product invariants (Feedback Overlay, Canvas per-page overlay, Inbox,
+    /// Sandbox pipeline).
+    NewApp,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

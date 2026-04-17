@@ -309,10 +309,10 @@ This NoIDE instance is a self-evolving meta-app. Each approved sandbox job is on
 
 Whatever the app becomes, the shell must keep these four surfaces reachable and functional:
 
-1. **Feedback Overlay** — reachable from every screen, every mode. The user must always be able to open the feedback panel and submit new feedback.
-2. **Canvas / drawing board** — the user must always be able to return to a blank drawing surface to sketch the next iteration.
-3. **Inbox** — the list/overview of submitted feedback must remain visible and navigable.
-4. **Sandbox pipeline** — the feedback → sandbox-job state machine (and the Advance / Retry / Reject affordances) must keep working end-to-end so the *next* iteration can happen.
+1. **Feedback Overlay** — reachable from every screen, every mode. The user must always be able to open the feedback panel and submit new feedback about the page they are on.
+2. **Canvas overlay on every page** — the Canvas is NOT a standalone tab or dedicated route. It is an overlay the user can open on top of *any* page of the app to draw / annotate / sketch feedback about *that specific page*. Every route must support opening the Canvas on top of it; the feedback submission records which route the drawing was made on. A design that only lets the user draw on a single "Canvas tab" is wrong — the whole point is per-page visual feedback.
+3. **Inbox** — the list/overview of submitted feedback must remain visible and navigable, and each entry must preserve the page/route it was submitted from.
+4. **Sandbox pipeline** — the feedback → sandbox-job state machine (and the Advance / Retry / Reject / Run affordances) must keep working end-to-end so the *next* iteration can happen.
 
 If your change would break any of these four surfaces in the resulting app, it is wrong — redesign the change to preserve them. These invariants are load-bearing; they are what makes iteration N+1 possible.
 

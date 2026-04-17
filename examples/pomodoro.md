@@ -1,0 +1,2 @@
+Build me a pomodoro app which contains statistics of my day, uses camera to detect if i am in front of the pc every minute, and fetches my keyboard while typing in other apps so that it can capture my meaningful work. completely private but in the end of the day tells me about my day, what i could improve, where did i miss my focus etc. complete dashboard.
+if OS-wide capture across other apps needs a native accessibility plugin get it

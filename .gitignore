@@ -8,3 +8,4 @@ workspace/
 # Tauri-generated
 app/src-tauri/gen/schemas/
 
+tmp.md

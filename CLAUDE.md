@@ -115,7 +115,7 @@ See `.claude/rules/common/product-invariants.md` for authoritative text. In shor
 
 - **Sandbox always stays.** The feedback → sandbox-job pipeline is permanent.
 - **Feedback Overlay always stays.** Reachable from every screen, every mode.
-- **The drawing board is always reachable.** The canvas module may be rewritten or replaced; the affordance to return to a blank drawing surface must always exist.
+- **The Canvas is a per-page overlay, not a tab.** The canvas module may be rewritten or replaced, but the resulting app must let the user open the Canvas overlay *on top of every page / route* to annotate the actual screen they have feedback about. A dedicated "canvas tab" where the canvas only exists as its own screen violates this invariant.
 - **Sandboxes are saveable and forkable into standalone apps.** Sandbox state is a portable, self-contained artifact that can be renamed / cloned into a new NoIDE-shaped app with its own identity.
 
 These outrank refactor aesthetics and most feature requests. Changes that violate them are product decisions — escalate.

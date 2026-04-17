@@ -9,6 +9,7 @@ pub enum FeedbackType {
     Improvement,
     Confusion,
     Compliment,
+    NewApp,
 }
 
 impl FeedbackType {
@@ -19,16 +20,18 @@ impl FeedbackType {
             Self::Improvement => "Improvement",
             Self::Confusion => "Confusion",
             Self::Compliment => "Compliment",
+            Self::NewApp => "New App",
         }
     }
 
-    pub fn all() -> [FeedbackType; 5] {
+    pub fn all() -> [FeedbackType; 6] {
         [
             Self::Bug,
             Self::FeatureRequest,
             Self::Improvement,
             Self::Confusion,
             Self::Compliment,
+            Self::NewApp,
         ]
     }
 }
