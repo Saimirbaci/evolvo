@@ -904,37 +904,42 @@ pub fn ingest_image_data_url(ctrl: &CanvasController, data_url: String) {
     if let Some(b64) = data_url.split(',').nth(1) {
         ctrl.add_pasted_base64(b64.to_string());
     }
-    // Image is dropped into the centre of the canvas, sized to 40% of width,
-    // preserving aspect ratio once it loads.
+    // Drop the image at its natural pixel size, centred. If it's larger than
+    // the canvas we scale down to fit (keeping aspect ratio) so it stays
+    // visible; otherwise we render it 1:1.
     let ctrl2 = ctrl.clone();
     let data_for_resolve = data_url.clone();
     spawn_local(async move {
-        if let Some((w_ratio, h_ratio)) = decode_image_ratio(&data_for_resolve).await {
-            let iw = 0.4_f64.min(w_ratio);
-            let ih = iw * (h_ratio / w_ratio).max(0.01);
+        let canvas_px = ctrl2
+            .canvas_node
+            .with_value(|c| c.as_ref().map(canvas_pixel_size));
+        let (cw, ch) = match canvas_px {
+            Some((w, h)) if w > 0 && h > 0 => (w as f64, h as f64),
+            _ => {
+                ctrl2.add_shape(Shape::Image {
+                    x: 0.3, y: 0.3, w: 0.4, h: 0.4, data_url: data_for_resolve,
+                });
+                return;
+            }
+        };
+        if let Some((nw, nh)) = decode_image_size(&data_for_resolve).await {
+            let scale = (cw / nw).min(ch / nh).min(1.0);
+            let iw = (nw * scale) / cw;
+            let ih = (nh * scale) / ch;
             let x = 0.5 - iw / 2.0;
             let y = 0.5 - ih / 2.0;
             ctrl2.add_shape(Shape::Image {
-                x,
-                y,
-                w: iw,
-                h: ih,
-                data_url: data_for_resolve,
+                x, y, w: iw, h: ih, data_url: data_for_resolve,
             });
         } else {
-            // Fallback: assume square 40%.
             ctrl2.add_shape(Shape::Image {
-                x: 0.3,
-                y: 0.3,
-                w: 0.4,
-                h: 0.4,
-                data_url,
+                x: 0.3, y: 0.3, w: 0.4, h: 0.4, data_url: data_for_resolve,
             });
         }
     });
 }
 
-async fn decode_image_ratio(data_url: &str) -> Option<(f64, f64)> {
+async fn decode_image_size(data_url: &str) -> Option<(f64, f64)> {
     let img = HtmlImageElement::new().ok()?;
     img.set_src(data_url);
     let decode = img.decode();
@@ -944,7 +949,7 @@ async fn decode_image_ratio(data_url: &str) -> Option<(f64, f64)> {
     if nw <= 0.0 || nh <= 0.0 {
         return None;
     }
-    Some((1.0, nh / nw))
+    Some((nw, nh))
 }
 
 // ---------------------------------------------------------------------------
