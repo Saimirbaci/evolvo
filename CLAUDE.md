@@ -116,9 +116,70 @@ See `.claude/rules/common/product-invariants.md` for authoritative text. In shor
 - **Sandbox always stays.** The feedback → sandbox-job pipeline is permanent.
 - **Feedback Overlay always stays.** Reachable from every screen, every mode.
 - **The Canvas is a per-page overlay, not a tab.** The canvas module may be rewritten or replaced, but the resulting app must let the user open the Canvas overlay *on top of every page / route* to annotate the actual screen they have feedback about. A dedicated "canvas tab" where the canvas only exists as its own screen violates this invariant.
+- **One trigger opens BOTH Canvas overlay and Feedback panel.** Every Iteration ships a single Feedback FAB bound to a single `panel_open` signal — clicking it brings up the drawing surface *and* the submission panel together. Iterations must keep this: exactly one affordance, one signal, both surfaces visible together. Never a separate "draw" button and "send feedback" button; never leave a stale prior trigger behind after redesign; the button must be clearly labelled (`aria-label` + visible `title`) so the user knows what it does.
 - **Sandboxes are saveable and forkable into standalone apps.** Sandbox state is a portable, self-contained artifact that can be renamed / cloned into a new NoIDE-shaped app with its own identity.
 
 These outrank refactor aesthetics and most feature requests. Changes that violate them are product decisions — escalate.
+
+## Canvas + Feedback overlay rules (load-bearing, easy to regress)
+
+These concrete rules are what make I-P2 / I-P3 actually work. Previous
+iterations regressed them — read before touching `app/ui/src/canvas.rs`,
+`app/ui/src/app.rs`, or the overlay CSS in `app/ui/styles.css`.
+
+1. **One FAB, opens both.** The ✎ FAB toggles *both* `canvas_open` and
+   `feedback_open` in lockstep. Do not reintroduce a second ✦ FAB — the
+   product wants a single affordance. The feedback panel is still always
+   reachable (I-P2 holds via this single button).
+
+2. **The underlying page must remain visible while the canvas is open.**
+   The whole point of the canvas is annotating the *current route*. That
+   means:
+   - `.canvas-overlay` uses `background: transparent` (never a white/opaque
+     backdrop, never `backdrop-filter: blur`).
+   - The `<canvas>` bitmap is cleared with `ctx.clear_rect(...)` on every
+     render — **never** `fill_rect` with white. A white fill on the bitmap
+     defeats the transparent CSS and hides the page.
+   - `.canvas-surface` / `.stage` inside the overlay have
+     `background: transparent`.
+
+3. **`.stage` needs a flex parent.** `.stage` is `flex: 1`. `.canvas-overlay`
+   must be `display: flex`, or the stage collapses to 0×0 and the canvas
+   silently swallows no pointer events (looks like "drawing is broken").
+
+4. **Pointer-event layering.** `.canvas-overlay { pointer-events: none }`
+   and `.canvas-overlay > * { pointer-events: auto }` — so clicks outside
+   the drawing surface still reach the toolbar / close button, but the
+   overlay itself does not trap events over empty space. (If you ever want
+   clicks outside the canvas to fall through to the page underneath, that
+   is the hook.)
+
+5. **Z-index contract.** Canvas overlay is `z-index: 50`. The Feedback
+   `.panel` must be **above** it (currently `z-index: 55`) so the panel is
+   visible and interactable while the canvas overlay is open. If you add
+   new floating UI, respect: overlay 50 < panel 55 < FAB stack (45 is fine
+   because FAB lives outside the overlay).
+
+6. **Exported annotation PNG is transparent.** Because the bitmap is
+   `clear_rect`-ed, the PNG attached to feedback has only strokes on a
+   transparent background. Do not "fix" this by filling white — it's by
+   design so reviewers can overlay it on a page screenshot.
+
+## Dev-server port hygiene
+
+The runner rewrites this iteration to port `1430 + N`. If `cargo tauri dev`
+shows a blank WebView with a console error like `Failed to load resource:
+Could not connect to the server` at `127.0.0.1:<port>`, a stale `trunk`
+process from a previous iteration is almost certainly holding the port and
+your new `trunk` silently failed to bind. Check:
+
+```bash
+lsof -iTCP -sTCP:LISTEN -P -n | grep trunk
+```
+
+Kill the stale PID and restart `cargo tauri dev`. Do **not** work around
+this by rewriting the port in config — the iteration port is a contract
+with the runner.
 
 ## Verify-before-done — actually run the app
 

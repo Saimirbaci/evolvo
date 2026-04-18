@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 
 use crate::canvas::{CanvasController, CanvasSurface};
 use crate::feedback_panel::FeedbackPanel;
@@ -337,6 +338,11 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
             let _ = interop::run_sandbox_job(&id).await;
             reload.update(|v| *v = v.wrapping_add(1));
         });
+        // The sandbox run spawns a background thread on the host that writes
+        // notes asynchronously (launching…, then either success or failure).
+        // A single reload right after the invoke only catches the first note;
+        // poll for follow-up notes a few seconds later too.
+        schedule_reloads(reload, &[1500, 4000, 10_000]);
     };
 
     let branch = record.branch_name.clone();
@@ -427,4 +433,23 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
 fn format_time(ms: u64) -> String {
     let date = js_sys::Date::new(&JsValue::from_f64(ms as f64));
     String::from(date.to_iso_string())
+}
+
+/// Bump `reload` after each delay (ms). Used to surface asynchronous sandbox
+/// notes (e.g. the Run button's background-thread spawn result) without
+/// requiring the user to navigate away and back.
+fn schedule_reloads(reload: RwSignal<u32>, delays_ms: &[i32]) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    for &ms in delays_ms {
+        let r = reload;
+        let cb = Closure::once_into_js(move || {
+            r.update(|v| *v = v.wrapping_add(1));
+        });
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.unchecked_ref(),
+            ms,
+        );
+    }
 }

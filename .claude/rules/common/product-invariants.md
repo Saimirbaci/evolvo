@@ -23,6 +23,20 @@ The canvas implementation (today `app/ui/src/canvas.rs`) **may be removed, rewri
 
 A rewrite that makes the Canvas a separate tab, or that makes any page un-annotatable, is incomplete.
 
+## I-P3b. One trigger opens BOTH the Canvas overlay AND the Feedback panel
+
+The Canvas overlay and the Feedback submission panel are a **single surface from the user's point of view**, driven by a **single trigger** and a **single open/closed state**. Iteration zero implements this as the `FeedbackFab` button in `app/ui/src/app.rs` bound to a `panel_open: RwSignal<bool>` signal: one click opens the drawing surface and the submission panel together, another closes both.
+
+Iterations must preserve this contract:
+
+- **Exactly one affordance per surface.** One FAB (or one persistent-chrome button, or one keyboard shortcut — pick *one*) invokes the Feedback+Canvas surface. Never two buttons where one opens "the canvas" and another opens "the feedback form".
+- **One signal drives both.** The Canvas overlay's visibility and the Feedback panel's visibility are bound to the same boolean state. No half-open states.
+- **Delete the prior trigger when you restyle.** If the agent redesigns the affordance, the previous button must be removed in the same change. A leftover button that "still renders but does nothing" is a regression — the user will click it first and file feedback about *that*.
+- **Clearly labelled.** Icon-only triggers MUST carry `aria-label` and a visible `title` naming the feedback action. The user must know at a glance what that button does.
+- **Discoverable on every page.** Consistent with I-P2 and I-P3 — the trigger is visible from every route, no hover-only menus, no tab-switch required.
+
+A UI where a user sees two Feedback-related buttons and can't tell which one is live violates this invariant, regardless of how the code looks.
+
 ## I-P4. Sandboxes are saveable and forkable into standalone apps
 
 A user can **save a sandbox** and **rename / fork it into another app**. This means:

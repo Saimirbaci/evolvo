@@ -25,6 +25,7 @@
 //! 3. Walk up from the process CWD using the same check.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -381,6 +382,20 @@ Whatever the app becomes, the shell must keep these four surfaces reachable and 
 
 If your change would break any of these four surfaces in the resulting app, it is wrong — redesign the change to preserve them. These invariants are load-bearing; they are what makes iteration N+1 possible.
 
+## ONE button opens BOTH the Canvas overlay AND the Feedback panel — always
+
+This is a hard rule, not a suggestion. The host iteration zero ships a **single Feedback FAB** (`FeedbackFab` in `app/ui/src/app.rs`) bound to a **single `panel_open: RwSignal<bool>`** signal. Clicking it toggles the feedback surface open; while open, both the drawing surface (Canvas + Toolbar) and the Feedback submission panel are visible and usable together. There is never one button for "draw" and a second button for "send feedback" — they are the same action from the user's point of view.
+
+Rules you MUST follow when the iteration app keeps a Feedback affordance (i.e. always):
+
+- **Exactly one trigger.** One FAB, one toolbar button, one keyboard shortcut, one menu item — pick *one* affordance per surface. Do NOT ship "the old Canvas button that no longer works" alongside "a new FAB for the feedback container". If you rewrite, DELETE the previous trigger in the same change. Two buttons where the user can't tell which one is live = broken.
+- **One signal drives both.** Bind the Canvas overlay's visibility and the Feedback panel's visibility to the **same** `RwSignal<bool>` (equivalent in whatever stack you're on). When it flips true, both surfaces come up; when it flips false, both go away. No "half-open" state where Canvas is up but Feedback isn't, or vice-versa.
+- **Discoverable on every page.** The trigger is visible on every route — floating, pinned, or in a persistent chrome region — never hidden behind a tab switch or a hover-only menu. Icon-only triggers MUST have `aria-label` (and a `title`) so the user knows what they do.
+- **Clearly labelled.** The user must be able to tell *at a glance* what that single button does. Iteration zero uses "Send feedback" as the `title` and `aria-label`, a pencil/close icon, and a count badge when there are pending annotations. Keep that intent: the button's label must name the feedback/annotation action explicitly, not just show a glyph.
+- **Delete dead triggers.** If you restyle or move the affordance, remove the prior one in the same commit. A deprecated button that "still renders but does nothing" is a regression — the user will click it first, get nothing, and file feedback about *that*.
+
+Concretely: if the user sees two buttons and isn't sure which one opens feedback, you have already failed this invariant. Redesign until there is exactly one.
+
 ## Context hygiene — update docs and agents alongside the code
 
 Because future iterations rely on the repo's own documentation for context, any non-trivial change to the app MUST also update:
@@ -736,6 +751,34 @@ pub struct ResolvedRunCommand {
     pub source: &'static str,
 }
 
+/// Build a PATH suitable for spawning developer toolchains (`cargo`, `trunk`,
+/// `tauri-cli`, `node`, `pnpm`…) from a GUI-launched host. macOS apps started
+/// from Finder/Dock inherit a minimal `/usr/bin:/bin:/usr/sbin:/sbin`, which
+/// is why `cargo tauri dev` silently fails with "No such file or directory"
+/// when the Run button is clicked from the packaged app. We prepend the
+/// common install locations so the child can actually find its tools.
+pub fn enriched_path() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        parts.push(format!("{home}/.cargo/bin"));
+        parts.push(format!("{home}/.local/bin"));
+        parts.push(format!("{home}/.bun/bin"));
+        parts.push(format!("{home}/.volta/bin"));
+        parts.push(format!("{home}/.nvm/versions/node/current/bin"));
+    }
+    parts.push("/opt/homebrew/bin".into());
+    parts.push("/opt/homebrew/sbin".into());
+    parts.push("/usr/local/bin".into());
+    parts.push("/usr/local/sbin".into());
+    if let Ok(existing) = std::env::var("PATH") {
+        if !existing.is_empty() {
+            parts.push(existing);
+        }
+    }
+    parts.push("/usr/bin:/bin:/usr/sbin:/sbin".into());
+    parts.join(":")
+}
+
 pub fn resolve_run_command(worktree: &Path) -> ResolvedRunCommand {
     let script = worktree.join(DEFAULT_RUN_SCRIPT);
     if script.exists() {
@@ -813,6 +856,46 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
 
         let cmd = resolve_run_command(&worktree);
         let port = iteration_port(job.iteration);
+        let path_env = enriched_path();
+
+        // Write a preflight banner to the log file BEFORE spawning so the
+        // user has context even if the child process never manages to boot
+        // (missing toolchain, missing cwd, bad permissions, etc.). `mut`
+        // because we reopen it as append after spawn.
+        {
+            let mut banner = match log_handle.try_clone() {
+                Ok(f) => f,
+                Err(_) => log_handle
+                    .try_clone()
+                    .unwrap_or_else(|_| fs::File::create(&log_path).unwrap()),
+            };
+            let _ = writeln!(
+                banner,
+                "== iteration run ==\njob_id: {}\niteration: {}\nport: {}\ncommand: {} {}\ncwd: {}\nsource: {}\nPATH: {}\n--",
+                job_id,
+                job.iteration,
+                port,
+                cmd.program,
+                cmd.args.join(" "),
+                cmd.cwd.display(),
+                cmd.source,
+                path_env,
+            );
+        }
+
+        // Fast-fail checks surface a clear error to the user instead of a
+        // silent "thread exited" — both into the notes (so the card shows
+        // it after refresh) and into the log file (for a permanent record).
+        if !cmd.cwd.exists() {
+            let msg = format!(
+                "run failed: cwd {} does not exist — did this iteration rewrite the stack without adding scripts/run-iteration.sh?",
+                cmd.cwd.display()
+            );
+            let _ = writeln!(&log_handle, "{msg}");
+            let _ = engine.append_note(&job_id, &msg);
+            return;
+        }
+
         let _ = engine.append_note(
             &job_id,
             &format!(
@@ -829,6 +912,7 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
         let status = Command::new(&cmd.program)
             .args(&cmd.args)
             .current_dir(&cmd.cwd)
+            .env("PATH", &path_env)
             .env("NOIDE_WORKSPACE_ROOT", &run_workspace)
             .env("NOIDE_ITERATION_PORT", port.to_string())
             .stdin(Stdio::null())
@@ -853,12 +937,17 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
                 );
             }
             Err(e) => {
+                let hint = if e.kind() == std::io::ErrorKind::NotFound {
+                    format!(
+                        "`{}` was not found on PATH. On macOS, apps launched from Finder/Dock inherit a minimal PATH; install the toolchain or launch NoIDE from a shell where `{}` works. PATH used: {}",
+                        cmd.program, cmd.program, path_env
+                    )
+                } else {
+                    format!("spawn error: {e}")
+                };
                 let _ = engine.append_note(
                     &job_id,
-                    &format!(
-                        "failed to launch iteration run ({e}) — ensure `{}` is installed and in PATH",
-                        cmd.program
-                    ),
+                    &format!("failed to launch iteration run — {hint}"),
                 );
             }
         }
@@ -1097,6 +1186,16 @@ mod tests {
         .unwrap();
         let changed = rewrite_iteration_port(&worktree, BASE_DEV_PORT).unwrap();
         assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn iteration_guidance_enforces_single_trigger_for_canvas_and_feedback() {
+        let g = iteration_guidance(1);
+        assert!(g.contains("ONE button"));
+        assert!(g.contains("Canvas overlay"));
+        assert!(g.contains("Feedback panel"));
+        assert!(g.contains("panel_open"));
+        assert!(g.contains("Delete dead triggers") || g.contains("DELETE the previous trigger"));
     }
 
     #[test]
