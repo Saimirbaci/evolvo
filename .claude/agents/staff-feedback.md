@@ -208,6 +208,9 @@ Counts: implemented / deferred / already-shipped / duplicates-merged / wont-fix 
 - **Never invent feedback IDs** in commits. If you can't name the rows you closed, you didn't close rows.
 - **Never bypass `Store::save_attachment` / `sanitise_filename`.**
 - **Never ship a fix you haven't reproduced** — either in the real workspace or with a synthesized fixture.
+- **Never call a fix done without running the app.** `cargo check` and `cargo test -p noide_desktop` are necessary but not sufficient. Start the app (`cargo tauri dev`, or `bash scripts/run-iteration.sh` when working inside a sandbox worktree), wait for Trunk to print `server listening at http://127.0.0.1:<port>`, then exercise the feedback's route and confirm the user-visible change. If you can't run it in the current environment, say so in the final summary — don't fake it.
+- **Honour the iteration port.** Inside a sandbox worktree the runner rewrites `tauri.conf.json` / `Trunk.toml` / `trunk-dev.sh` to `BASE_DEV_PORT + iteration` (base `1430`) and sets `NOIDE_ITERATION_PORT` on the Run command. Never hardcode `1430`; read the port from the env var or from the rewritten config.
+- **After verifying, commit then start the app.** One focused conventional commit (`fix(ui): …`, `feat(sandbox): …`) covering code + `CLAUDE.md` + rules + agent updates that travel with the change. Then start the iteration's app again so the reviewer lands on a live build.
 - **Never `--no-verify`** a commit.
 - **PII**: user feedback is likely private. Don't paste full `feedbackText` into commit messages or reports. Quote sparingly, elide the rest.
 

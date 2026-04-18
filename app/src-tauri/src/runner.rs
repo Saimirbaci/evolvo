@@ -39,6 +39,21 @@ const RUN_LOG_FILE: &str = "iteration-run.log";
 const RUN_WORKSPACE_DIR: &str = "run_workspace";
 const DEFAULT_RUN_SCRIPT: &str = "scripts/run-iteration.sh";
 
+/// Base dev-server port used by the host NoIDE (iteration 0). Each iteration
+/// bumps this by its iteration number so concurrent iteration runs don't
+/// collide on the same port — iteration 1 lives on `BASE + 1`, iteration 2 on
+/// `BASE + 2`, and so on. Kept in sync with `app/src-tauri/tauri.conf.json`'s
+/// `devUrl` and `app/ui/Trunk.toml`'s `serve.port`.
+pub const BASE_DEV_PORT: u16 = 1430;
+
+/// Port the iteration's dev server should bind to. `iteration = 0` is the
+/// host NoIDE itself; real sandbox iterations start at 1. Capped at ~65500
+/// defensively, though in practice nobody reaches 64k iterations.
+pub fn iteration_port(iteration: u32) -> u16 {
+    let shifted = (BASE_DEV_PORT as u32).saturating_add(iteration);
+    shifted.min(65500) as u16
+}
+
 /// Locate the NoIDE source repo that should be forked into the sandbox.
 pub fn resolve_source_repo() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("NOIDE_SOURCE_REPO") {
@@ -207,6 +222,52 @@ pub fn create_worktree(source: &Path, dest: &Path, branch: &str) -> Result<(), S
     Ok(())
 }
 
+/// Rewrite the dev-server port in a worktree so iteration N listens on
+/// `BASE_DEV_PORT + N` instead of the base port. Best-effort: patches every
+/// file it recognises and ignores missing ones (the agent may have rewritten
+/// the stack, in which case they're responsible for handling the port via
+/// `scripts/run-iteration.sh` + the `NOIDE_ITERATION_PORT` env var).
+///
+/// Returns the list of files that were actually modified so callers can log
+/// a useful breadcrumb.
+pub fn rewrite_iteration_port(worktree: &Path, port: u16) -> Result<Vec<PathBuf>, StoreError> {
+    let base_str = BASE_DEV_PORT.to_string();
+    let port_str = port.to_string();
+    if base_str == port_str {
+        return Ok(Vec::new());
+    }
+
+    let mut changed = Vec::new();
+    let targets: &[&str] = &[
+        "app/src-tauri/tauri.conf.json",
+        "app/ui/Trunk.toml",
+        "app/ui/scripts/trunk-dev.sh",
+    ];
+
+    for rel in targets {
+        let path = worktree.join(rel);
+        if !path.exists() {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !body.contains(&base_str) {
+            continue;
+        }
+        // Replace any bare occurrence of the base port. The substrings we're
+        // replacing (":1430", "port = 1430", "--port 1430") are distinctive
+        // enough that a naive replace_all is safe — the base port number
+        // doesn't collide with anything else in these files.
+        let new_body = body.replace(&base_str, &port_str);
+        if new_body != body {
+            fs::write(&path, new_body)?;
+            changed.push(path);
+        }
+    }
+    Ok(changed)
+}
+
 /// Copy every attachment belonging to `feedback` into `inputs_dir` so the
 /// spawned `claude` process can Read them by absolute path from inside the
 /// worktree. Returns a human-readable list of the copied paths for the
@@ -273,6 +334,7 @@ pub struct StagedAttachment {
 /// Canvas / drawing board, Inbox, Sandbox pipeline) MUST survive every pass.
 pub fn iteration_guidance(iteration: u32) -> String {
     let n = iteration.max(1);
+    let port = iteration_port(n);
     let (phase, latitude) = match n {
         1..=3 => (
             "Bootstrap phase",
@@ -327,6 +389,12 @@ Because future iterations rely on the repo's own documentation for context, any 
 
 The next iteration's agent will read these files first. Leaving them stale is the single biggest way to sabotage iteration N+1.
 
+## Per-iteration dev-server port
+
+This iteration's dev server MUST listen on **port {port}** (base `1430` + iteration `{n}`). The runner has already rewritten `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in this worktree to use port `{port}` so concurrent iteration runs don't collide. When the reviewer clicks **Run**, the runner also sets `NOIDE_ITERATION_PORT={port}` in the child environment.
+
+If you rewrote the stack so the default files no longer exist, you MUST honour `NOIDE_ITERATION_PORT` in `scripts/run-iteration.sh` (or whatever startup script you ship) and bind the dev/server on that port. Never hardcode `1430` — it belongs to the host NoIDE.
+
 ## Keep the iteration runnable — `scripts/run-iteration.sh`
 
 The reviewer UI has a **Run** button that launches the app built in this iteration's worktree. It invokes `scripts/run-iteration.sh` at the worktree root if present, otherwise falls back to `cargo tauri dev` in `app/src-tauri`.
@@ -334,10 +402,33 @@ The reviewer UI has a **Run** button that launches the app built in this iterati
 If you rewrite the stack (e.g. move off Tauri/Leptos) you MUST create or update `scripts/run-iteration.sh` so the Run button still works. The script should:
 
 - Start the current app in the foreground (the runner streams its stdout/stderr into a log file).
+- Bind the dev/server to `$NOIDE_ITERATION_PORT` (falling back to `{port}` for this iteration if the env var isn't set).
 - Respect `NOIDE_WORKSPACE_ROOT` if the app stores any state — the runner sets that env var to a per-iteration workspace directory so runs stay isolated from the host NoIDE.
 - Exit non-zero on startup failure so the reviewer sees a useful error in the sandbox notes.
 
 If you kept the default stack, you can skip the script and rely on the `cargo tauri dev` fallback.
+
+## Verify-before-done — you MUST run the app before calling the task complete
+
+Type-checking is not verification. Before you commit and return, you MUST actually start the app and confirm it boots. The reviewer expects a running binary, not a green `cargo check`.
+
+Concrete steps for the default stack (adapt for whatever stack this iteration ships):
+
+1. Run `cargo check -p noide_desktop` and `cargo check -p noide_ui --target wasm32-unknown-unknown`. Both must pass.
+2. Run `cargo test -p noide_desktop` and fix any regression you introduced. Add tests for new host-side logic.
+3. Start the app in the background: `NOIDE_ITERATION_PORT={port} cargo tauri dev` (or `bash scripts/run-iteration.sh`). Wait for the dev server to print its ready line (Trunk prints `server listening at http://127.0.0.1:{port}`). If the build fails or the server doesn't come up, fix the cause — do NOT claim success.
+4. Exercise the change: navigate to the affected route, trigger the feedback / canvas / sandbox path that the feedback is about, and confirm the user-visible behaviour matches what was asked for. Try to break it — empty inputs, fast clicks, edge cases adjacent to what the feedback described. If any of the four invariants (Feedback Overlay, per-page Canvas overlay, Inbox, Sandbox pipeline) regressed, that's a blocker: fix it before finishing.
+5. Only after the app actually ran and the change actually worked, commit and return.
+
+If you genuinely cannot run the app in this environment (no display, missing system deps), say so plainly in your final summary — don't fake it. "I couldn't run the app because X" is acceptable; "looks good, tests pass" when you never started the binary is not.
+
+## After implementation — commit, then start the new version
+
+When the change is verified:
+
+1. Stage and commit every file you touched (including updated `CLAUDE.md` / rules / agents). Use a conventional-commit subject like `feat(ui): <short>` or `fix(sandbox): <short>`. One focused commit is fine; multiple small commits are better when the work naturally splits.
+2. Leave the iteration's app running so the reviewer lands on a live build. If you shut it down earlier to rebuild, start it again before returning: `NOIDE_ITERATION_PORT={port} cargo tauri dev` (or the equivalent for your stack). The reviewer's Run button will also launch it, but starting it here saves them a click and confirms startup worked.
+3. In your final summary mention the port this iteration is serving on ({port}) and how you verified the change.
 "#,
     )
 }
@@ -419,9 +510,12 @@ pub fn build_implementation_prompt(
 6. Run the appropriate checks before finishing. The exact commands depend on the current stack — read `CLAUDE.md` for the build contract. For today's Rust + Leptos + Tauri shell the defaults are:
    - Backend: `cargo check -p noide_desktop`
    - UI: `cargo check -p noide_ui --target wasm32-unknown-unknown`
+   - Tests: `cargo test -p noide_desktop`
    If you rewrote the stack, run the equivalent checks for the new stack and update `CLAUDE.md` to document them.
-7. Commit your work with `git add -A && git commit` so the reviewer can diff the branch. Use a conventional-commit subject line like `feat(ui): …` or `fix(sandbox): …`.
-8. Print a short summary (5-10 lines) of what you changed, which files were touched, and — if invariants were at risk — how you preserved Feedback Overlay / Canvas / Inbox / Sandbox. Keep it focused — the reviewer reads this first.
+7. **Actually run the app** (see "Verify-before-done" above). Start it on the iteration's port, confirm the dev server comes up, and exercise the change in the running app. A green `cargo check` is not sufficient — the reviewer expects a binary that boots and does what the feedback asked.
+8. Commit your work with `git add -A && git commit` so the reviewer can diff the branch. Use a conventional-commit subject line like `feat(ui): …` or `fix(sandbox): …`.
+9. Start the iteration's app again (if you shut it down to rebuild) so the reviewer lands on a live build when they open the worktree.
+10. Print a short summary (5-10 lines) of what you changed, which files were touched, how you verified the change ran, and — if invariants were at risk — how you preserved Feedback Overlay / Canvas / Inbox / Sandbox. Keep it focused — the reviewer reads this first.
 
 # Safety
 
@@ -496,6 +590,12 @@ pub fn prepare_run(
     create_worktree(&source, &worktree, &branch)?;
     let attachments = stage_attachments(store, feedback, &inputs_dir)?;
 
+    // Each iteration gets its own dev-server port so users can run multiple
+    // iterations side-by-side without collision. Rewrite the worktree's port
+    // config before the agent starts so `cargo tauri dev` "just works".
+    let port = iteration_port(job.iteration);
+    let _ = rewrite_iteration_port(&worktree, port);
+
     let prompt = build_implementation_prompt(feedback, job, &attachments, &log_file);
     fs::write(&prompt_file, &prompt)?;
 
@@ -503,6 +603,7 @@ pub fn prepare_run(
         "job_id": job.id,
         "feedback_id": feedback.id,
         "iteration": job.iteration,
+        "iteration_port": port,
         "branch": branch,
         "worktree": worktree.display().to_string(),
         "source_repo": source.display().to_string(),
@@ -709,14 +810,16 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
         };
 
         let cmd = resolve_run_command(&worktree);
+        let port = iteration_port(job.iteration);
         let _ = engine.append_note(
             &job_id,
             &format!(
-                "launching iteration run via {} ({} {}) in {} — log {}",
+                "launching iteration run via {} ({} {}) in {} on port {} — log {}",
                 cmd.source,
                 cmd.program,
                 cmd.args.join(" "),
                 cmd.cwd.display(),
+                port,
                 log_path.display(),
             ),
         );
@@ -725,6 +828,7 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
             .args(&cmd.args)
             .current_dir(&cmd.cwd)
             .env("NOIDE_WORKSPACE_ROOT", &run_workspace)
+            .env("NOIDE_ITERATION_PORT", port.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_handle))
             .stderr(Stdio::from(log_for_err))
@@ -937,6 +1041,69 @@ mod tests {
         assert_eq!(chosen.program, "bash");
         assert!(chosen.args[0].ends_with("scripts/run-iteration.sh"));
         assert_eq!(chosen.cwd, worktree);
+    }
+
+    #[test]
+    fn iteration_port_shifts_by_iteration_number() {
+        assert_eq!(iteration_port(0), BASE_DEV_PORT);
+        assert_eq!(iteration_port(1), BASE_DEV_PORT + 1);
+        assert_eq!(iteration_port(7), BASE_DEV_PORT + 7);
+        // Saturation guard: astronomical iterations stay in-range.
+        assert!(iteration_port(u32::MAX) <= 65500);
+    }
+
+    #[test]
+    fn rewrite_iteration_port_patches_known_files_and_tolerates_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().to_path_buf();
+        fs::create_dir_all(worktree.join("app/src-tauri")).unwrap();
+        fs::create_dir_all(worktree.join("app/ui/scripts")).unwrap();
+
+        fs::write(
+            worktree.join("app/src-tauri/tauri.conf.json"),
+            r#"{"build":{"devUrl":"http://localhost:1430"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            worktree.join("app/ui/Trunk.toml"),
+            "[serve]\nport = 1430\n",
+        )
+        .unwrap();
+        // trunk-dev.sh intentionally omitted — rewrite should skip it cleanly.
+
+        let port = iteration_port(3);
+        let changed = rewrite_iteration_port(&worktree, port).unwrap();
+        assert_eq!(changed.len(), 2);
+
+        let conf = fs::read_to_string(worktree.join("app/src-tauri/tauri.conf.json")).unwrap();
+        assert!(conf.contains(&port.to_string()));
+        assert!(!conf.contains("1430"));
+
+        let trunk = fs::read_to_string(worktree.join("app/ui/Trunk.toml")).unwrap();
+        assert!(trunk.contains(&port.to_string()));
+    }
+
+    #[test]
+    fn rewrite_iteration_port_is_noop_for_base_port() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().to_path_buf();
+        fs::create_dir_all(worktree.join("app/src-tauri")).unwrap();
+        fs::write(
+            worktree.join("app/src-tauri/tauri.conf.json"),
+            r#"{"devUrl":"http://localhost:1430"}"#,
+        )
+        .unwrap();
+        let changed = rewrite_iteration_port(&worktree, BASE_DEV_PORT).unwrap();
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn iteration_guidance_mentions_port_and_verification() {
+        let g = iteration_guidance(2);
+        assert!(g.contains(&iteration_port(2).to_string()));
+        assert!(g.contains("NOIDE_ITERATION_PORT"));
+        assert!(g.contains("Verify-before-done"));
+        assert!(g.contains("commit"));
     }
 
     #[test]

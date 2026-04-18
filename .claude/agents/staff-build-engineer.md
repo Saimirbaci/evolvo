@@ -43,9 +43,16 @@ cargo clippy -p noide_desktop -- -D warnings                 # host lint
 cargo check -p noide_ui --target wasm32-unknown-unknown      # WASM compile
 cd app/ui && trunk build                                     # WASM bundle
 cd app/src-tauri && cargo tauri build                        # (when bundle.active=true)
+cd app/src-tauri && cargo tauri dev                          # smoke test — must come up
 ```
 
-All six must pass. If one of the last two is ignored in CI because "it's slow," you've lost the contract. Measure, then optimize — don't skip.
+All seven must pass. If one of the last three is ignored in CI because "it's slow," you've lost the contract. Measure, then optimize — don't skip.
+
+**Green type-checks are not enough.** Before declaring a build-side change done, actually boot the app with `cargo tauri dev` and confirm Trunk prints `server listening at http://127.0.0.1:<port>`. A Cargo build that succeeds but a runtime that fails to bind the dev port (wrong feature flag, missing capability, broken CSP) is still a broken build.
+
+### Iteration port convention
+
+Inside sandbox worktrees, iteration `N` listens on `BASE_DEV_PORT + N` (base `1430`, defined in `app/src-tauri/src/runner.rs`). The runner rewrites `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in each worktree and sets `NOIDE_ITERATION_PORT` on the Run command. When you touch any of those three files, preserve the single-source `1430` literal (the rewriter does naive string replace) and honour `NOIDE_ITERATION_PORT` in any startup script you add.
 
 ---
 

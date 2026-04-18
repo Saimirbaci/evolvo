@@ -120,6 +120,34 @@ See `.claude/rules/common/product-invariants.md` for authoritative text. In shor
 
 These outrank refactor aesthetics and most feature requests. Changes that violate them are product decisions — escalate.
 
+## Verify-before-done — actually run the app
+
+Type-checks and unit tests do not prove the feature works. Before claiming a change is complete:
+
+1. Run `cargo check --workspace` and `cargo test -p noide_desktop`. Both must pass.
+2. **Start the app** with `cargo tauri dev` (or `bash scripts/run-iteration.sh` inside a sandbox worktree). Wait for Trunk to print `server listening at http://127.0.0.1:<port>`.
+3. **Exercise the change** in the running app: the affected route, the golden path, and 1-2 edge cases adjacent to what was asked. Confirm none of the four invariants regressed.
+4. Only then commit.
+
+If you genuinely cannot run the app in the current environment, say so plainly in your summary — don't claim success you didn't observe.
+
+## Sandbox iteration port convention
+
+Each sandbox iteration runs on its own dev-server port so multiple iterations can run side-by-side without collisions.
+
+- Host NoIDE (iteration 0): port **`1430`** — this is `BASE_DEV_PORT` in `app/src-tauri/src/runner.rs`.
+- Iteration `N`: port **`1430 + N`**.
+
+Before spawning the claude run in a sandbox worktree, the runner rewrites `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in that worktree to the iteration's port. The runner also sets `NOIDE_ITERATION_PORT=<port>` in the environment of the iteration's Run command. If you rewrite the stack, honour that env var in your replacement startup script — never hardcode `1430`.
+
+## After implementation — commit, then start the new version
+
+When the work is done and verified:
+
+1. `git add -A && git commit -m "<conventional commit>"` — include `CLAUDE.md`, rules, and agent updates in the same commit when they travel with a behaviour change.
+2. Start the iteration's app (`cargo tauri dev` or the equivalent for the current stack) so the reviewer lands on a live build. Leave it running.
+3. In your final summary note which port the iteration is serving on and how you verified it.
+
 ## Rules & agents
 
 Project rules live under `.claude/rules/` — read them before editing:
