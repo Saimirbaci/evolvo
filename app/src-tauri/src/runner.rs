@@ -5,10 +5,13 @@
 //! Safety posture:
 //! - The worktree lives on its own branch (`sandbox/<job-id>`) so Claude
 //!   can never touch the main branch or the primary checkout.
-//! - Claude is launched with `--permission-mode acceptEdits`. It auto-
-//!   approves file edits inside its sandbox but still pauses for genuinely
-//!   risky operations. This is intentionally more conservative than
-//!   `--dangerously-skip-permissions`.
+//! - Claude is launched with `--dangerously-skip-permissions`. The sandbox
+//!   worktree + throwaway branch provide the safety envelope; inside that
+//!   envelope the agent needs to actually run `cargo`, `git`, `trunk`,
+//!   `bash scripts/run-iteration.sh`, etc. without the user standing over
+//!   it hitting "approve". Every file the agent writes lives on
+//!   `sandbox/<job-id>` and every command runs in the worktree dir, so the
+//!   blast radius is bounded even with full tool access.
 //! - All stdout + stderr is streamed to `claude.log` under the job's sandbox
 //!   workspace directory, and every state transition is appended to the job
 //!   record's notes for observability.
@@ -520,8 +523,8 @@ pub fn build_implementation_prompt(
 # Safety
 
 - You are on branch `{branch}` in an isolated worktree. Do not `git push`, do not switch branches, do not touch the main branch.
-- You are running with `--permission-mode acceptEdits`: file edits inside this worktree are auto-approved, but genuinely risky operations still need confirmation.
-- If a dependency is missing or the task is impossible in this environment, say so plainly and exit — do not fake success.
+- You are running with `--dangerously-skip-permissions`: file edits, `cargo`, `git`, `trunk`, `bash scripts/run-iteration.sh`, and other shell commands inside this worktree all run without prompting. The worktree + throwaway branch are the safety envelope — use the access; don't burn cycles apologising for "not being able to run cargo". You ARE able. Run the checks and the app.
+- If a dependency is genuinely missing on the host (e.g. `cargo` itself isn't installed) say so plainly and exit — do not fake success. But "I'm blocked from running cargo" is not a valid reason inside this sandbox; you have permission.
 - Your full transcript is being captured at `{log_file}` for reviewer audit.
 "#,
         guidance = guidance,
@@ -613,7 +616,7 @@ pub fn prepare_run(
             "role": a.role,
             "path": a.path.display().to_string(),
         })).collect::<Vec<_>>(),
-        "permission_mode": "acceptEdits",
+        "permission_mode": "dangerously-skip-permissions",
         "started_at_unix_ms": crate::types::current_time_unix_ms(),
     });
     fs::write(&metadata_file, serde_json::to_string_pretty(&metadata)?)?;
@@ -661,7 +664,7 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
         let _ = engine.append_note(
             &job_id,
             &format!(
-                "claude code starting (permission-mode=acceptEdits, auth=subscription) in worktree {} — streaming to {}",
+                "claude code starting (dangerously-skip-permissions, auth=subscription) in worktree {} — streaming to {}",
                 prepared.worktree.display(),
                 prepared.log_file.display(),
             ),
@@ -676,8 +679,7 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
         let status = Command::new("claude")
             .arg("-p")
             .arg(&prepared.prompt)
-            .arg("--permission-mode")
-            .arg("acceptEdits")
+            .arg("--dangerously-skip-permissions")
             .current_dir(&prepared.worktree)
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_AUTH_TOKEN")
@@ -935,7 +937,7 @@ mod tests {
         assert!(prompt.contains("/tmp/job-42/inputs/annotations.json"));
         assert!(prompt.contains("/tmp/job-42/claude.log"));
         assert!(prompt.contains(".claude/agents/"));
-        assert!(prompt.contains("acceptEdits"));
+        assert!(prompt.contains("dangerously-skip-permissions"));
     }
 
     #[test]

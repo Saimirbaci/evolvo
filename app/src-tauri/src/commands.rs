@@ -173,7 +173,7 @@ pub fn load_sandbox_job(
 /// "Advance" button entry point. Behaviour depends on the job's current
 /// status:
 /// - `Pending` → fork the source repo into a sandbox worktree, spawn
-///   `claude -p … --permission-mode acceptEdits` in it, and return with
+///   `claude -p … --dangerously-skip-permissions` in it, and return with
 ///   status `Implementing`. The run continues on a background thread;
 ///   the job will flip to `BuildReady` or `Failed` when claude exits.
 /// - `BuildReady` → advance to `Promoted` via the regular state machine
