@@ -101,6 +101,16 @@ pub async fn run_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
 }
 
 #[derive(Serialize)]
+struct NoteArgs<'a> {
+    id: &'a str,
+    note: &'a str,
+}
+
+pub async fn append_sandbox_note(id: &str, note: &str) -> Result<SandboxJobRecord, String> {
+    invoke_command_with_args("append_sandbox_note", &NoteArgs { id, note }).await
+}
+
+#[derive(Serialize)]
 struct UrlArg<'a> {
     url: &'a str,
 }

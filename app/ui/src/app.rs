@@ -267,6 +267,7 @@ fn FeedbackCard(record: FeedbackRecord) -> impl IntoView {
 fn SandboxPage() -> impl IntoView {
     let items: RwSignal<Option<Result<Vec<SandboxJobRecord>, String>>> = RwSignal::new(None);
     let reload = RwSignal::new(0_u32);
+    let selected: RwSignal<Option<String>> = RwSignal::new(None);
     Effect::new(move |_: Option<()>| {
         let _ = reload.get();
         spawn_local(async move {
@@ -274,36 +275,92 @@ fn SandboxPage() -> impl IntoView {
             items.set(Some(result));
         });
     });
+
+    // Keep selection valid — if nothing selected but records exist, select the
+    // first; if the selected id disappeared, fall back.
+    Effect::new(move |_: Option<()>| {
+        let Some(Ok(ref records)) = items.get() else { return };
+        let current = selected.get_untracked();
+        let valid = current
+            .as_ref()
+            .map(|id| records.iter().any(|r| &r.id == id))
+            .unwrap_or(false);
+        if !valid {
+            selected.set(records.first().map(|r| r.id.clone()));
+        }
+    });
+
     view! {
-        <div class="list-page">
-            <h2>"Sandbox"</h2>
-            {move || match items.get() {
-                None => view! { <div class="empty-state">"Loading…"</div> }.into_any(),
-                Some(Err(e)) => view! {
-                    <div class="empty-state">{format!("Failed to load: {e}")}</div>
-                }.into_any(),
-                Some(Ok(records)) => {
-                    if records.is_empty() {
-                        view! {
-                            <div class="empty-state">"No sandbox jobs yet."</div>
-                        }.into_any()
-                    } else {
-                        view! {
-                            <div class="list-grid">
-                                {records.into_iter().map(|r| view! {
-                                    <SandboxCard record=r reload=reload />
-                                }).collect_view()}
-                            </div>
-                        }.into_any()
+        <div class="sandbox-page">
+            <aside class="sandbox-sidebar">
+                <h2 class="sandbox-sidebar-title">"Sandbox"</h2>
+                {move || match items.get() {
+                    None => view! { <div class="empty-state">"Loading…"</div> }.into_any(),
+                    Some(Err(e)) => view! {
+                        <div class="empty-state">{format!("Failed to load: {e}")}</div>
+                    }.into_any(),
+                    Some(Ok(records)) => {
+                        if records.is_empty() {
+                            view! {
+                                <div class="empty-state">"No sandbox jobs yet."</div>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <ul class="sandbox-list">
+                                    {records.into_iter().map(|r| {
+                                        let id = r.id.clone();
+                                        let id_for_click = id.clone();
+                                        let is_active = move || selected.get().as_deref() == Some(&id);
+                                        view! {
+                                            <li>
+                                                <button
+                                                    class="sandbox-list-item"
+                                                    class:active=is_active
+                                                    on:click=move |_| selected.set(Some(id_for_click.clone()))
+                                                >
+                                                    <div class="sandbox-list-item-head">
+                                                        <span class="sandbox-list-item-title">{r.title.clone()}</span>
+                                                        <span class="list-card-status">{r.status.label()}</span>
+                                                    </div>
+                                                    <div class="list-card-meta">
+                                                        {if r.iteration > 0 {
+                                                            format!("iter {} · {}", r.iteration, format_time(r.created_at_unix_ms))
+                                                        } else {
+                                                            format_time(r.created_at_unix_ms)
+                                                        }}
+                                                    </div>
+                                                </button>
+                                            </li>
+                                        }
+                                    }).collect_view()}
+                                </ul>
+                            }.into_any()
+                        }
                     }
-                }
-            }}
+                }}
+            </aside>
+            <section class="sandbox-detail">
+                {move || {
+                    let Some(Ok(records)) = items.get() else {
+                        return view! { <div class="empty-state">"Loading…"</div> }.into_any();
+                    };
+                    let Some(id) = selected.get() else {
+                        return view! {
+                            <div class="empty-state">"Select a sandbox job to view activity."</div>
+                        }.into_any();
+                    };
+                    let Some(record) = records.into_iter().find(|r| r.id == id) else {
+                        return view! { <div class="empty-state">"No selection."</div> }.into_any();
+                    };
+                    view! { <SandboxDetail record=record reload=reload /> }.into_any()
+                }}
+            </section>
         </div>
     }
 }
 
 #[component]
-fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView {
+fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView {
     let can_approve = record.status.can_approve();
     let can_retry = record.status.can_retry();
     let can_run = record.status.can_run() && record.worktree_path.is_some();
@@ -311,6 +368,12 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
     let reject_id = record.id.clone();
     let retry_id = record.id.clone();
     let run_id = record.id.clone();
+
+    // Inline "Fix" clarification editor state.
+    let fix_open: RwSignal<bool> = RwSignal::new(false);
+    let fix_text: RwSignal<String> = RwSignal::new(String::new());
+    let fix_submitting: RwSignal<bool> = RwSignal::new(false);
+
     let approve_click = move |_| {
         let id = approve_id.clone();
         spawn_local(async move {
@@ -325,24 +388,32 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
-    let retry_click = move |_| {
-        let id = retry_id.clone();
-        spawn_local(async move {
-            let _ = interop::retry_sandbox_job(&id).await;
-            reload.update(|v| *v = v.wrapping_add(1));
-        });
-    };
     let run_click = move |_| {
         let id = run_id.clone();
         spawn_local(async move {
             let _ = interop::run_sandbox_job(&id).await;
             reload.update(|v| *v = v.wrapping_add(1));
         });
-        // The sandbox run spawns a background thread on the host that writes
-        // notes asynchronously (launching…, then either success or failure).
-        // A single reload right after the invoke only catches the first note;
-        // poll for follow-up notes a few seconds later too.
         schedule_reloads(reload, &[1500, 4000, 10_000]);
+    };
+    let submit_fix = move || {
+        if fix_submitting.get_untracked() {
+            return;
+        }
+        let text = fix_text.get_untracked().trim().to_string();
+        let id = retry_id.clone();
+        fix_submitting.set(true);
+        spawn_local(async move {
+            if !text.is_empty() {
+                let note = format!("User clarification: {text}");
+                let _ = interop::append_sandbox_note(&id, &note).await;
+            }
+            let _ = interop::retry_sandbox_job(&id).await;
+            fix_submitting.set(false);
+            fix_open.set(false);
+            fix_text.set(String::new());
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
     };
 
     let branch = record.branch_name.clone();
@@ -350,22 +421,28 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
     let log = record.log_path.clone();
     let notes = record.notes.clone();
     let iteration = record.iteration;
+    let title = record.title.clone();
+    let summary = record.summary.clone();
+    let status_label = record.status.label();
+    let created = format_time(record.created_at_unix_ms);
 
     view! {
-        <div class="list-card">
-            <div class="list-card-head">
-                <span class="list-card-title">{record.title.clone()}</span>
-                <span class="list-card-status">{record.status.label()}</span>
-            </div>
-            <div class="list-card-meta">{format_time(record.created_at_unix_ms)}</div>
-            {if iteration > 0 {
-                view! {
-                    <div class="list-card-meta"><strong>"iteration: "</strong>{iteration}</div>
-                }.into_any()
-            } else {
-                view! { <span></span> }.into_any()
-            }}
-            <div class="list-card-body">{record.summary.clone()}</div>
+        <div class="sandbox-detail-inner">
+            <header class="sandbox-detail-head">
+                <div>
+                    <h3 class="sandbox-detail-title">{title}</h3>
+                    <div class="list-card-meta">
+                        {if iteration > 0 {
+                            format!("iteration {iteration} · {created}")
+                        } else {
+                            created
+                        }}
+                    </div>
+                </div>
+                <span class="list-card-status">{status_label}</span>
+            </header>
+
+            <p class="sandbox-detail-summary">{summary}</p>
 
             {match branch {
                 Some(b) => view! {
@@ -386,36 +463,72 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
                 None => view! { <span></span> }.into_any(),
             }}
 
-            {if notes.is_empty() {
-                view! { <span></span> }.into_any()
-            } else {
-                view! {
-                    <details class="list-card-notes">
-                        <summary>{format!("Activity ({} entries)", notes.len())}</summary>
-                        <ul>
+            <section class="sandbox-activity">
+                <h4>{format!("Activity ({} entries)", notes.len())}</h4>
+                {if notes.is_empty() {
+                    view! {
+                        <div class="empty-state">"No activity yet."</div>
+                    }.into_any()
+                } else {
+                    view! {
+                        <ul class="sandbox-activity-list">
                             {notes.into_iter().map(|n| view! { <li>{n}</li> }).collect_view()}
                         </ul>
-                    </details>
+                    }.into_any()
+                }}
+            </section>
+
+            {move || {
+                if !fix_open.get() {
+                    return view! { <span></span> }.into_any();
+                }
+                let submit = submit_fix.clone();
+                view! {
+                    <div class="sandbox-fix-form">
+                        <label class="sandbox-fix-label">
+                            "Describe the problem or give Claude more context for the fix:"
+                        </label>
+                        <textarea
+                            class="sandbox-fix-textarea"
+                            placeholder="e.g. build failed because the new command wasn't registered in invoke_handler…"
+                            prop:value=move || fix_text.get()
+                            on:input=move |ev| {
+                                let t = event_target::<web_sys::HtmlTextAreaElement>(&ev);
+                                fix_text.set(t.value());
+                            }
+                        ></textarea>
+                        <div class="sandbox-fix-actions">
+                            <button
+                                class="secondary-btn"
+                                prop:disabled=move || fix_submitting.get()
+                                on:click=move |_| {
+                                    fix_open.set(false);
+                                    fix_text.set(String::new());
+                                }
+                            >
+                                "Cancel"
+                            </button>
+                            <button
+                                class="primary-btn"
+                                prop:disabled=move || fix_submitting.get()
+                                on:click=move |_| submit()
+                            >
+                                {move || if fix_submitting.get() { "Submitting…" } else { "Submit fix" }}
+                            </button>
+                        </div>
+                    </div>
                 }.into_any()
             }}
 
-            <div class="list-card-actions">
+            <div class="sandbox-detail-actions">
                 <button class="secondary-btn" on:click=reject_click>"Reject"</button>
-                {if can_retry {
-                    view! {
-                        <button class="secondary-btn" on:click=retry_click>
-                            "Retry"
-                        </button>
-                    }.into_any()
-                } else {
-                    view! { <span></span> }.into_any()
-                }}
                 <button
-                    class="primary-btn"
-                    prop:disabled=!can_approve
-                    on:click=approve_click
+                    class="secondary-btn"
+                    prop:disabled=!can_retry
+                    on:click=move |_| fix_open.update(|v| *v = !*v)
+                    title="Send a clarification and re-run this iteration"
                 >
-                    "Advance"
+                    "Fix"
                 </button>
                 <button
                     class="secondary-btn"
@@ -424,6 +537,14 @@ fn SandboxCard(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView
                     title="Launch the app built in this iteration's worktree"
                 >
                     "Run"
+                </button>
+                <button
+                    class="primary-btn"
+                    prop:disabled=!can_approve
+                    on:click=approve_click
+                    title="Plan then implement the next iteration from this feedback"
+                >
+                    "Evolve"
                 </button>
             </div>
         </div>
