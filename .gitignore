@@ -9,3 +9,4 @@ workspace/
 app/src-tauri/gen/schemas/
 
 tmp.md
+examples/

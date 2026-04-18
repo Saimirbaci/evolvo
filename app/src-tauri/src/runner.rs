@@ -349,13 +349,24 @@ pub fn build_implementation_prompt(
     log_file: &Path,
 ) -> String {
     let iteration = if job.iteration == 0 { 1 } else { job.iteration };
+    let is_new_app = matches!(feedback.feedback_type, crate::types::FeedbackType::NewApp);
     let guidance = iteration_guidance(iteration);
-    let work_step_4 = if iteration <= 3 {
+    // A `NewApp` feedback is an explicit "start over" signal from the user —
+    // it overrides the iteration-number-based latitude and forces the agent
+    // back into bootstrap mode no matter how many iterations have happened.
+    let work_step_4 = if is_new_app {
+        "4. **This is a `NewApp` feedback.** The user is asking you to build a NEW APP from scratch on top of the NoIDE shell. Treat the existing app code as disposable scaffolding: rename, delete, rewrite, and restructure whatever you need to produce the app the user described in the canvas + text + voice. The only things you must preserve are the four product invariants above (Feedback Overlay, Canvas per-page overlay, Inbox, Sandbox pipeline) and the ability to keep iterating. Everything else — the old app's domain, pages, data model, stack choices — is up for replacement."
+    } else if iteration <= 3 {
         "4. Make the change the user described. On this iteration you are allowed — and expected — to restructure the codebase to fit the app the user drew. Touch as much as you need; just keep the four invariants above intact."
     } else if iteration <= 9 {
         "4. Make a change that clearly resolves the feedback and moves the app toward the user's described vision. Refactor when it serves the goal; don't refactor for its own sake."
     } else {
         "4. Make the minimal, focused change that actually resolves the feedback. Do not refactor unrelated code unless the user explicitly asks for it."
+    };
+    let new_app_banner = if is_new_app {
+        "\n\n> **Feedback type: `NewApp`.** The user has explicitly asked for a new app from scratch. This overrides the iteration-phase latitude above — you have bootstrap-level freedom to rewrite, regardless of iteration number. Preserve only the four invariants.\n"
+    } else {
+        ""
     };
     let feedback_type = format!("{:?}", feedback.feedback_type);
     let route = if feedback.page_route.is_empty() {
@@ -383,7 +394,7 @@ pub fn build_implementation_prompt(
     format!(
         r#"You are running inside a sandboxed git worktree of the NoIDE project. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Advance" on the resulting sandbox job. Your job: implement the change.
 
-{guidance}
+{guidance}{new_app_banner}
 
 # Sandbox job
 
@@ -427,6 +438,7 @@ pub fn build_implementation_prompt(
         feedback_text = feedback.feedback_text,
         log_file = log_file.display(),
         work_step_4 = work_step_4,
+        new_app_banner = new_app_banner,
     )
 }
 
@@ -870,6 +882,26 @@ mod tests {
         );
         assert!(prompt.contains("Iteration: `1`"));
         assert!(prompt.contains("Bootstrap phase"));
+    }
+
+    #[test]
+    fn prompt_treats_new_app_feedback_as_bootstrap_even_late_in_iterations() {
+        let mut fb = mk_feedback();
+        fb.feedback_type = FeedbackType::NewApp;
+        let mut job = mk_job();
+        job.iteration = 15; // Would normally be "minor, surgical" phase.
+
+        let prompt = build_implementation_prompt(
+            &fb,
+            &job,
+            &[],
+            Path::new("/tmp/claude.log"),
+        );
+        assert!(prompt.contains("NewApp"));
+        assert!(prompt.contains("new app from scratch") || prompt.contains("NEW APP from scratch"));
+        assert!(prompt.contains("overrides the iteration-phase latitude"));
+        // The "minor, surgical" guidance must NOT be chosen for NewApp, even at iteration 15.
+        assert!(!prompt.contains("Make the minimal, focused change"));
     }
 
     #[test]
