@@ -1,4 +1,6 @@
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
+use web_sys::{Element, PointerEvent};
 
 use crate::canvas::{CanvasController, DrawingTool};
 
@@ -17,8 +19,52 @@ const STROKES: &[(&str, f64)] = &[("S", 1.5), ("M", 3.0), ("L", 6.0)];
 #[component]
 pub fn Toolbar(controller: CanvasController) -> impl IntoView {
     let tools = DrawingTool::all();
+    let offset: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
+    let drag_origin: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
+
+    let on_handle_down = move |ev: PointerEvent| {
+        ev.prevent_default();
+        if let Some(target) = ev.target().and_then(|t| t.dyn_into::<Element>().ok()) {
+            let _ = target.set_pointer_capture(ev.pointer_id());
+        }
+        let (ox, oy) = offset.get_untracked();
+        drag_origin.set(Some((ev.client_x() as f64, ev.client_y() as f64, ox, oy)));
+    };
+    let on_handle_move = move |ev: PointerEvent| {
+        if let Some((sx, sy, ox, oy)) = drag_origin.get_untracked() {
+            offset.set((
+                ox + ev.client_x() as f64 - sx,
+                oy + ev.client_y() as f64 - sy,
+            ));
+        }
+    };
+    let on_handle_up = move |ev: PointerEvent| {
+        drag_origin.set(None);
+        if let Some(target) = ev.target().and_then(|t| t.dyn_into::<Element>().ok()) {
+            let _ = target.release_pointer_capture(ev.pointer_id());
+        }
+    };
+
     view! {
-        <div class="toolbar" aria-label="Drawing tools">
+        <div
+            class="toolbar"
+            aria-label="Drawing tools"
+            style:transform=move || {
+                let (x, y) = offset.get();
+                format!("translate({x}px, {y}px)")
+            }
+        >
+            <div
+                class="drag-handle"
+                title="Drag to move"
+                aria-label="Move toolbar"
+                on:pointerdown=on_handle_down
+                on:pointermove=on_handle_move
+                on:pointerup=on_handle_up
+                on:pointercancel=on_handle_up
+            >
+                "⋮⋮"
+            </div>
             <div class="toolbar-row">
                 {tools.into_iter().map(|tool| {
                     let ctrl = controller.clone();

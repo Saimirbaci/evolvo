@@ -8,6 +8,29 @@ use crate::interop;
 use crate::toolbar::Toolbar;
 use crate::types::{AppHealth, FeedbackRecord, SandboxJobRecord};
 
+/// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
+/// moves. Kept as a constant rather than a build-time env var so the binary
+/// ships with a known, auditable destination.
+const STAR_REPO_URL: &str = "https://github.com/saimirbaci/NoIDE";
+
+fn star_us_link() -> leptos::prelude::AnyView {
+    view! {
+        <button
+            class="app-bar-link star-us-link"
+            title="Star this repo on GitHub"
+            aria-label="Star NoIDE on GitHub"
+            on:click=move |_| {
+                spawn_local(async move {
+                    let _ = interop::open_external_url(STAR_REPO_URL).await;
+                });
+            }
+        >
+            <span class="star-us-icon" aria-hidden="true">"★"</span>
+            "Star Us"
+        </button>
+    }.into_any()
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Default)]
 pub enum View {
     #[default]
@@ -75,9 +98,9 @@ pub fn App() -> impl IntoView {
                     </span>
                 </div>
                 <nav class="app-bar-actions">
-                    {View::all().into_iter().map(|v| {
+                    {View::all().into_iter().flat_map(|v| {
                         let is_active = move || view_sig.get() == v;
-                        view! {
+                        let primary = view! {
                             <button
                                 class="app-bar-link"
                                 class:active=is_active
@@ -85,6 +108,14 @@ pub fn App() -> impl IntoView {
                             >
                                 {v.label()}
                             </button>
+                        }.into_any();
+                        // Inject the "Star Us" shortcut just before the
+                        // Sandbox tab so it sits at the left edge of the
+                        // sandbox section of the nav.
+                        if matches!(v, View::Sandbox) {
+                            vec![star_us_link(), primary]
+                        } else {
+                            vec![primary]
                         }
                     }).collect_view()}
                 </nav>

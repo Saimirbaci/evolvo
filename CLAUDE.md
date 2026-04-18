@@ -132,3 +132,5 @@ Agents:
 - `staff-feedback` — works the local feedback queue (reads JSON from `~/.noide/noide_workspace/feedback/`) and ships fixes end-to-end.
 - `staff-build-engineer` — keeps `cargo check`, `cargo test`, `trunk build`, `cargo tauri build` green; owns toolchain, CI hygiene, bundle size.
 - `staff-architect-self-evolving-software` — designs the sandbox → promotion pipeline so the app can safely absorb its own feedback.
+
+# After each session of work is complete commit the changes with a message describing the work done.

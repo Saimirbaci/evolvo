@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use web_sys::{window, HtmlTextAreaElement};
+use wasm_bindgen::JsCast;
+use web_sys::{window, Element, HtmlTextAreaElement, PointerEvent};
 
 use crate::canvas::CanvasController;
 use crate::interop;
@@ -83,9 +84,58 @@ pub fn FeedbackPanel(
     let thumbs_ctrl = controller.clone();
     let voice_view = voice.clone();
 
+    let offset: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
+    let drag_origin: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
+
+    let on_handle_down = move |ev: PointerEvent| {
+        // Don't start a drag if the user clicked an interactive child
+        // (the close button). Only grab drags that start on the header
+        // element itself or the title span.
+        if let Some(t) = ev.target().and_then(|t| t.dyn_into::<Element>().ok()) {
+            let tag = t.tag_name();
+            if tag.eq_ignore_ascii_case("button") {
+                return;
+            }
+        }
+        ev.prevent_default();
+        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<Element>().ok()) {
+            let _ = target.set_pointer_capture(ev.pointer_id());
+        }
+        let (ox, oy) = offset.get_untracked();
+        drag_origin.set(Some((ev.client_x() as f64, ev.client_y() as f64, ox, oy)));
+    };
+    let on_handle_move = move |ev: PointerEvent| {
+        if let Some((sx, sy, ox, oy)) = drag_origin.get_untracked() {
+            offset.set((
+                ox + ev.client_x() as f64 - sx,
+                oy + ev.client_y() as f64 - sy,
+            ));
+        }
+    };
+    let on_handle_up = move |ev: PointerEvent| {
+        drag_origin.set(None);
+        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<Element>().ok()) {
+            let _ = target.release_pointer_capture(ev.pointer_id());
+        }
+    };
+
     view! {
-        <aside class="panel" aria-label="Feedback">
-            <div class="panel-header">
+        <aside
+            class="panel"
+            aria-label="Feedback"
+            style:transform=move || {
+                let (x, y) = offset.get();
+                format!("translate({x}px, {y}px)")
+            }
+        >
+            <div
+                class="panel-header panel-drag-handle"
+                title="Drag to move"
+                on:pointerdown=on_handle_down
+                on:pointermove=on_handle_move
+                on:pointerup=on_handle_up
+                on:pointercancel=on_handle_up
+            >
                 <div class="panel-title">"Feedback"</div>
                 <button
                     class="panel-close-btn"

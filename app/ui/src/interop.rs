@@ -99,3 +99,12 @@ pub async fn retry_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
 pub async fn run_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
     invoke_command_with_args("run_sandbox_job", &IdArg { id }).await
 }
+
+#[derive(Serialize)]
+struct UrlArg<'a> {
+    url: &'a str,
+}
+
+pub async fn open_external_url(url: &str) -> Result<(), String> {
+    invoke_command_with_args("open_external_url", &UrlArg { url }).await
+}

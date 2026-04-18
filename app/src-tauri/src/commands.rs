@@ -364,6 +364,40 @@ pub fn open_workspace_path(state: State<'_, AppState>) -> Result<String, String>
     Ok(state.workspace_root_display())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenUrlPayload {
+    pub url: String,
+}
+
+/// Open an external URL in the user's default browser. Restricted to http(s)
+/// so we can't be tricked into shelling out to arbitrary `file://` or custom
+/// schemes. We shell out to the platform's native "open" instead of pulling
+/// in `tauri-plugin-opener` just for one Star-Us button — fewer dependencies,
+/// no extra capability grants.
+#[tauri::command]
+pub fn open_external_url(payload: OpenUrlPayload) -> Result<(), String> {
+    let url = payload.url;
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("refusing to open non-http(s) url: {url}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    let spawn_result = std::process::Command::new("open").arg(&url).spawn();
+
+    #[cfg(target_os = "linux")]
+    let spawn_result = std::process::Command::new("xdg-open").arg(&url).spawn();
+
+    #[cfg(target_os = "windows")]
+    let spawn_result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", &url])
+        .spawn();
+
+    spawn_result
+        .map(|_| ())
+        .map_err(|e| format!("failed to open url {url}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -95,6 +95,50 @@ button {
   color: var(--accent);
 }
 
+.star-us-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #b45309;
+}
+
+.star-us-link:hover {
+  background: rgba(234, 179, 8, 0.12);
+}
+
+.star-us-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+
+/* ---- Drag handle shared ---- */
+
+.drag-handle {
+  align-self: center;
+  padding: 2px 6px;
+  margin-bottom: 4px;
+  color: rgba(15, 23, 42, 0.35);
+  font-size: 11px;
+  letter-spacing: 2px;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+.drag-handle:active {
+  cursor: grabbing;
+}
+
+.panel-drag-handle {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.panel-drag-handle:active {
+  cursor: grabbing;
+}
+
 /* ---- Canvas stage ---- */
 
 .stage {
