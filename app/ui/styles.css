@@ -194,9 +194,10 @@ button {
     color: rgba(15, 23, 42, 0.45);
 }
 
-/* ---- Drawing toolbar ---- */
+/* ---- Drawing toolbar (pill) ---- */
 
 .toolbar {
+<<<<<<< HEAD
     position: absolute;
     left: 20px;
     top: 20px;
@@ -257,6 +258,93 @@ button {
 .stroke-btn {
     font-size: 12px;
     font-weight: 600;
+=======
+  position: absolute;
+  left: 20px;
+  top: 20px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--panel-bg);
+  border-radius: 999px;
+  box-shadow: var(--panel-shadow);
+  backdrop-filter: blur(10px);
+  z-index: 30;
+}
+
+.toolbar-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 32px;
+  color: rgba(15, 23, 42, 0.3);
+  font-size: 11px;
+  letter-spacing: 1px;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+.toolbar-handle:active {
+  cursor: grabbing;
+}
+
+.pill-btn {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  color: var(--fg);
+  font-size: 15px;
+  transition: background 0.15s ease, color 0.15s ease;
+  padding: 0;
+}
+
+.pill-btn:hover {
+  background: rgba(15, 23, 42, 0.06);
+}
+
+.pill-btn.active {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.pill-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.pill-tool {
+  background: rgba(15, 23, 42, 0.05);
+}
+
+.pill-tool-glyph {
+  font-size: 17px;
+  line-height: 1;
+}
+
+.pill-color-dot {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--panel-bg);
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.2);
+}
+
+.pill-stroke {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant: tabular-nums;
+>>>>>>> 13e29e5 (feat(ui): pill toolbar + shape/select/crop tools)
 }
 
 .color-swatch {
@@ -271,6 +359,90 @@ button {
 .color-swatch.active {
     border-color: var(--fg);
     transform: scale(1.1);
+}
+
+/* ---- Toolbar popovers ---- */
+
+.popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  min-width: 180px;
+  background: var(--panel-bg);
+  border-radius: 10px;
+  box-shadow: var(--panel-shadow);
+  backdrop-filter: blur(10px);
+  padding: 6px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.popover-colors {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: auto;
+  padding: 8px;
+}
+
+.popover-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--fg);
+  font-size: 13px;
+  text-align: left;
+  width: 100%;
+}
+
+.popover-item:hover:not(:disabled) {
+  background: rgba(15, 23, 42, 0.06);
+}
+
+.popover-item.active {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.popover-item.danger {
+  color: #b91c1c;
+}
+
+.popover-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.popover-glyph {
+  width: 20px;
+  display: inline-flex;
+  justify-content: center;
+  font-size: 15px;
+}
+
+.popover-label {
+  flex: 1;
+}
+
+.popover-kbd {
+  font-size: 11px;
+  color: rgba(15, 23, 42, 0.5);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(15, 23, 42, 0.06);
+}
+
+.popover-item.active .popover-kbd {
+  background: rgba(255, 255, 255, 0.25);
+  color: var(--accent-fg);
 }
 
 /* ---- Feedback side panel ---- */

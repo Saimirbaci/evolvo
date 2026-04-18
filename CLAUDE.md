@@ -224,7 +224,6 @@ Agents:
 - `staff-architect-self-evolving-software` — designs the lineage → promotion pipeline so the app can safely absorb its own feedback.
 
 # After each session:
-
 - Commit the changes with a message describing the work done.
 - Start the new version of the app (the iteration you just built) so the reviewer can see it live when they start their review.
 - Update the SandboxJob status to `build_ready` so the next iteration can start from it.

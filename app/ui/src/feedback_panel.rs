@@ -86,6 +86,38 @@ pub fn FeedbackPanel(
 
     let offset: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let drag_origin: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
+    // Explicit size overrides. `None` means "use the CSS default" (width 320px,
+    // height stretched between top:20 and bottom:20). Once the user drags the
+    // resize handle we switch to fixed pixel dimensions.
+    let size: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
+    let resize_origin: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
+
+    let on_resize_down = move |ev: PointerEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<Element>().ok()) {
+            let _ = target.set_pointer_capture(ev.pointer_id());
+        }
+        let (w, h) = size.get_untracked().unwrap_or_else(current_panel_size);
+        resize_origin.set(Some((ev.client_x() as f64, ev.client_y() as f64, w, h)));
+    };
+    let on_resize_move = move |ev: PointerEvent| {
+        if let Some((sx, sy, w0, h0)) = resize_origin.get_untracked() {
+            // Panel is anchored top/right, so dragging left grows width and
+            // dragging down grows height.
+            let dx = sx - ev.client_x() as f64;
+            let dy = ev.client_y() as f64 - sy;
+            let w = (w0 + dx).clamp(260.0, 900.0);
+            let h = (h0 + dy).clamp(240.0, 1400.0);
+            size.set(Some((w, h)));
+        }
+    };
+    let on_resize_up = move |ev: PointerEvent| {
+        resize_origin.set(None);
+        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<Element>().ok()) {
+            let _ = target.release_pointer_capture(ev.pointer_id());
+        }
+    };
 
     let on_handle_down = move |ev: PointerEvent| {
         // Don't start a drag if the user clicked an interactive child
@@ -127,6 +159,9 @@ pub fn FeedbackPanel(
                 let (x, y) = offset.get();
                 format!("translate({x}px, {y}px)")
             }
+            style:width=move || size.get().map(|(w, _)| format!("{w}px")).unwrap_or_default()
+            style:height=move || size.get().map(|(_, h)| format!("{h}px")).unwrap_or_default()
+            style:bottom=move || if size.get().is_some() { "auto".to_string() } else { String::new() }
         >
             <div
                 class="panel-header panel-drag-handle"
@@ -215,11 +250,33 @@ pub fn FeedbackPanel(
                     }
                     on:click=submit
                 >
-                    {move || if submitting.get() { "Sending…" } else { "Submit to lineage" }}
+                    {move || if submitting.get() { "Sending…" } else { "Submit to sandbox" }}
                 </button>
             </div>
+            <div
+                class="panel-resize-handle"
+                title="Drag to resize"
+                aria-label="Resize feedback panel"
+                role="separator"
+                on:pointerdown=on_resize_down
+                on:pointermove=on_resize_move
+                on:pointerup=on_resize_up
+                on:pointercancel=on_resize_up
+            ></div>
         </aside>
     }
+}
+
+/// Current on-screen dimensions of any existing `.panel` element. Used as
+/// the starting point the first time the user grabs the resize handle so the
+/// panel doesn't jump from its CSS-driven stretched height to a fixed value.
+fn current_panel_size() -> (f64, f64) {
+    let Some(doc) = window().and_then(|w| w.document()) else { return (320.0, 480.0) };
+    let Some(el) = doc.query_selector(".panel").ok().flatten() else {
+        return (320.0, 480.0);
+    };
+    let rect = el.get_bounding_client_rect();
+    (rect.width().max(260.0), rect.height().max(240.0))
 }
 
 fn window_size() -> (u32, u32) {
