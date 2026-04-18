@@ -208,6 +208,7 @@ When the work is done and verified:
 1. `git add -A && git commit -m "<conventional commit>"` — include `CLAUDE.md`, rules, and agent updates in the same commit when they travel with a behaviour change.
 2. Start the iteration's app (`cargo tauri dev` or the equivalent for the current stack) so the reviewer lands on a live build. Leave it running.
 3. In your final summary note which port the iteration is serving on and how you verified it.
+4. Change the SandboxJob status to `build_ready` so the next iteration can start from it.
 
 ## Rules & agents
 
