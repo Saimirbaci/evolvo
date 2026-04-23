@@ -370,10 +370,10 @@ async fn wait_two_frames() {
 }
 
 /// Draw the page PNG and the annotation PNG into an offscreen canvas and
-/// return the resulting base64. Annotations are stretched to the page image's
-/// dimensions because the overlay is full-viewport and captured window pixels
-/// include the native chrome (title bar) — the small misalignment from the
-/// title bar is acceptable for feedback-review purposes.
+/// return the resulting base64. The annotation is drawn only over the canvas
+/// element's actual bounding rect in the captured image — not stretched to
+/// the full page — so strokes stay aligned with the page content they're
+/// annotating (the app bar stays visible, strokes don't creep over it).
 async fn composite_page_and_annotations(page_b64: &str, anno_data_url: &str) -> Option<String> {
     let page_url = format!("data:image/png;base64,{page_b64}");
     let page_img = load_image(&page_url).await?;
@@ -397,15 +397,42 @@ async fn composite_page_and_annotations(page_b64: &str, anno_data_url: &str) -> 
         .ok()?;
 
     ctx.draw_image_with_html_image_element(&page_img, 0.0, 0.0).ok()?;
-    // Stretch the annotation layer over the full page — canvas overlay CSS
-    // is full-viewport so ratios map correctly even if the pixel sizes differ
-    // (HiDPI → capture is at device pixels, annotations at CSS pixels).
+
+    // Map the canvas-surface's CSS-pixel rect onto the captured image.
+    // The capture may include native window chrome (title bar on macOS) so
+    // the capture's height often exceeds `window.innerHeight * dpr` by the
+    // chrome height. We scale by width ratio and offset vertically by that
+    // chrome band.
+    let win = window()?;
+    let inner_w = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0);
+    let inner_h = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0);
+    let (dx, dy, dw, dh) = {
+        let surface = doc
+            .query_selector(".canvas-surface")
+            .ok()
+            .flatten()
+            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
+        let rect = surface.as_ref().map(|el| el.get_bounding_client_rect());
+        let scale_x = pw as f64 / inner_w;
+        let scale_y = pw as f64 / inner_w; // preserve aspect using width ratio
+        let chrome_offset = (ph as f64 - inner_h * scale_y).max(0.0);
+        match rect {
+            Some(r) => (
+                r.left() * scale_x,
+                chrome_offset + r.top() * scale_y,
+                r.width() * scale_x,
+                r.height() * scale_y,
+            ),
+            None => (0.0, 0.0, pw as f64, ph as f64),
+        }
+    };
+
     ctx.draw_image_with_html_image_element_and_dw_and_dh(
         &anno_img,
-        0.0,
-        0.0,
-        pw as f64,
-        ph as f64,
+        dx,
+        dy,
+        dw,
+        dh,
     )
     .ok()?;
 

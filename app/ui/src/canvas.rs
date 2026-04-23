@@ -461,9 +461,14 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
 
             if tool == DrawingTool::Text {
                 ev.prevent_default();
+                // Input is absolutely positioned inside .stage, which does
+                // not start at viewport (0,0) — the app bar sits above it.
+                // Store stage-relative coords so CSS left/top puts the input
+                // where the user clicked rather than offset by the app-bar
+                // height.
                 ctrl.text_input.set(Some(TextInputState {
-                    client_x: ev.client_x() as f64,
-                    client_y: ev.client_y() as f64,
+                    client_x: ev.client_x() as f64 - rect.left(),
+                    client_y: ev.client_y() as f64 - rect.top(),
                     ratio_x: rx,
                     ratio_y: ry,
                 }));
