@@ -1,7 +1,12 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use wasm_bindgen::JsCast;
-use web_sys::{window, Element, HtmlTextAreaElement, PointerEvent};
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{
+    window, CanvasRenderingContext2d, Element, HtmlCanvasElement, HtmlElement, HtmlImageElement,
+    HtmlTextAreaElement, PointerEvent,
+};
 
 use crate::canvas::CanvasController;
 use crate::interop;
@@ -32,9 +37,7 @@ pub fn FeedbackPanel(
             }
             submitting.set(true);
             status.set(None);
-            let screenshot = ctrl
-                .to_png_data_url()
-                .and_then(|url| url.split(',').nth(1).map(str::to_string));
+            let anno_url = ctrl.to_png_data_url();
             let annotations = ctrl.annotations_json();
             let pasted = ctrl.pasted_base64.get_untracked();
             let (win_w, win_h) = window_size();
@@ -46,23 +49,54 @@ pub fn FeedbackPanel(
                     Some(t)
                 }
             };
-            let payload = SubmitFeedbackPayload {
-                feedback_type: feedback_type.get_untracked(),
-                page_route: route.get_untracked(),
-                feedback_text: text.get_untracked(),
-                annotations,
-                pasted_images_base64: pasted,
-                screenshot_base64: screenshot,
-                voice_base64: voice.base64.get_untracked(),
-                voice_mime_type: voice.mime_type.get_untracked(),
-                voice_transcript: transcript,
-                window_width: win_w,
-                window_height: win_h,
-            };
+            let feedback_type_v = feedback_type.get_untracked();
+            let route_v = route.get_untracked();
+            let text_v = text.get_untracked();
+            let voice_b64 = voice.base64.get_untracked();
+            let voice_mime = voice.mime_type.get_untracked();
 
             let ctrl_reset = ctrl.clone();
             let voice_reset = voice.clone();
             spawn_local(async move {
+                // Hide overlays so the screenshot captures the underlying page
+                // without the canvas surface or this feedback panel obscuring it.
+                let hidden = hide_overlays_for_capture();
+                wait_two_frames().await;
+                let page_b64 = interop::capture_window_png().await.ok();
+                restore_overlays(&hidden);
+
+                // Composite: page as backdrop, annotation PNG stretched on top.
+                let screenshot = match (page_b64.as_deref(), anno_url.as_deref()) {
+                    (Some(page), Some(anno)) => {
+                        composite_page_and_annotations(page, anno)
+                            .await
+                            .or_else(|| Some(page.to_string()))
+                    }
+                    (Some(page), None) => Some(page.to_string()),
+                    (None, Some(anno)) => Some(
+                        anno.split(',')
+                            .nth(1)
+                            .map(str::to_string)
+                            .unwrap_or_default(),
+                    ),
+                    (None, None) => None,
+                }
+                .filter(|s| !s.is_empty());
+
+                let payload = SubmitFeedbackPayload {
+                    feedback_type: feedback_type_v,
+                    page_route: route_v,
+                    feedback_text: text_v,
+                    annotations,
+                    pasted_images_base64: pasted,
+                    screenshot_base64: screenshot,
+                    voice_base64: voice_b64,
+                    voice_mime_type: voice_mime,
+                    voice_transcript: transcript,
+                    window_width: win_w,
+                    window_height: win_h,
+                };
+
                 match interop::submit_feedback(&payload).await {
                     Ok(record) => {
                         status.set(Some(Ok(format!("Sent • queued as {}", record.id))));
@@ -277,6 +311,116 @@ fn current_panel_size() -> (f64, f64) {
     };
     let rect = el.get_bounding_client_rect();
     (rect.width().max(260.0), rect.height().max(240.0))
+}
+
+/// Tracks elements we forced to `visibility: hidden` while a capture is in
+/// flight, so `restore_overlays` can put them back without touching anything
+/// else in the DOM.
+struct HiddenHandles {
+    nodes: Vec<(HtmlElement, String)>,
+}
+
+fn hide_overlays_for_capture() -> HiddenHandles {
+    let mut nodes = Vec::new();
+    let Some(doc) = window().and_then(|w| w.document()) else {
+        return HiddenHandles { nodes };
+    };
+    // Hide the canvas overlay (transparent annotation layer) and this feedback
+    // panel itself so the captured screenshot shows the page beneath them.
+    for sel in [".canvas-overlay", ".panel"] {
+        if let Ok(Some(node)) = doc.query_selector(sel) {
+            if let Ok(el) = node.dyn_into::<HtmlElement>() {
+                let style = el.style();
+                let prior = style
+                    .get_property_value("visibility")
+                    .unwrap_or_default();
+                let _ = style.set_property("visibility", "hidden");
+                nodes.push((el, prior));
+            }
+        }
+    }
+    HiddenHandles { nodes }
+}
+
+fn restore_overlays(h: &HiddenHandles) {
+    for (el, prior) in &h.nodes {
+        let style = el.style();
+        if prior.is_empty() {
+            let _ = style.remove_property("visibility");
+        } else {
+            let _ = style.set_property("visibility", prior);
+        }
+    }
+}
+
+/// Double-RAF: the first frame applies the visibility change, the second
+/// guarantees the compositor has painted the updated frame before we take
+/// the native screenshot.
+async fn wait_two_frames() {
+    for _ in 0..2 {
+        let Some(win) = window() else { return };
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let cb = Closure::once_into_js(move || {
+                let _ = resolve.call0(&JsValue::UNDEFINED);
+            });
+            let _ = win.request_animation_frame(cb.as_ref().unchecked_ref());
+        });
+        let _ = JsFuture::from(promise).await;
+    }
+}
+
+/// Draw the page PNG and the annotation PNG into an offscreen canvas and
+/// return the resulting base64. Annotations are stretched to the page image's
+/// dimensions because the overlay is full-viewport and captured window pixels
+/// include the native chrome (title bar) — the small misalignment from the
+/// title bar is acceptable for feedback-review purposes.
+async fn composite_page_and_annotations(page_b64: &str, anno_data_url: &str) -> Option<String> {
+    let page_url = format!("data:image/png;base64,{page_b64}");
+    let page_img = load_image(&page_url).await?;
+    let anno_img = load_image(anno_data_url).await?;
+    let pw = page_img.natural_width().max(1);
+    let ph = page_img.natural_height().max(1);
+
+    let doc = window().and_then(|w| w.document())?;
+    let canvas: HtmlCanvasElement = doc
+        .create_element("canvas")
+        .ok()?
+        .dyn_into::<HtmlCanvasElement>()
+        .ok()?;
+    canvas.set_width(pw);
+    canvas.set_height(ph);
+    let ctx: CanvasRenderingContext2d = canvas
+        .get_context("2d")
+        .ok()
+        .flatten()?
+        .dyn_into()
+        .ok()?;
+
+    ctx.draw_image_with_html_image_element(&page_img, 0.0, 0.0).ok()?;
+    // Stretch the annotation layer over the full page — canvas overlay CSS
+    // is full-viewport so ratios map correctly even if the pixel sizes differ
+    // (HiDPI → capture is at device pixels, annotations at CSS pixels).
+    ctx.draw_image_with_html_image_element_and_dw_and_dh(
+        &anno_img,
+        0.0,
+        0.0,
+        pw as f64,
+        ph as f64,
+    )
+    .ok()?;
+
+    let url = canvas.to_data_url_with_type("image/png").ok()?;
+    url.split(',').nth(1).map(str::to_string)
+}
+
+async fn load_image(src: &str) -> Option<HtmlImageElement> {
+    let img = HtmlImageElement::new().ok()?;
+    img.set_src(src);
+    let _ = JsFuture::from(img.decode()).await;
+    if img.natural_width() == 0 {
+        return None;
+    }
+    Some(img)
 }
 
 fn window_size() -> (u32, u32) {

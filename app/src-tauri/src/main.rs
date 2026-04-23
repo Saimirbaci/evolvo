@@ -20,6 +20,7 @@ fn main() {
             commands::run_sandbox_job,
             commands::append_sandbox_note,
             commands::open_workspace_path,
+            commands::capture_window_png,
             commands::open_external_url,
         ])
         .run(tauri::generate_context!())

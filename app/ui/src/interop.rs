@@ -118,3 +118,11 @@ struct UrlArg<'a> {
 pub async fn open_external_url(url: &str) -> Result<(), String> {
     invoke_command_with_args("open_external_url", &UrlArg { url }).await
 }
+
+/// Returns base64-encoded PNG of the current Tauri window. Used by the
+/// feedback panel to composite annotations onto the real page view, since
+/// the canvas overlay itself is transparent and would otherwise leave the
+/// submitted screenshot without any page context.
+pub async fn capture_window_png() -> Result<String, String> {
+    invoke_command("capture_window_png").await
+}

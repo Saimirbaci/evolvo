@@ -364,6 +364,34 @@ pub fn open_workspace_path(state: State<'_, AppState>) -> Result<String, String>
     Ok(state.workspace_root_display())
 }
 
+/// Capture the Tauri window's content as a PNG and return base64.
+///
+/// The UI calls this right before submitting feedback so it can composite
+/// annotations onto the real page view — otherwise the agent reviewing the
+/// feedback only sees the transparent strokes from the canvas overlay and
+/// has no visual reference for what the user was annotating.
+///
+/// Matching is done by window title (set in `tauri.conf.json`); if multiple
+/// windows share the title the first match wins. We take the whole window
+/// including the native title bar because cropping needs platform-specific
+/// DPI handling — the UI can trim if needed.
+#[tauri::command]
+pub fn capture_window_png(window: tauri::WebviewWindow) -> Result<String, String> {
+    let title = window.title().map_err(|e| e.to_string())?;
+    let windows = xcap::Window::all().map_err(|e| e.to_string())?;
+    let target = windows
+        .into_iter()
+        .find(|w| w.title().ok().as_deref() == Some(title.as_str()))
+        .ok_or_else(|| format!("no OS window matching title {title:?}"))?;
+    let rgba = target.capture_image().map_err(|e| e.to_string())?;
+    let mut buf: Vec<u8> = Vec::new();
+    let dyn_img = image::DynamicImage::ImageRgba8(rgba);
+    dyn_img
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(STANDARD.encode(&buf))
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenUrlPayload {

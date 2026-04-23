@@ -160,10 +160,16 @@ iterations regressed them — read before touching `app/ui/src/canvas.rs`,
    new floating UI, respect: overlay 50 < panel 55 < FAB stack (45 is fine
    because FAB lives outside the overlay).
 
-6. **Exported annotation PNG is transparent.** Because the bitmap is
-   `clear_rect`-ed, the PNG attached to feedback has only strokes on a
-   transparent background. Do not "fix" this by filling white — it's by
-   design so reviewers can overlay it on a page screenshot.
+6. **Live canvas bitmap stays transparent; the *submitted* screenshot is a
+   composite.** The on-screen canvas is `clear_rect`-ed so the overlay is
+   see-through (do not "fix" this by filling white). At submit time,
+   `feedback_panel.rs` hides `.canvas-overlay` and `.panel`, calls the
+   `capture_window_png` Tauri command (xcap-backed) to grab the real page,
+   then draws the annotation PNG on top of that page image in an offscreen
+   canvas and submits the composite. The agent reviewing feedback therefore
+   gets a single PNG with page context + user strokes. If you rewire the
+   submit flow, preserve the hide-capture-composite step — without it,
+   Claude sees only disembodied marks on white.
 
 ## Dev-server port hygiene
 
