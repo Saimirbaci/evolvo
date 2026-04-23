@@ -10,3 +10,5 @@ app/src-tauri/gen/schemas/
 
 tmp.md
 examples/
+plans/
+settings.local.json
