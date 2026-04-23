@@ -1,0 +1,14 @@
+# Merge into Cargo.toml (workspace) and app/src-tauri/Cargo.toml.
+
+[workspace.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+keyring = "3"
+uuid = { version = "1", features = ["v4"] }
+
+# Under app/src-tauri/Cargo.toml [dependencies] add:
+#   reqwest = { workspace = true }
+#   keyring = { workspace = true }
+#   uuid = { workspace = true }
+#   serde = { workspace = true, features = ["derive"] }
+#   serde_json = { workspace = true }
+#   tokio = { version = "1", features = ["macros", "rt"] } # already pulled by tauri

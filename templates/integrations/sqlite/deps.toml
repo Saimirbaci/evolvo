@@ -1,0 +1,5 @@
+[workspace.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# app/src-tauri/Cargo.toml:
+#   rusqlite = { workspace = true }

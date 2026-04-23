@@ -1,0 +1,7 @@
+[workspace.dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+
+# app/src-tauri/Cargo.toml:
+#   axum = { workspace = true }
+#   tokio = { workspace = true }

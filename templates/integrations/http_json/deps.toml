@@ -1,0 +1,7 @@
+[workspace.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+keyring = "3"
+
+# app/src-tauri/Cargo.toml:
+#   reqwest = { workspace = true }
+#   keyring = { workspace = true }
