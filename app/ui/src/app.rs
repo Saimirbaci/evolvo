@@ -117,7 +117,7 @@ pub fn App() -> impl IntoView {
             </header>
 
             {move || match view_sig.get() {
-                View::Home => view! { <HomePage /> }.into_any(),
+                View::Home => view! { <HomePage panel_open=panel_open /> }.into_any(),
                 View::Lineage => view! { <SandboxPage /> }.into_any(),
             }}
 
@@ -145,9 +145,11 @@ pub fn App() -> impl IntoView {
 }
 
 #[component]
-fn HomePage() -> impl IntoView {
+fn HomePage(panel_open: RwSignal<bool>) -> impl IntoView {
+    // Hide the welcome copy while the canvas overlay is open so it doesn't
+    // end up in the page screenshot that ships with the feedback submission.
     view! {
-        <div class="home-page">
+        <div class="home-page" class:hidden=move || panel_open.get()>
             <div class="home-hero">
                 <h1 class="home-title">"Welcome to Evolvo"</h1>
                 <p class="home-subtitle">
