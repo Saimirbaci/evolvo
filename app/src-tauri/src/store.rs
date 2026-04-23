@@ -364,6 +364,7 @@ mod tests {
             log_path: None,
             source_repo: None,
             iteration: 0,
+            stages: Vec::new(),
         };
         store.save_lineage_job(&job).unwrap();
         assert_eq!(store.list_lineage_jobs().unwrap().len(), 1);

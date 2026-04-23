@@ -133,6 +133,144 @@ pub struct LineageJobRecord {
     /// and are treated as iteration 1 when they run.
     #[serde(default)]
     pub iteration: u32,
+    /// Multi-stage planner pipeline progress for NewApp iterations. Empty
+    /// for classic single-session runs (bug fixes, small features). Each
+    /// entry is appended when the corresponding stage starts and mutated
+    /// in place as the stage progresses / finishes. Serialized default so
+    /// older records without this field round-trip cleanly.
+    #[serde(default)]
+    pub stages: Vec<StageState>,
+}
+
+/// Which stage of the multi-stage NewApp pipeline a `StageState` represents.
+/// Plan stages are read-only (the Claude session writes only to `plan.json`);
+/// impl stages write code to the worktree.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StageKind {
+    BackendPlan,
+    BackendImpl,
+    FrontendPlan,
+    FrontendImpl,
+    E2EPlan,
+    E2EImpl,
+    FinalReview,
+}
+
+impl StageKind {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::BackendPlan => "backend_plan",
+            Self::BackendImpl => "backend_impl",
+            Self::FrontendPlan => "frontend_plan",
+            Self::FrontendImpl => "frontend_impl",
+            Self::E2EPlan => "e2e_plan",
+            Self::E2EImpl => "e2e_impl",
+            Self::FinalReview => "final_review",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BackendPlan => "Backend plan",
+            Self::BackendImpl => "Backend impl",
+            Self::FrontendPlan => "Frontend plan",
+            Self::FrontendImpl => "Frontend impl",
+            Self::E2EPlan => "E2E plan",
+            Self::E2EImpl => "E2E impl",
+            Self::FinalReview => "Final review",
+        }
+    }
+
+    pub fn is_planner(self) -> bool {
+        matches!(self, Self::BackendPlan | Self::FrontendPlan | Self::E2EPlan)
+    }
+
+    /// Canonical order for the pipeline.
+    pub fn pipeline() -> &'static [StageKind] {
+        &[
+            Self::BackendPlan,
+            Self::BackendImpl,
+            Self::FrontendPlan,
+            Self::FrontendImpl,
+            Self::E2EPlan,
+            Self::E2EImpl,
+            Self::FinalReview,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StageStatus {
+    #[default]
+    Pending,
+    Running,
+    Validating,
+    Green,
+    Failed,
+    Skipped,
+}
+
+impl StageStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Validating => "validating",
+            Self::Green => "green",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Green | Self::Failed | Self::Skipped)
+    }
+}
+
+/// One stage of the NewApp pipeline with enough metadata for the UI to
+/// render a live progress panel. Stored inside `LineageJobRecord.stages`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StageState {
+    pub kind: StageKind,
+    #[serde(default)]
+    pub status: StageStatus,
+    /// Absolute path to the per-stage `claude.log` (for planner / impl
+    /// stages) or validator report (for the final review stage).
+    #[serde(default)]
+    pub log_path: Option<String>,
+    /// Monotonic unix-ms timestamp when the stage first flipped to
+    /// `Running`. `None` while still `Pending`.
+    #[serde(default)]
+    pub started_at_unix_ms: Option<u64>,
+    /// Set when the stage reaches any terminal status (`Green`, `Failed`,
+    /// `Skipped`).
+    #[serde(default)]
+    pub finished_at_unix_ms: Option<u64>,
+    /// Short human-readable summary surfaced in the UI — the first error
+    /// on failure, the validator headline on green, etc.
+    #[serde(default)]
+    pub headline: Option<String>,
+    /// Structured validator output (counts, checks) — serialized to JSON
+    /// so the UI can render a table without re-parsing free text.
+    #[serde(default)]
+    pub report: Option<serde_json::Value>,
+}
+
+impl StageState {
+    pub fn pending(kind: StageKind) -> Self {
+        Self {
+            kind,
+            status: StageStatus::Pending,
+            log_path: None,
+            started_at_unix_ms: None,
+            finished_at_unix_ms: None,
+            headline: None,
+            report: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

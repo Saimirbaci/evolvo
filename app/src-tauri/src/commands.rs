@@ -170,6 +170,68 @@ pub fn load_lineage_job(
         .map_err(store_error)
 }
 
+#[tauri::command]
+pub fn list_job_stages(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<Vec<crate::types::StageState>, String> {
+    let job = state
+        .store()
+        .load_lineage_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
+    Ok(job.stages)
+}
+
+#[tauri::command]
+pub fn read_job_plan(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<Option<serde_json::Value>, String> {
+    let root = state.store().layout().root().to_path_buf();
+    let job_dir = runner::job_workspace_dir(&root, &payload.id);
+    match crate::plan::load_plan(&job_dir).map_err(store_error)? {
+        Some(p) => Ok(Some(
+            serde_json::to_value(p).map_err(|e| format!("serialize plan: {e}"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailStageLogPayload {
+    pub id: String,
+    pub stage: String,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[tauri::command]
+pub fn tail_stage_log(
+    state: State<'_, AppState>,
+    payload: TailStageLogPayload,
+) -> Result<String, String> {
+    let root = state.store().layout().root().to_path_buf();
+    let job_dir = runner::job_workspace_dir(&root, &payload.id);
+    let safe = payload
+        .stage
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>();
+    if safe.is_empty() {
+        return Err("stage slug empty".into());
+    }
+    let log = job_dir.join("logs").join(format!("{safe}.log"));
+    if !log.exists() {
+        return Ok(String::new());
+    }
+    let bytes = std::fs::read(&log).map_err(|e| format!("read log: {e}"))?;
+    let cap = payload.max_bytes.unwrap_or(32 * 1024);
+    let start = bytes.len().saturating_sub(cap);
+    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
 /// "Advance" button entry point. Behaviour depends on the job's current
 /// status:
 /// - `Pending` → fork the source repo into a lineage worktree, spawn
@@ -235,7 +297,11 @@ fn start_implementation_run(
         .force_status(&job.id, LineageJobStatus::Implementing)
         .map_err(store_error)?;
 
-    runner::launch_claude(store.clone(), job.id.clone(), prepared);
+    if runner::is_multi_stage_candidate(&feedback) {
+        runner::launch_pipeline(store.clone(), job.id.clone(), feedback, prepared);
+    } else {
+        runner::launch_claude(store.clone(), job.id.clone(), prepared);
+    }
     Ok(updated)
 }
 

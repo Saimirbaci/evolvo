@@ -22,6 +22,9 @@ fn main() {
             commands::open_workspace_path,
             commands::capture_window_png,
             commands::open_external_url,
+            commands::list_job_stages,
+            commands::read_job_plan,
+            commands::tail_stage_log,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Evolvo desktop app");

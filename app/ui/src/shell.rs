@@ -411,6 +411,7 @@ fn LineageDetail(
     let summary = record.summary.clone();
     let status_label = record.status.label();
     let created = format_time(record.created_at_unix_ms);
+    let stages = record.stages.clone();
 
     view! {
         <div class="lineage-detail-inner">
@@ -447,6 +448,41 @@ fn LineageDetail(
                     <div class="list-card-meta"><strong>"log: "</strong><code>{l}</code></div>
                 }.into_any(),
                 None => view! { <span></span> }.into_any(),
+            }}
+
+            {if stages.is_empty() {
+                view! { <span></span> }.into_any()
+            } else {
+                let total = stages.len();
+                let green = stages.iter().filter(|s| matches!(s.status, crate::types::StageStatus::Green)).count();
+                view! {
+                    <section class="lineage-stages">
+                        <h4>{format!("Pipeline ({green}/{total} green)")}</h4>
+                        <ul class="stage-list">
+                            {stages.into_iter().map(|s| {
+                                let icon = s.status.icon();
+                                let kind = s.kind.label();
+                                let status = s.status.label();
+                                let headline = s.headline.clone().unwrap_or_default();
+                                let elapsed = match (s.started_at_unix_ms, s.finished_at_unix_ms) {
+                                    (Some(a), Some(b)) if b >= a => format!("{}s", (b - a) / 1000),
+                                    (Some(_), None) => "running…".to_string(),
+                                    _ => String::new(),
+                                };
+                                let status_class = format!("stage-status stage-status-{}", s.status.label());
+                                view! {
+                                    <li class="stage-row">
+                                        <span class="stage-icon">{icon}</span>
+                                        <span class="stage-kind">{kind}</span>
+                                        <span class=status_class>{status}</span>
+                                        <span class="stage-elapsed">{elapsed}</span>
+                                        <span class="stage-headline">{headline}</span>
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ul>
+                    </section>
+                }.into_any()
             }}
 
             <section class="lineage-activity">

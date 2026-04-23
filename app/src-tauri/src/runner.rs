@@ -344,6 +344,13 @@ const EMBEDDED_STEP_NEW_APP: &str = include_str!("../../../prompts/work_steps/ne
 const EMBEDDED_STEP_BOOTSTRAP: &str = include_str!("../../../prompts/work_steps/bootstrap.md");
 const EMBEDDED_STEP_SHAPING: &str = include_str!("../../../prompts/work_steps/shaping.md");
 const EMBEDDED_STEP_MATURATION: &str = include_str!("../../../prompts/work_steps/maturation.md");
+const EMBEDDED_STAGE_BACKEND_PLAN: &str = include_str!("../../../prompts/stages/backend_plan.md");
+const EMBEDDED_STAGE_BACKEND_IMPL: &str = include_str!("../../../prompts/stages/backend_impl.md");
+const EMBEDDED_STAGE_FRONTEND_PLAN: &str = include_str!("../../../prompts/stages/frontend_plan.md");
+const EMBEDDED_STAGE_FRONTEND_IMPL: &str = include_str!("../../../prompts/stages/frontend_impl.md");
+const EMBEDDED_STAGE_E2E_PLAN: &str = include_str!("../../../prompts/stages/e2e_plan.md");
+const EMBEDDED_STAGE_E2E_IMPL: &str = include_str!("../../../prompts/stages/e2e_impl.md");
+const EMBEDDED_STAGE_FINAL_REVIEW: &str = include_str!("../../../prompts/stages/final_review.md");
 
 fn prompts_override_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("EVOLVO_PROMPTS_DIR") {
@@ -987,6 +994,227 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
     });
 }
 
+// --- Multi-stage NewApp pipeline dispatcher ---------------------------------
+
+/// Stage prompts live alongside the classic ones under `prompts/stages/`.
+/// Resolved with the same override chain: `$EVOLVO_PROMPTS_DIR`, source repo,
+/// then the compiled-in fallback.
+fn stage_prompt_template(kind: crate::types::StageKind) -> String {
+    use crate::types::StageKind as K;
+    let (rel, embedded) = match kind {
+        K::BackendPlan => ("stages/backend_plan.md", EMBEDDED_STAGE_BACKEND_PLAN),
+        K::BackendImpl => ("stages/backend_impl.md", EMBEDDED_STAGE_BACKEND_IMPL),
+        K::FrontendPlan => ("stages/frontend_plan.md", EMBEDDED_STAGE_FRONTEND_PLAN),
+        K::FrontendImpl => ("stages/frontend_impl.md", EMBEDDED_STAGE_FRONTEND_IMPL),
+        K::E2EPlan => ("stages/e2e_plan.md", EMBEDDED_STAGE_E2E_PLAN),
+        K::E2EImpl => ("stages/e2e_impl.md", EMBEDDED_STAGE_E2E_IMPL),
+        K::FinalReview => ("stages/final_review.md", EMBEDDED_STAGE_FINAL_REVIEW),
+    };
+    load_prompt(rel, embedded)
+}
+
+/// Render the concrete per-stage prompt by substituting `{{VAR}}` placeholders
+/// with plan + job-derived values.
+fn render_stage_prompt(
+    template: &str,
+    plan: &crate::plan::IterationPlan,
+    worktree: &Path,
+    plan_path: &Path,
+    job_id: &str,
+) -> String {
+    let canvas_png = plan
+        .canvas
+        .png_path
+        .clone()
+        .unwrap_or_else(|| "<none>".to_string());
+    let annotations = plan
+        .canvas
+        .annotations_path
+        .clone()
+        .unwrap_or_else(|| "<none>".to_string());
+    let voice = plan
+        .voice_transcript
+        .clone()
+        .unwrap_or_else(|| "<none>".to_string());
+    let region_index = if plan.canvas.regions.is_empty() {
+        "(no annotations — text-only feedback)".to_string()
+    } else {
+        plan.canvas
+            .regions
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: bbox=[{:.0},{:.0},{:.0},{:.0}] strokes={} color={} labels={:?}",
+                    r.id,
+                    r.bbox[0],
+                    r.bbox[1],
+                    r.bbox[2],
+                    r.bbox[3],
+                    r.stroke_count,
+                    r.dominant_color.as_deref().unwrap_or("-"),
+                    r.labels
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    template
+        .replace("{{APP_NAME}}", &plan.app.name)
+        .replace("{{JOB_ID}}", job_id)
+        .replace("{{ITERATION}}", &plan.app.iteration.to_string())
+        .replace("{{ROUTE}}", &plan.canvas.route)
+        .replace("{{PLAN_PATH}}", &plan_path.display().to_string())
+        .replace("{{CANVAS_PNG}}", &canvas_png)
+        .replace("{{ANNOTATIONS_PATH}}", &annotations)
+        .replace("{{USER_TEXT}}", &plan.user_text)
+        .replace("{{VOICE_TRANSCRIPT}}", &voice)
+        .replace("{{REGION_INDEX}}", &region_index)
+        .replace("{{WORKTREE}}", &worktree.display().to_string())
+}
+
+/// Concrete `StageDispatcher` that spawns `claude -p <prompt>` per stage and
+/// streams its JSONL output to `<job_dir>/logs/<slug>.log`. Blocks the
+/// calling thread until Claude exits.
+pub struct ClaudeStageDispatcher;
+
+impl crate::stages::StageDispatcher for ClaudeStageDispatcher {
+    fn dispatch(&self, ctx: crate::stages::StageDispatch<'_>) -> Result<PathBuf, String> {
+        let plan = crate::plan::load_plan(ctx.job_dir)
+            .map_err(|e| format!("load plan: {e}"))?
+            .ok_or_else(|| "plan.json missing before stage dispatch".to_string())?;
+
+        let logs_dir = ctx.job_dir.join("logs");
+        fs::create_dir_all(&logs_dir).map_err(|e| format!("create logs dir: {e}"))?;
+        let log_path = logs_dir.join(format!("{}.log", ctx.stage.slug()));
+        let log_handle = fs::File::create(&log_path)
+            .map_err(|e| format!("create log {}: {e}", log_path.display()))?;
+        let log_err = log_handle
+            .try_clone()
+            .map_err(|e| format!("clone log handle: {e}"))?;
+
+        let template = stage_prompt_template(ctx.stage);
+        let prompt = render_stage_prompt(&template, &plan, ctx.worktree, &ctx.plan_path, ctx.job_id);
+
+        let status = Command::new("claude")
+            .arg("-p")
+            .arg(&prompt)
+            .arg("--dangerously-skip-permissions")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose")
+            .current_dir(ctx.worktree)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_handle))
+            .stderr(Stdio::from(log_err))
+            .status()
+            .map_err(|e| format!("spawn claude for {}: {e}", ctx.stage.slug()))?;
+
+        if !status.success() {
+            return Err(format!(
+                "claude exited {status} for stage {} — see {}",
+                ctx.stage.slug(),
+                log_path.display()
+            ));
+        }
+        Ok(log_path)
+    }
+}
+
+/// Run the multi-stage NewApp pipeline for a prepared job. Seeds the plan,
+/// executes every stage, and flips the job to `BuildReady` on success or
+/// `Failed` on the first red stage. Spawned on its own OS thread so the
+/// Tauri command returns immediately.
+pub fn launch_pipeline(
+    store: Store,
+    job_id: String,
+    feedback: FeedbackRecord,
+    prepared: PreparedRun,
+) {
+    std::thread::spawn(move || {
+        let engine = LineageEngine::new(&store);
+        let root = store.layout().root().to_path_buf();
+        let job_dir = job_workspace_dir(&root, &job_id);
+
+        let job = match store.load_lineage_job(&job_id) {
+            Ok(Some(j)) => j,
+            _ => {
+                let _ = engine.append_note(&job_id, "pipeline: job record vanished");
+                return;
+            }
+        };
+
+        if let Err(e) =
+            crate::stages::seed_plan_from_feedback(&store, &feedback, &job_id, &job_dir, job.iteration)
+        {
+            let _ = engine.append_note(&job_id, &format!("pipeline: seed plan failed — {e}"));
+            let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+            return;
+        }
+
+        let _ = engine.append_note(
+            &job_id,
+            &format!(
+                "multi-stage NewApp pipeline starting in worktree {} — stages: {}",
+                prepared.worktree.display(),
+                crate::types::StageKind::pipeline()
+                    .iter()
+                    .map(|s| s.slug())
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            ),
+        );
+
+        let dispatcher = ClaudeStageDispatcher;
+        match crate::stages::run_pipeline(
+            &store,
+            &engine,
+            &dispatcher,
+            &prepared.worktree,
+            &job_dir,
+            &job_id,
+        ) {
+            Ok(stages) => {
+                let all_green = stages.iter().all(|s| {
+                    matches!(
+                        s.status,
+                        crate::types::StageStatus::Green | crate::types::StageStatus::Skipped
+                    )
+                });
+                if all_green {
+                    let _ = engine
+                        .append_note(&job_id, "pipeline: all stages green — marking build ready");
+                    let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
+                } else {
+                    let first_red = stages
+                        .iter()
+                        .find(|s| matches!(s.status, crate::types::StageStatus::Failed))
+                        .map(|s| s.kind.slug())
+                        .unwrap_or("<unknown>");
+                    let _ = engine.append_note(
+                        &job_id,
+                        &format!("pipeline: stopped at {first_red} — marking failed"),
+                    );
+                    let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                }
+            }
+            Err(e) => {
+                let _ = engine.append_note(&job_id, &format!("pipeline: dispatcher error — {e}"));
+                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+            }
+        }
+    });
+}
+
+/// True iff the feedback is a NewApp request carrying a canvas screenshot or
+/// annotations. Used by the command layer to route to `launch_pipeline`
+/// instead of the single-session `launch_claude`.
+pub fn is_multi_stage_candidate(feedback: &FeedbackRecord) -> bool {
+    matches!(feedback.feedback_type, crate::types::FeedbackType::NewApp)
+        && (feedback.screenshot_filename.is_some() || !feedback.annotations.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,6 +1255,7 @@ mod tests {
             log_path: None,
             source_repo: None,
             iteration: 0,
+            stages: Vec::new(),
         }
     }
 

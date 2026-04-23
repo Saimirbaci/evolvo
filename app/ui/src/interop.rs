@@ -5,7 +5,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
-use crate::types::{AppHealth, FeedbackRecord, LineageJobRecord, SubmitFeedbackPayload};
+use crate::types::{AppHealth, FeedbackRecord, LineageJobRecord, StageState, SubmitFeedbackPayload};
 
 fn js_error(v: JsValue) -> String {
     v.as_string()
@@ -123,4 +123,32 @@ pub async fn open_external_url(url: &str) -> Result<(), String> {
 /// submitted screenshot without any page context.
 pub async fn capture_window_png() -> Result<String, String> {
     invoke_command("capture_window_png").await
+}
+
+pub async fn list_job_stages(id: &str) -> Result<Vec<StageState>, String> {
+    invoke_command_with_args("list_job_stages", &IdArg { id }).await
+}
+
+pub async fn read_job_plan(id: &str) -> Result<Option<serde_json::Value>, String> {
+    invoke_command_with_args("read_job_plan", &IdArg { id }).await
+}
+
+#[derive(Serialize)]
+struct TailStageLogArgs<'a> {
+    id: &'a str,
+    stage: &'a str,
+    #[serde(rename = "maxBytes")]
+    max_bytes: Option<usize>,
+}
+
+pub async fn tail_stage_log(id: &str, stage: &str, max_bytes: Option<usize>) -> Result<String, String> {
+    invoke_command_with_args(
+        "tail_stage_log",
+        &TailStageLogArgs {
+            id,
+            stage,
+            max_bytes,
+        },
+    )
+    .await
 }

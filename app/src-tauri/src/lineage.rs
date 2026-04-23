@@ -16,6 +16,7 @@
 use crate::store::{Store, StoreError};
 use crate::types::{
     current_time_unix_ms, FeedbackRecord, FeedbackStatus, LineageJobRecord, LineageJobStatus,
+    StageKind, StageState, StageStatus,
 };
 
 pub struct LineageEngine<'a> {
@@ -89,6 +90,7 @@ impl<'a> LineageEngine<'a> {
             log_path: None,
             source_repo: None,
             iteration: 0,
+            stages: Vec::new(),
         };
         self.store.save_lineage_job(&job)?;
 
@@ -147,6 +149,68 @@ impl<'a> LineageEngine<'a> {
             .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         job.status = status;
         job.updated_at_unix_ms = current_time_unix_ms();
+        self.store.save_lineage_job(&job)?;
+        Ok(job)
+    }
+
+    /// Seed the `stages` vec on a job with the canonical pipeline order —
+    /// one `StageState::pending` per `StageKind`. Idempotent: re-seeding an
+    /// already-populated vec is a no-op so restarts / retries don't drop
+    /// progress. Returns the refreshed record.
+    pub fn seed_stages(
+        &self,
+        job_id: &str,
+        stages: &[StageKind],
+    ) -> Result<LineageJobRecord, StoreError> {
+        let mut job = self
+            .store
+            .load_lineage_job(job_id)?
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+        if !job.stages.is_empty() {
+            return Ok(job);
+        }
+        job.stages = stages.iter().copied().map(StageState::pending).collect();
+        job.updated_at_unix_ms = current_time_unix_ms();
+        self.store.save_lineage_job(&job)?;
+        Ok(job)
+    }
+
+    /// Mutate a single stage entry by kind. Closure receives `&mut
+    /// StageState` and is expected to update status / timestamps / headline.
+    /// Auto-stamps `started_at_unix_ms` the first time the stage flips to
+    /// `Running` and `finished_at_unix_ms` when it reaches a terminal status.
+    pub fn update_stage<F>(
+        &self,
+        job_id: &str,
+        kind: StageKind,
+        mutator: F,
+    ) -> Result<LineageJobRecord, StoreError>
+    where
+        F: FnOnce(&mut StageState),
+    {
+        let mut job = self
+            .store
+            .load_lineage_job(job_id)?
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+        let slot = job
+            .stages
+            .iter_mut()
+            .find(|s| s.kind == kind)
+            .ok_or_else(|| format!("stage {kind:?} not seeded for job {job_id}"))?;
+        let prev_status = slot.status;
+        mutator(slot);
+        let now = current_time_unix_ms();
+        if matches!(slot.status, StageStatus::Running | StageStatus::Validating)
+            && slot.started_at_unix_ms.is_none()
+        {
+            slot.started_at_unix_ms = Some(now);
+        }
+        if slot.status.is_terminal() && slot.finished_at_unix_ms.is_none() {
+            slot.finished_at_unix_ms = Some(now);
+        }
+        if prev_status != slot.status {
+            job.updated_at_unix_ms = now;
+        }
         self.store.save_lineage_job(&job)?;
         Ok(job)
     }
@@ -210,6 +274,61 @@ mod tests {
             updated_at_unix_ms: 0,
             lineage_job_id: None,
         }
+    }
+
+    #[test]
+    fn seed_and_update_stages_tracks_status_and_timestamps() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = mk_feedback("fb-1");
+        let job = engine.enqueue_job_for_feedback(&mut fb).unwrap();
+
+        let pipeline = [
+            crate::types::StageKind::BackendPlan,
+            crate::types::StageKind::BackendImpl,
+        ];
+        let seeded = engine.seed_stages(&job.id, &pipeline).unwrap();
+        assert_eq!(seeded.stages.len(), 2);
+        assert!(seeded.stages.iter().all(|s| matches!(s.status, crate::types::StageStatus::Pending)));
+
+        let updated = engine
+            .update_stage(&job.id, crate::types::StageKind::BackendPlan, |s| {
+                s.status = crate::types::StageStatus::Running;
+                s.headline = Some("dispatching planner".into());
+            })
+            .unwrap();
+        let plan = updated
+            .stages
+            .iter()
+            .find(|s| matches!(s.kind, crate::types::StageKind::BackendPlan))
+            .unwrap();
+        assert!(matches!(plan.status, crate::types::StageStatus::Running));
+        assert!(plan.started_at_unix_ms.is_some());
+        assert!(plan.finished_at_unix_ms.is_none());
+
+        let done = engine
+            .update_stage(&job.id, crate::types::StageKind::BackendPlan, |s| {
+                s.status = crate::types::StageStatus::Green;
+                s.headline = Some("plan.json written".into());
+            })
+            .unwrap();
+        let plan = done
+            .stages
+            .iter()
+            .find(|s| matches!(s.kind, crate::types::StageKind::BackendPlan))
+            .unwrap();
+        assert!(matches!(plan.status, crate::types::StageStatus::Green));
+        assert!(plan.finished_at_unix_ms.is_some());
+
+        // Re-seeding is idempotent.
+        let again = engine.seed_stages(&job.id, &pipeline).unwrap();
+        assert_eq!(again.stages.len(), 2);
+        assert!(matches!(
+            again.stages[0].status,
+            crate::types::StageStatus::Green
+        ));
     }
 
     #[test]

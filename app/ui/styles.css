@@ -883,6 +883,82 @@ button {
     background: #ffffff;
 }
 
+.lineage-stages {
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    background: #fafbfd;
+}
+
+.lineage-stages h4 {
+    font-size: 13px;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+    color: var(--fg);
+}
+
+.stage-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.stage-row {
+    display: grid;
+    grid-template-columns: 24px 140px 90px 80px 1fr;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 6px;
+}
+
+.stage-row:hover {
+    background: rgba(0, 0, 0, 0.03);
+}
+
+.stage-icon {
+    font-size: 14px;
+    text-align: center;
+}
+
+.stage-kind {
+    font-weight: 500;
+}
+
+.stage-status {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 1px 6px;
+    border-radius: 10px;
+    display: inline-block;
+    text-align: center;
+}
+
+.stage-status-pending    { background: #eee; color: #666; }
+.stage-status-running    { background: #fff3c4; color: #7c5e00; }
+.stage-status-validating { background: #d6e4ff; color: #1a3d99; }
+.stage-status-green      { background: #d6f5d6; color: #1a6a1a; }
+.stage-status-failed     { background: #fbd5d5; color: #9a1a1a; }
+.stage-status-skipped    { background: #eee; color: #999; }
+
+.stage-elapsed {
+    color: #666;
+    font-variant-numeric: tabular-nums;
+}
+
+.stage-headline {
+    color: #555;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .lineage-activity h4 {
     font-size: 13px;
     font-weight: 600;

@@ -149,6 +149,100 @@ pub struct LineageJobRecord {
     pub source_repo: Option<String>,
     #[serde(default)]
     pub iteration: u32,
+    #[serde(default)]
+    pub stages: Vec<StageState>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StageKind {
+    BackendPlan,
+    BackendImpl,
+    FrontendPlan,
+    FrontendImpl,
+    E2EPlan,
+    E2EImpl,
+    FinalReview,
+}
+
+impl StageKind {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::BackendPlan => "backend_plan",
+            Self::BackendImpl => "backend_impl",
+            Self::FrontendPlan => "frontend_plan",
+            Self::FrontendImpl => "frontend_impl",
+            Self::E2EPlan => "e2e_plan",
+            Self::E2EImpl => "e2e_impl",
+            Self::FinalReview => "final_review",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BackendPlan => "Backend plan",
+            Self::BackendImpl => "Backend impl",
+            Self::FrontendPlan => "Frontend plan",
+            Self::FrontendImpl => "Frontend impl",
+            Self::E2EPlan => "E2E plan",
+            Self::E2EImpl => "E2E impl",
+            Self::FinalReview => "Final review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StageStatus {
+    #[default]
+    Pending,
+    Running,
+    Validating,
+    Green,
+    Failed,
+    Skipped,
+}
+
+impl StageStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Validating => "validating",
+            Self::Green => "green",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Pending => "○",
+            Self::Running => "◐",
+            Self::Validating => "◑",
+            Self::Green => "●",
+            Self::Failed => "✕",
+            Self::Skipped => "–",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StageState {
+    pub kind: StageKind,
+    #[serde(default)]
+    pub status: StageStatus,
+    #[serde(default)]
+    pub log_path: Option<String>,
+    #[serde(default)]
+    pub started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub finished_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub headline: Option<String>,
+    #[serde(default)]
+    pub report: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
