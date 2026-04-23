@@ -186,8 +186,8 @@ button {
 
 /* ---- Home landing page ---- */
 
-.home-page.hidden {
-    display: none;
+.home-page.home-page-empty {
+    background: var(--bg);
 }
 
 .home-page {

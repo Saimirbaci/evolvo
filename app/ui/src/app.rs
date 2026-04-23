@@ -146,24 +146,32 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn HomePage(panel_open: RwSignal<bool>) -> impl IntoView {
-    // Hide the welcome copy while the canvas overlay is open so it doesn't
-    // end up in the page screenshot that ships with the feedback submission.
+    // Remove the welcome copy from the DOM entirely while the canvas overlay
+    // is open, so it can't end up in the page screenshot captured at submit.
     view! {
-        <div class="home-page" class:hidden=move || panel_open.get()>
-            <div class="home-hero">
-                <h1 class="home-title">"Welcome to Evolvo"</h1>
-                <p class="home-subtitle">
-                    "Click the ✎ button in the bottom-right corner of any page \
-                     to open the Canvas overlay and send feedback about what \
-                     you're looking at."
-                </p>
-                <ul class="home-tips">
-                    <li>"Draw, type, or paste screenshots directly on the page."</li>
-                    <li>"Record a voice note to add context."</li>
-                    <li>"Submit to kick off a lineage iteration."</li>
-                </ul>
-            </div>
-        </div>
+        {move || {
+            if panel_open.get() {
+                view! { <div class="home-page home-page-empty"></div> }.into_any()
+            } else {
+                view! {
+                    <div class="home-page">
+                        <div class="home-hero">
+                            <h1 class="home-title">"Welcome to Evolvo"</h1>
+                            <p class="home-subtitle">
+                                "Click the ✎ button in the bottom-right corner of any page \
+                                 to open the Canvas overlay and send feedback about what \
+                                 you're looking at."
+                            </p>
+                            <ul class="home-tips">
+                                <li>"Draw, type, or paste screenshots directly on the page."</li>
+                                <li>"Record a voice note to add context."</li>
+                                <li>"Submit to kick off a lineage iteration."</li>
+                            </ul>
+                        </div>
+                    </div>
+                }.into_any()
+            }
+        }}
     }
 }
 
