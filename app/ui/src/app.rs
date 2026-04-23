@@ -7,7 +7,7 @@ use crate::canvas::{CanvasController, CanvasSurface};
 use crate::feedback_panel::FeedbackPanel;
 use crate::interop;
 use crate::toolbar::Toolbar;
-use crate::types::{AppHealth, FeedbackRecord, SandboxJobRecord};
+use crate::types::{AppHealth, SandboxJobRecord};
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
 /// moves. Kept as a constant rather than a build-time env var so the binary
@@ -36,7 +36,6 @@ fn star_us_link() -> leptos::prelude::AnyView {
 pub enum View {
     #[default]
     Home,
-    Inbox,
     Lineage,
 }
 
@@ -44,7 +43,6 @@ impl View {
     fn route(self) -> &'static str {
         match self {
             Self::Home => "/",
-            Self::Inbox => "/inbox",
             Self::Lineage => "/lineage",
         }
     }
@@ -52,13 +50,12 @@ impl View {
     fn label(self) -> &'static str {
         match self {
             Self::Home => "Canvas",
-            Self::Inbox => "Inbox",
             Self::Lineage => "Lineage",
         }
     }
 
-    fn all() -> [View; 3] {
-        [Self::Home, Self::Inbox, Self::Lineage]
+    fn all() -> [View; 2] {
+        [Self::Home, Self::Lineage]
     }
 }
 
@@ -84,7 +81,11 @@ pub fn App() -> impl IntoView {
         route.set(view_sig.get().route().to_string());
     });
 
-    let controller_for_home = controller.clone();
+    let panel_open: RwSignal<bool> = RwSignal::new(false);
+    let ctrl_fab = controller.clone();
+    let ctrl_toolbar = controller.clone();
+    let ctrl_canvas = controller.clone();
+    let ctrl_panel = controller.clone();
 
     view! {
         <div class="app-root">
@@ -99,9 +100,9 @@ pub fn App() -> impl IntoView {
                     </span>
                 </div>
                 <nav class="app-bar-actions">
-                    {View::all().into_iter().flat_map(|v| {
+                    {View::all().into_iter().map(|v| {
                         let is_active = move || view_sig.get() == v;
-                        let primary = view! {
+                        view! {
                             <button
                                 class="app-bar-link"
                                 class:active=is_active
@@ -109,57 +110,58 @@ pub fn App() -> impl IntoView {
                             >
                                 {v.label()}
                             </button>
-                        }.into_any();
-                        // Inject the "Star Us" shortcut just before the
-                        // Lineage tab so it sits at the left edge of the
-                        // lineage section of the nav.
-                        if matches!(v, View::Lineage) {
-                            vec![star_us_link(), primary]
-                        } else {
-                            vec![primary]
-                        }
+                        }.into_any()
                     }).collect_view()}
+                    {star_us_link()}
                 </nav>
             </header>
 
             {move || match view_sig.get() {
-                View::Home => view! {
-                    <HomePage controller=controller_for_home.clone() route=route />
-                }.into_any(),
-                View::Inbox => view! { <InboxPage /> }.into_any(),
+                View::Home => view! { <HomePage /> }.into_any(),
                 View::Lineage => view! { <SandboxPage /> }.into_any(),
             }}
+
+            {move || {
+                if panel_open.get() {
+                    view! {
+                        <div class="canvas-overlay">
+                            <Toolbar controller=ctrl_toolbar.clone() />
+                            <CanvasSurface controller=ctrl_canvas.clone() />
+                        </div>
+                        <FeedbackPanel
+                            controller=ctrl_panel.clone()
+                            route=route
+                            is_open=panel_open
+                        />
+                    }.into_any()
+                } else {
+                    view! { <span></span> }.into_any()
+                }
+            }}
+
+            <FeedbackFab controller=ctrl_fab.clone() is_open=panel_open />
         </div>
     }
 }
 
 #[component]
-fn HomePage(controller: CanvasController, route: RwSignal<String>) -> impl IntoView {
-    let ctrl_canvas = controller.clone();
-    let ctrl_toolbar = controller.clone();
-    let ctrl_fab = controller.clone();
-    let panel_open: RwSignal<bool> = RwSignal::new(false);
-
+fn HomePage() -> impl IntoView {
     view! {
-        <Toolbar controller=ctrl_toolbar />
-        <CanvasSurface controller=ctrl_canvas />
-
-        {move || {
-            if panel_open.get() {
-                view! {
-                    <FeedbackPanel
-                        controller=controller.clone()
-                        route=route
-                        is_open=panel_open
-                    />
-                }
-                .into_any()
-            } else {
-                view! { <span></span> }.into_any()
-            }
-        }}
-
-        <FeedbackFab controller=ctrl_fab is_open=panel_open />
+        <div class="home-page">
+            <div class="home-hero">
+                <h1 class="home-title">"Welcome to Evolvo"</h1>
+                <p class="home-subtitle">
+                    "Click the ✎ button in the bottom-right corner of any page \
+                     to open the Canvas overlay and send feedback about what \
+                     you're looking at."
+                </p>
+                <ul class="home-tips">
+                    <li>"Draw, type, or paste screenshots directly on the page."</li>
+                    <li>"Record a voice note to add context."</li>
+                    <li>"Submit to kick off a lineage iteration."</li>
+                </ul>
+            </div>
+        </div>
     }
 }
 
@@ -189,77 +191,6 @@ fn FeedbackFab(controller: CanvasController, is_open: RwSignal<bool>) -> impl In
                 }
             }}
         </button>
-    }
-}
-
-#[component]
-fn InboxPage() -> impl IntoView {
-    let items: RwSignal<Option<Result<Vec<FeedbackRecord>, String>>> = RwSignal::new(None);
-    Effect::new(move |already: Option<()>| {
-        if already.is_some() {
-            return;
-        }
-        spawn_local(async move {
-            let result = interop::list_feedback().await;
-            items.set(Some(result));
-        });
-    });
-    view! {
-        <div class="list-page">
-            <h2>"Feedback inbox"</h2>
-            {move || match items.get() {
-                None => view! { <div class="empty-state">"Loading…"</div> }.into_any(),
-                Some(Err(e)) => view! {
-                    <div class="empty-state">{format!("Failed to load: {e}")}</div>
-                }.into_any(),
-                Some(Ok(records)) => {
-                    if records.is_empty() {
-                        view! {
-                            <div class="empty-state">
-                                "No feedback yet — go draw on the canvas and submit something."
-                            </div>
-                        }.into_any()
-                    } else {
-                        view! {
-                            <div class="list-grid">
-                                {records.into_iter().map(|r| view! { <FeedbackCard record=r /> }).collect_view()}
-                            </div>
-                        }.into_any()
-                    }
-                }
-            }}
-        </div>
-    }
-}
-
-#[component]
-fn FeedbackCard(record: FeedbackRecord) -> impl IntoView {
-    let title = record
-        .feedback_text
-        .lines()
-        .next()
-        .unwrap_or("(no text)")
-        .to_string();
-    let extras = format!(
-        "{} annotation(s) • {} image(s){}",
-        record.annotations.len(),
-        record.pasted_images.len(),
-        if record.voice_filename.is_some() {
-            " • voice"
-        } else {
-            ""
-        },
-    );
-    view! {
-        <div class="list-card">
-            <div class="list-card-head">
-                <span class="list-card-title">{record.feedback_type.label()}</span>
-                <span class="list-card-status">{record.status.label()}</span>
-            </div>
-            <div class="list-card-meta">{format_time(record.created_at_unix_ms)}</div>
-            <div class="list-card-body">{title}</div>
-            <div class="list-card-meta">{extras}</div>
-        </div>
     }
 }
 

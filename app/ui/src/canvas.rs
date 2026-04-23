@@ -995,8 +995,7 @@ fn render_all_with_preview(
     let w = canvas.width() as f64;
     let h = canvas.height() as f64;
 
-    ctx.set_fill_style_str("#ffffff");
-    ctx.fill_rect(0.0, 0.0, w, h);
+    ctx.clear_rect(0.0, 0.0, w, h);
 
     let shapes = ctrl.shapes.get_untracked();
     let selected = ctrl.selected_idx.get_untracked();
