@@ -25,7 +25,7 @@ Applies to both `app/src-tauri` (host, native target) and `app/ui` (WASM target)
 
 - All disk writes go through `Store` in `store.rs`. Do not spread `fs::write` calls across the crate.
 - All user-supplied filenames go through `sanitise_filename`. Path traversal is the only realistic local attack surface here — take it seriously.
-- Workspace root comes from `default_workspace_root()` (honours `NOIDE_WORKSPACE_ROOT`). Do not hardcode `~/.noide` anywhere else.
+- Workspace root comes from `default_workspace_root()` (honours `NOIDE_WORKSPACE_ROOT`). Do not hardcode `~/.evolvo` anywhere else.
 
 ## Tests
 

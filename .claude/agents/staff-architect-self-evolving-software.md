@@ -62,7 +62,7 @@ A `SandboxJob` never reaches `Promoted` without `approve_sandbox_job` being call
 
 - Each status transition writes to the `notes` vec with enough context to reconstruct *why*.
 - Each transition has an inverse or a terminal marker. `promoted` and `rejected` are terminal — document that explicitly.
-- The workspace must be rsync-able: someone copying `~/.noide/noide_workspace/` to a colleague's machine must see the exact same state. No hidden state in RAM.
+- The workspace must be rsync-able: someone copying `~/.evolvo/evolvo_workspace/` to a colleague's machine must see the exact same state. No hidden state in RAM.
 
 ### I3. The blast radius of a promotion is bounded
 

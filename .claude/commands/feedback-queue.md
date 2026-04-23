@@ -1,8 +1,8 @@
 ---
-description: List pending feedback rows from the local workspace (~/.noide/noide_workspace/feedback) and propose the top 5 to work, ranked.
+description: List pending feedback rows from the local workspace (~/.evolvo/noide_workspace/feedback) and propose the top 5 to work, ranked.
 ---
 
-Read feedback JSON from `${NOIDE_WORKSPACE_ROOT:-$HOME/.noide/noide_workspace}/feedback/`. For each file, extract `id`, `status`, `feedbackType`, `pageRoute`, first 120 chars of `feedbackText`, and `createdAtUnixMs`.
+Read feedback JSON from `${NOIDE_WORKSPACE_ROOT:-$HOME/.evolvo/noide_workspace}/feedback/`. For each file, extract `id`, `status`, `feedbackType`, `pageRoute`, first 120 chars of `feedbackText`, and `createdAtUnixMs`.
 
 Keep only rows with `status == "new"` or `status == "triaged"`. Rank by: (bug > confusion > improvement > feature_request > compliment), then recency.
 

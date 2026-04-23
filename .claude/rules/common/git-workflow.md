@@ -52,6 +52,6 @@ If a pre-commit hook fails, fix the root cause. Never bypass.
 
 ## Never commit
 
-- `~/.noide/noide_workspace/` contents (it's outside the repo anyway — but don't symlink it in).
+- `~/.evolvo/noide_workspace/` contents (it's outside the repo anyway — but don't symlink it in).
 - Real user feedback JSON. If you need a fixture, synthesize it.
 - Secrets, tokens, signed bundle certs.

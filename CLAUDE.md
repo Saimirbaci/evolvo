@@ -10,14 +10,14 @@ Evolvo is a **Tauri 2** desktop app with a **Leptos 0.8 (CSR / WASM)** frontend.
 | Frontend     | Leptos 0.8 CSR + wasm-bindgen + web-sys      | `app/ui/src/main.rs`                   |
 | Build (UI)   | Trunk → `app/ui/dist/`                       | `app/ui/Trunk.toml`                    |
 | Build (host) | Cargo workspace (`app/src-tauri`, `app/ui`)  | `Cargo.toml` (workspace root)          |
-| Storage      | Plain JSON files under `~/.noide/noide_workspace/` | `app/src-tauri/src/store.rs`     |
+| Storage      | Plain JSON files under `~/.evolvo/noide_workspace/` | `app/src-tauri/src/store.rs`     |
 
 `NOIDE_WORKSPACE_ROOT` env var overrides the default workspace root — use this in tests and local scripting.
 
 ## Workspace layout on disk
 
 ```
-~/.noide/noide_workspace/
+~/.evolvo/noide_workspace/
 ├── feedback/           # {id}.json — FeedbackRecord
 ├── sandbox_jobs/       # {id}.json — SandboxJobRecord
 └── attachments/{feedback_id}/
@@ -107,7 +107,7 @@ app/ui/src/
 - Trunk does NOT type-check the workspace automatically. Run `cargo check --workspace` before declaring UI work done — a Leptos view macro will happily compile nonsense into a runtime panic.
 - `withGlobalTauri: true` is set — `interop.rs` relies on `window.__TAURI__`. Don't switch to module import without updating both sides.
 - Canvas pastes/screenshots go through the clipboard + canvas→PNG path; the base64 encode happens in WASM before `submit_feedback`. Large images will dominate the IPC payload — keep attachments sane (soft-cap at a few MB).
-- `.noide/noide_workspace/` is outside the repo. Use `NOIDE_WORKSPACE_ROOT` to point at a temp dir for reproducible runs.
+- `.evolvo/noide_workspace/` is outside the repo. Use `NOIDE_WORKSPACE_ROOT` to point at a temp dir for reproducible runs.
 
 ## Product invariants (read this first)
 
@@ -219,7 +219,7 @@ Project rules live under `.claude/rules/` — read them before editing:
 - `.claude/rules/common/` — commit / branching / review conventions
 
 Agents:
-- `staff-feedback` — works the local feedback queue (reads JSON from `~/.noide/noide_workspace/feedback/`) and ships fixes end-to-end.
+- `staff-feedback` — works the local feedback queue (reads JSON from `~/.evolvo/noide_workspace/feedback/`) and ships fixes end-to-end.
 - `staff-build-engineer` — keeps `cargo check`, `cargo test`, `trunk build`, `cargo tauri build` green; owns toolchain, CI hygiene, bundle size.
 - `staff-architect-self-evolving-software` — designs the lineage → promotion pipeline so the app can safely absorb its own feedback.
 
