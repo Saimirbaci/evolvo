@@ -325,6 +325,61 @@ pub struct StagedAttachment {
     pub path: PathBuf,
 }
 
+/// Embedded fallbacks so the binary still works when the prompts dir is
+/// missing. Overrides are resolved at runtime from (in order):
+///   1. `$EVOLVO_PROMPTS_DIR`
+///   2. `<source_repo>/prompts/`
+///   3. the compiled-in string below.
+/// This lets the user edit the on-disk prompt files and see the change on the
+/// next lineage run without rebuilding the host binary.
+const EMBEDDED_ITERATION_GUIDANCE: &str = include_str!("../../../prompts/iteration_guidance.md");
+const EMBEDDED_IMPLEMENTATION: &str = include_str!("../../../prompts/implementation.md");
+const EMBEDDED_NEW_APP_BANNER: &str = include_str!("../../../prompts/new_app_banner.md");
+const EMBEDDED_PHASE_BOOTSTRAP: &str = include_str!("../../../prompts/phases/bootstrap.md");
+const EMBEDDED_PHASE_SHAPING: &str = include_str!("../../../prompts/phases/shaping.md");
+const EMBEDDED_PHASE_CONSOLIDATION: &str =
+    include_str!("../../../prompts/phases/consolidation.md");
+const EMBEDDED_PHASE_MATURATION: &str = include_str!("../../../prompts/phases/maturation.md");
+const EMBEDDED_STEP_NEW_APP: &str = include_str!("../../../prompts/work_steps/new_app.md");
+const EMBEDDED_STEP_BOOTSTRAP: &str = include_str!("../../../prompts/work_steps/bootstrap.md");
+const EMBEDDED_STEP_SHAPING: &str = include_str!("../../../prompts/work_steps/shaping.md");
+const EMBEDDED_STEP_MATURATION: &str = include_str!("../../../prompts/work_steps/maturation.md");
+
+fn prompts_override_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("EVOLVO_PROMPTS_DIR") {
+        let pb = PathBuf::from(p);
+        if pb.is_dir() {
+            return Some(pb);
+        }
+    }
+    if let Some(repo) = resolve_source_repo() {
+        let pb = repo.join("prompts");
+        if pb.is_dir() {
+            return Some(pb);
+        }
+    }
+    None
+}
+
+fn load_prompt(rel: &str, embedded: &str) -> String {
+    if let Some(dir) = prompts_override_dir() {
+        let path = dir.join(rel);
+        if let Ok(s) = fs::read_to_string(&path) {
+            return s;
+        }
+    }
+    embedded.to_string()
+}
+
+fn trim_trailing_newline(s: String) -> String {
+    let trimmed = s.trim_end_matches('\n');
+    if trimmed.len() == s.len() {
+        s
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Construct the prompt handed to Claude Code. Kept public so tests (and
 /// future tooling) can assert it contains the right invariants.
 /// Returns the tailored guidance block for a given iteration number. The
@@ -339,33 +394,28 @@ pub struct StagedAttachment {
 pub fn iteration_guidance(iteration: u32) -> String {
     let n = iteration.max(1);
     let port = iteration_port(n);
-    let (phase, latitude) = match n {
-        1..=5 => (
-            "Bootstrap phase",
-            "You have wide latitude to make drastic architectural and source-code changes. \
-             Treat the existing Evolvo shell as scaffolding: rip out, rename, restructure, and replace code \
-             as needed to realise the app the user has described in the canvas, voice, and text. \
-             Follow the user's described app (ERP, IDE, fitness tracker, whatever they drew) as faithfully as you can.",
-        ),
-        6..=9 => (
-            "Shaping phase",
-            "Significant changes are still welcome when they move the app toward the user's described vision, \
-             but prefer cohesive feature additions over wholesale rewrites. Refactor when it clearly serves the feedback.",
-        ),
+    let (phase, rel, embedded) = match n {
+        1..=5 => ("Bootstrap phase", "phases/bootstrap.md", EMBEDDED_PHASE_BOOTSTRAP),
+        6..=9 => ("Shaping phase", "phases/shaping.md", EMBEDDED_PHASE_SHAPING),
         10..=12 => (
             "Consolidation phase",
-            "Prefer targeted changes that extend or refine existing features. Only restructure code if the feedback \
-             explicitly calls for it or the current shape blocks the change.",
+            "phases/consolidation.md",
+            EMBEDDED_PHASE_CONSOLIDATION,
         ),
-        _ => (
-            "Maturation phase",
-            "Default to minor, surgical changes. Do NOT refactor unrelated code, rename modules, or restructure the app \
-             unless the user explicitly asks for it in this feedback.",
-        ),
+        _ => ("Maturation phase", "phases/maturation.md", EMBEDDED_PHASE_MATURATION),
     };
+    let latitude = trim_trailing_newline(load_prompt(rel, embedded));
 
-    format!(
-        r#"# Iteration {n} — {phase}
+    let template = load_prompt("iteration_guidance.md", EMBEDDED_ITERATION_GUIDANCE);
+    template
+        .replace("{n}", &n.to_string())
+        .replace("{phase}", phase)
+        .replace("{latitude}", &latitude)
+        .replace("{port}", &port.to_string())
+}
+
+#[cfg(any())]
+const _DEAD_TEMPLATE: &str = r#"# Iteration {n} — {phase}
 
 This Evolvo instance is a self-evolving meta-app. Each approved lineage job is one iteration in the life of the app the user is building on top of the Evolvo shell.
 
@@ -458,9 +508,7 @@ When the change is verified:
 1. Stage and commit every file you touched (including updated `CLAUDE.md` / rules / agents). Use a conventional-commit subject like `feat(ui): <short>` or `fix(lineage): <short>`. One focused commit is fine; multiple small commits are better when the work naturally splits.
 2. Leave the iteration's app running so the reviewer lands on a live build. If you shut it down earlier to rebuild, start it again before returning: `EVOLVO_ITERATION_PORT={port} cargo tauri dev` (or the equivalent for your stack). The reviewer's Run button will also launch it, but starting it here saves them a click and confirms startup worked.
 3. In your final summary mention the port this iteration is serving on ({port}) and how you verified the change.
-"#,
-    )
-}
+"#;
 
 pub fn build_implementation_prompt(
     feedback: &FeedbackRecord,
@@ -474,19 +522,20 @@ pub fn build_implementation_prompt(
     // A `NewApp` feedback is an explicit "start over" signal from the user —
     // it overrides the iteration-number-based latitude and forces the agent
     // back into bootstrap mode no matter how many iterations have happened.
-    let work_step_4 = if is_new_app {
-        "4. **This is a `NewApp` feedback.** The user is asking you to build a NEW APP from scratch on top of the Evolvo shell. Build the new app in `app/ui/src/app.rs` (and any new modules you add alongside it) mounted inside `<Shell>` — the NewApp content area is yours to rewrite freely. Do NOT touch `app/ui/src/shell.rs`: the shell (app bar, Lineage nav + page, Star Us link, Feedback FAB, Canvas overlay) is permanent and is what guarantees the four product invariants (Feedback Overlay, Canvas per-page overlay, Inbox, Lineage pipeline) survive the rewrite. Everything inside the shell — the old app's domain, pages, data model, even the choice of Leptos if you replace the whole UI stack — is up for replacement, as long as the equivalent of `<Shell>` keeps wrapping the new content and keeps those invariants reachable from every page."
+    let (step_rel, step_embed) = if is_new_app {
+        ("work_steps/new_app.md", EMBEDDED_STEP_NEW_APP)
     } else if iteration <= 5 {
-        "4. Make the change the user described. On this iteration you are allowed — and expected — to restructure the codebase to fit the app the user drew. Touch as much as you need; just keep the four invariants above intact."
+        ("work_steps/bootstrap.md", EMBEDDED_STEP_BOOTSTRAP)
     } else if iteration <= 10 {
-        "4. Make a change that clearly resolves the feedback and moves the app toward the user's described vision. Refactor when it serves the goal; don't refactor for its own sake."
+        ("work_steps/shaping.md", EMBEDDED_STEP_SHAPING)
     } else {
-        "4. Make the minimal, focused change that actually resolves the feedback. Do not refactor unrelated code unless the user explicitly asks for it."
+        ("work_steps/maturation.md", EMBEDDED_STEP_MATURATION)
     };
+    let work_step_4 = trim_trailing_newline(load_prompt(step_rel, step_embed));
     let new_app_banner = if is_new_app {
-        "\n\n> **Feedback type: `NewApp`.** The user has explicitly asked for a new app from scratch. This overrides the iteration-phase latitude above — you have bootstrap-level freedom to rewrite, regardless of iteration number. Preserve only the four invariants.\n"
+        load_prompt("new_app_banner.md", EMBEDDED_NEW_APP_BANNER)
     } else {
-        ""
+        String::new()
     };
     let feedback_type = format!("{:?}", feedback.feedback_type);
     let route = if feedback.page_route.is_empty() {
@@ -504,66 +553,30 @@ pub fn build_implementation_prompt(
     let attachments_section = if attachments.is_empty() {
         String::new()
     } else {
-        let mut s =
-            String::from("\n\n## Attachments (read these with the Read tool before planning)\n");
+        let mut s = String::from(
+            "\n\n## Attachments (read these with the Read tool before planning/implementing)\n",
+        );
         for a in attachments {
             s.push_str(&format!("- **{}** — `{}`\n", a.role, a.path.display()));
         }
         s
     };
 
-    format!(
-        r#"You are running inside a lineageed git worktree of the Evolvo project. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Advance" on the resulting lineage job. Your job: implement the change.
-
-{guidance}{new_app_banner}
-
-# Lineage job
-
-- Job ID: `{job_id}`
-- Branch: `{branch}`
-- Iteration: `{iteration}`
-- Title: {title}
-- Feedback type: {feedback_type}
-- Submitted from route: {route}
-
-# What the user said
-
-{feedback_text}{voice_line}{attachments_section}
-
-# How to work
-
-1. Read `CLAUDE.md` and skim the relevant files under `app/` to orient yourself. Also skim `.claude/rules/` and `.claude/agents/` so you know what docs you will be expected to update.
-2. Read every file listed under Attachments above — the screenshot is often the clearest statement of intent of the app the user is building.
-3. When the work calls for a specialist, delegate via the Agent tool to one of the project agents defined in `.claude/agents/` (use whichever agents exist in this iteration of the repo — names may have changed).
-{work_step_4}
-5. If the app's architecture, stack, domain model, or command surface changed materially: update `CLAUDE.md`, the relevant files under `.claude/rules/`, and the affected `.claude/agents/*.md` (and `.claude/skills/*` if present) so the next iteration's agent starts with accurate context. Stale docs are treated as a bug.
-6. Run the appropriate checks before finishing. The exact commands depend on the current stack — read `CLAUDE.md` for the build contract. For today's Rust + Leptos + Tauri shell the defaults are:
-   - Backend: `cargo check -p evolvo_desktop`
-   - UI: `cargo check -p evolvo_ui --target wasm32-unknown-unknown`
-   - Tests: `cargo test -p evolvo_desktop`
-   If you rewrote the stack, run the equivalent checks for the new stack and update `CLAUDE.md` to document them.
-7. **Actually run the app** (see "Verify-before-done" above). Start it on the iteration's port, confirm the dev server comes up, and exercise the change in the running app. A green `cargo check` is not sufficient — the reviewer expects a binary that boots and does what the feedback asked.
-8. Commit your work with `git add -A && git commit` so the reviewer can diff the branch. Use a conventional-commit subject line like `feat(ui): …` or `fix(lineage): …`.
-9. Start the iteration's app again (if you shut it down to rebuild) so the reviewer lands on a live build when they open the worktree.
-10. Print a short summary (5-10 lines) of what you changed, which files were touched, how you verified the change ran, and — if invariants were at risk — how you preserved Feedback Overlay / Canvas / Inbox / Lineage. Keep it focused — the reviewer reads this first.
-
-# Safety
-
-- You are on branch `{branch}` in an isolated worktree. Do not `git push`, do not switch branches, do not touch the main branch.
-- You are running with `--dangerously-skip-permissions`: file edits, `cargo`, `git`, `trunk`, `bash scripts/run-iteration.sh`, and other shell commands inside this worktree all run without prompting. The worktree + throwaway branch are the safety envelope — use the access; don't burn cycles apologising for "not being able to run cargo". You ARE able. Run the checks and the app.
-- If a dependency is genuinely missing on the host (e.g. `cargo` itself isn't installed) say so plainly and exit — do not fake success. But "I'm blocked from running cargo" is not a valid reason inside this lineage; you have permission.
-- Your full transcript is being captured at `{log_file}` for reviewer audit.
-"#,
-        guidance = guidance,
-        job_id = job.id,
-        branch = branch_name(&job.id),
-        iteration = iteration,
-        title = job.title,
-        feedback_text = feedback.feedback_text,
-        log_file = log_file.display(),
-        work_step_4 = work_step_4,
-        new_app_banner = new_app_banner,
-    )
+    let template = load_prompt("implementation.md", EMBEDDED_IMPLEMENTATION);
+    template
+        .replace("{guidance}", &guidance)
+        .replace("{new_app_banner}", &new_app_banner)
+        .replace("{job_id}", &job.id)
+        .replace("{branch}", &branch_name(&job.id))
+        .replace("{iteration}", &iteration.to_string())
+        .replace("{title}", &job.title)
+        .replace("{feedback_type}", &feedback_type)
+        .replace("{route}", &route)
+        .replace("{feedback_text}", &feedback.feedback_text)
+        .replace("{voice_line}", &voice_line)
+        .replace("{attachments_section}", &attachments_section)
+        .replace("{work_step_4}", &work_step_4)
+        .replace("{log_file}", &log_file.display().to_string())
 }
 
 /// Returned synchronously from `prepare_run` so the caller can persist the

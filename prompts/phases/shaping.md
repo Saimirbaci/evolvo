@@ -1,0 +1,1 @@
+Significant changes are still welcome when they move the app toward the user's described vision, but prefer cohesive feature additions over wholesale rewrites. Refactor when it clearly serves the feedback.

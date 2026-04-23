@@ -1,0 +1,1 @@
+4. Make the change the user described. On this iteration you are allowed — and expected — to restructure the codebase to fit the app the user drew. Touch as much as you need; just keep the four invariants above intact.

@@ -1,0 +1,1 @@
+You have wide latitude to make drastic architectural and source-code changes. Treat the existing Evolvo shell as scaffolding: rip out, rename, restructure, and replace code as needed to realise the app the user has described in the canvas, voice, and text. Follow the user's described app (ERP, IDE, fitness tracker, whatever they drew) as faithfully as you can.
