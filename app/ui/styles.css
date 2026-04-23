@@ -257,155 +257,91 @@ button {
 
 /* ---- Drawing toolbar (pill) ---- */
 
-.toolbar {
-<<<<<<< HEAD
     position: absolute;
     left: 20px;
     top: 20px;
     display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding: 10px;
+    flex-direction: row;
+    align-items: center;
+    gap: 2px;
+    padding: 3px 5px;
     background: var(--panel-bg);
-    border-radius: 14px;
+    border-radius: 999px;
     box-shadow: var(--panel-shadow);
     backdrop-filter: blur(10px);
     z-index: 30;
 }
 
-.toolbar-row {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    align-items: center;
-}
-
-.toolbar-divider {
-    height: 1px;
-    width: 100%;
-    background: var(--border);
-}
-
-.tool-btn {
-    width: var(--tool-size);
-    height: var(--tool-size);
+.toolbar-handle {
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 8px;
+    width: 14px;
+    height: 24px;
+    color: rgba(15, 23, 42, 0.3);
+    font-size: 10px;
+    letter-spacing: 1px;
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+}
+
+.toolbar-handle:active {
+    cursor: grabbing;
+}
+
+.pill-btn {
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
     border: 1px solid transparent;
     background: transparent;
     cursor: pointer;
     color: var(--fg);
-    transition:
-        background 0.15s ease,
-        color 0.15s ease;
+    font-size: 13px;
+    transition: background 0.15s ease, color 0.15s ease;
+    padding: 0;
 }
 
-.tool-btn:hover {
-    background: rgba(15, 23, 42, 0.05);
+.pill-btn:hover {
+    background: rgba(15, 23, 42, 0.06);
 }
 
-.tool-btn.active {
+.pill-btn.active {
     background: var(--accent);
     color: var(--accent-fg);
 }
 
-.tool-btn:disabled {
+.pill-btn:disabled {
     opacity: 0.35;
     cursor: not-allowed;
 }
 
-.stroke-btn {
-    font-size: 12px;
-    font-weight: 600;
-=======
-  position: absolute;
-  left: 20px;
-  top: 20px;
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 8px;
-  background: var(--panel-bg);
-  border-radius: 999px;
-  box-shadow: var(--panel-shadow);
-  backdrop-filter: blur(10px);
-  z-index: 30;
-}
-
-.toolbar-handle {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 32px;
-  color: rgba(15, 23, 42, 0.3);
-  font-size: 11px;
-  letter-spacing: 1px;
-  cursor: grab;
-  user-select: none;
-  touch-action: none;
-}
-
-.toolbar-handle:active {
-  cursor: grabbing;
-}
-
-.pill-btn {
-  width: 34px;
-  height: 34px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  background: transparent;
-  cursor: pointer;
-  color: var(--fg);
-  font-size: 15px;
-  transition: background 0.15s ease, color 0.15s ease;
-  padding: 0;
-}
-
-.pill-btn:hover {
-  background: rgba(15, 23, 42, 0.06);
-}
-
-.pill-btn.active {
-  background: var(--accent);
-  color: var(--accent-fg);
-}
-
-.pill-btn:disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-}
-
 .pill-tool {
-  background: rgba(15, 23, 42, 0.05);
+    background: rgba(15, 23, 42, 0.05);
 }
 
 .pill-tool-glyph {
-  font-size: 17px;
-  line-height: 1;
+    font-size: 14px;
+    line-height: 1;
 }
 
 .pill-color-dot {
-  display: block;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: 2px solid var(--panel-bg);
-  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.2);
+    display: block;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--panel-bg);
+    box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.2);
 }
 
 .pill-stroke {
-  font-size: 12px;
-  font-weight: 600;
-  font-variant: tabular-nums;
->>>>>>> 13e29e5 (feat(ui): pill toolbar + shape/select/crop tools)
+    font-size: 11px;
+    font-weight: 600;
+    font-variant: tabular-nums;
 }
 
 .color-swatch {
