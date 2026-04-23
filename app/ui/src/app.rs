@@ -40,6 +40,8 @@ fn HomePage() -> impl IntoView {
 
     // Remove the welcome copy from the DOM entirely while the canvas overlay
     // is open, so it can't end up in the page screenshot captured at submit.
+    // this is only valid for the MetaApp. When building a NewApp this logic is not applicable, the user should be able
+    // to draw on top of the components, if he wants an empty Canvas he will use the MetaApp initial app.
     view! {
         {move || {
             if panel_open.get() {

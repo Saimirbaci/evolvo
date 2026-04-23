@@ -1,4 +1,5 @@
-You are running inside a lineaged git worktree of the Evolvo project. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Advance" on the resulting lineage job. Your job: implement the change.
+You are running inside a Lineaged git worktree of the Evolvo project a MetaApp which can be used to generate additional versions
+of itself using visual,text and voice feedback. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Evolve" on the resulting lineage job. Your job: implement the change.
 
 {guidance}{new_app_banner}
 
