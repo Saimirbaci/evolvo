@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tauri::State;
 
 use crate::runner;
-use crate::sandbox::{SandboxEngine, Transition};
+use crate::lineage::{SandboxEngine, Transition};
 use crate::state::AppState;
 use crate::store::StoreError;
 use crate::types::{
@@ -10,7 +10,7 @@ use crate::types::{
     SandboxJobRecord, SandboxJobStatus, SubmitFeedbackPayload,
 };
 
-const APP_NAME: &str = "NoIDE";
+const APP_NAME: &str = "Evolvo";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn store_error(err: StoreError) -> String {
@@ -118,7 +118,7 @@ pub fn submit_feedback(
 
     store.save_feedback(&record).map_err(store_error)?;
 
-    // Enqueue a sandbox job so reviewers can immediately triage.
+    // Enqueue a lineage job so reviewers can immediately triage.
     let engine = SandboxEngine::new(&store);
     let _ = engine
         .enqueue_job_for_feedback(&mut record)
@@ -172,7 +172,7 @@ pub fn load_sandbox_job(
 
 /// "Advance" button entry point. Behaviour depends on the job's current
 /// status:
-/// - `Pending` → fork the source repo into a sandbox worktree, spawn
+/// - `Pending` → fork the source repo into a lineage worktree, spawn
 ///   `claude -p … --dangerously-skip-permissions` in it, and return with
 ///   status `Implementing`. The run continues on a background thread;
 ///   the job will flip to `BuildReady` or `Failed` when claude exits.
@@ -191,7 +191,7 @@ pub fn approve_sandbox_job(
     let job = store
         .load_sandbox_job(&payload.id)
         .map_err(store_error)?
-        .ok_or_else(|| format!("sandbox job not found: {}", payload.id))?;
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
     match job.status {
         SandboxJobStatus::Pending => start_implementation_run(&store, &engine, &job),
         _ => engine
@@ -267,7 +267,7 @@ pub fn retry_sandbox_job(
     let job = store
         .load_sandbox_job(&payload.id)
         .map_err(store_error)?
-        .ok_or_else(|| format!("sandbox job not found: {}", payload.id))?;
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
     if !job.status.can_retry() {
         return Err(format!(
             "job {} is in status {:?} which does not support retry",
@@ -276,7 +276,7 @@ pub fn retry_sandbox_job(
     }
 
     let source = runner::resolve_source_repo().ok_or_else(|| {
-        "could not locate NoIDE source repo — set NOIDE_SOURCE_REPO or run from within the repo"
+        "could not locate Evolvo source repo — set NOIDE_SOURCE_REPO or run from within the repo"
             .to_string()
     })?;
     let workspace_root = store.layout().root().to_path_buf();
@@ -294,15 +294,15 @@ pub fn retry_sandbox_job(
     let refreshed = store
         .load_sandbox_job(&job.id)
         .map_err(store_error)?
-        .ok_or_else(|| format!("sandbox job not found after cleanup: {}", job.id))?;
+        .ok_or_else(|| format!("lineage job not found after cleanup: {}", job.id))?;
     start_implementation_run(&store, &engine, &refreshed)
 }
 
-/// Launch the app built in a sandbox job's worktree. Only valid after the
+/// Launch the app built in a lineage job's worktree. Only valid after the
 /// job has reached a state where a worktree exists and the agent has
 /// finished writing code (see `SandboxJobStatus::can_run`). The spawned
 /// process runs in the background with its own `NOIDE_WORKSPACE_ROOT` so it
-/// cannot see or mutate the host NoIDE's workspace.
+/// cannot see or mutate the host Evolvo's workspace.
 #[tauri::command]
 pub fn run_sandbox_job(
     state: State<'_, AppState>,
@@ -314,7 +314,7 @@ pub fn run_sandbox_job(
     let job = store
         .load_sandbox_job(&payload.id)
         .map_err(store_error)?
-        .ok_or_else(|| format!("sandbox job not found: {}", payload.id))?;
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
 
     if !job.status.can_run() {
         return Err(format!(
@@ -337,7 +337,7 @@ pub fn run_sandbox_job(
     store
         .load_sandbox_job(&payload.id)
         .map_err(store_error)?
-        .ok_or_else(|| format!("sandbox job disappeared after run: {}", payload.id))
+        .ok_or_else(|| format!("lineage job disappeared after run: {}", payload.id))
 }
 
 #[derive(serde::Deserialize)]

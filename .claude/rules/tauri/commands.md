@@ -1,4 +1,4 @@
-# Tauri 2 command conventions — NoIDE
+# Tauri 2 command conventions — Evolvo
 
 ## Adding a new command
 

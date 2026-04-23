@@ -23,5 +23,5 @@ fn main() {
             commands::open_external_url,
         ])
         .run(tauri::generate_context!())
-        .expect("failed to run NoIDE desktop app");
+        .expect("failed to run Evolvo desktop app");
 }

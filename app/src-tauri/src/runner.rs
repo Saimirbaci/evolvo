@@ -1,18 +1,18 @@
 //! Runs Claude Code non-interactively inside an isolated git worktree
-//! forked from the NoIDE source repo. This is the bridge between a reviewer
-//! pressing "Advance" on a sandbox job and actual code being written.
+//! forked from the Evolvo source repo. This is the bridge between a reviewer
+//! pressing "Advance" on a lineage job and actual code being written.
 //!
 //! Safety posture:
-//! - The worktree lives on its own branch (`sandbox/<job-id>`) so Claude
+//! - The worktree lives on its own branch (`lineage/<job-id>`) so Claude
 //!   can never touch the main branch or the primary checkout.
-//! - Claude is launched with `--dangerously-skip-permissions`. The sandbox
+//! - Claude is launched with `--dangerously-skip-permissions`. The lineage
 //!   worktree + throwaway branch provide the safety envelope; inside that
 //!   envelope the agent needs to actually run `cargo`, `git`, `trunk`,
 //!   `bash scripts/run-iteration.sh`, etc. without the user standing over
 //!   it hitting "approve". Every file the agent writes lives on
-//!   `sandbox/<job-id>` and every command runs in the worktree dir, so the
+//!   `lineage/<job-id>` and every command runs in the worktree dir, so the
 //!   blast radius is bounded even with full tool access.
-//! - All stdout + stderr is streamed to `claude.log` under the job's sandbox
+//! - All stdout + stderr is streamed to `claude.log` under the job's lineage
 //!   workspace directory, and every state transition is appended to the job
 //!   record's notes for observability.
 //! - If `claude` or `git` is missing the job transitions to `Failed` with a
@@ -29,7 +29,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::sandbox::SandboxEngine;
+use crate::lineage::SandboxEngine;
 use crate::store::{Store, StoreError};
 use crate::types::{FeedbackRecord, SandboxJobRecord, SandboxJobStatus};
 
@@ -43,22 +43,22 @@ const RUN_LOG_FILE: &str = "iteration-run.log";
 const RUN_WORKSPACE_DIR: &str = "run_workspace";
 const DEFAULT_RUN_SCRIPT: &str = "scripts/run-iteration.sh";
 
-/// Base dev-server port used by the host NoIDE (iteration 0). Each iteration
+/// Base dev-server port used by the host Evolvo (iteration 0). Each iteration
 /// bumps this by its iteration number so concurrent iteration runs don't
 /// collide on the same port — iteration 1 lives on `BASE + 1`, iteration 2 on
 /// `BASE + 2`, and so on. Kept in sync with `app/src-tauri/tauri.conf.json`'s
 /// `devUrl` and `app/ui/Trunk.toml`'s `serve.port`.
-pub const BASE_DEV_PORT: u16 = 1430;
+pub const BASE_DEV_PORT: u16 = 1530;
 
 /// Port the iteration's dev server should bind to. `iteration = 0` is the
-/// host NoIDE itself; real sandbox iterations start at 1. Capped at ~65500
+/// host Evolvo itself; real lineage iterations start at 1. Capped at ~65500
 /// defensively, though in practice nobody reaches 64k iterations.
 pub fn iteration_port(iteration: u32) -> u16 {
     let shifted = (BASE_DEV_PORT as u32).saturating_add(iteration);
     shifted.min(65500) as u16
 }
 
-/// Locate the NoIDE source repo that should be forked into the sandbox.
+/// Locate the Evolvo source repo that should be forked into the lineage.
 pub fn resolve_source_repo() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("NOIDE_SOURCE_REPO") {
         let pb = PathBuf::from(p);
@@ -128,7 +128,7 @@ pub fn metadata_path(workspace_root: &Path, job_id: &str) -> PathBuf {
 }
 
 pub fn branch_name(job_id: &str) -> String {
-    format!("sandbox/{job_id}")
+    format!("lineage/{job_id}")
 }
 
 /// Tear down any previous worktree + branch + job workspace left over from an
@@ -260,7 +260,7 @@ pub fn rewrite_iteration_port(worktree: &Path, port: u16) -> Result<Vec<PathBuf>
             continue;
         }
         // Replace any bare occurrence of the base port. The substrings we're
-        // replacing (":1430", "port = 1430", "--port 1430") are distinctive
+        // replacing (":1530", "port = 1530", "--port 1530") are distinctive
         // enough that a naive replace_all is safe — the base port number
         // doesn't collide with anything else in these files.
         let new_body = body.replace(&base_str, &port_str);
@@ -335,7 +335,7 @@ pub struct StagedAttachment {
 /// unless the user explicitly asks for a structural change.
 ///
 /// Regardless of iteration, the four product invariants (Feedback Overlay,
-/// Canvas / drawing board, Inbox, Sandbox pipeline) MUST survive every pass.
+/// Canvas / drawing board, Inbox, Lineage pipeline) MUST survive every pass.
 pub fn iteration_guidance(iteration: u32) -> String {
     let n = iteration.max(1);
     let port = iteration_port(n);
@@ -343,7 +343,7 @@ pub fn iteration_guidance(iteration: u32) -> String {
         1..=3 => (
             "Bootstrap phase",
             "You have wide latitude to make drastic architectural and source-code changes. \
-             Treat the existing NoIDE shell as scaffolding: rip out, rename, restructure, and replace code \
+             Treat the existing Evolvo shell as scaffolding: rip out, rename, restructure, and replace code \
              as needed to realise the app the user has described in the canvas, voice, and text. \
              Follow the user's described app (ERP, IDE, fitness tracker, whatever they drew) as faithfully as you can.",
         ),
@@ -367,7 +367,7 @@ pub fn iteration_guidance(iteration: u32) -> String {
     format!(
         r#"# Iteration {n} — {phase}
 
-This NoIDE instance is a self-evolving meta-app. Each approved sandbox job is one iteration in the life of the app the user is building on top of the NoIDE shell.
+This Evolvo instance is a self-evolving meta-app. Each approved lineage job is one iteration in the life of the app the user is building on top of the Evolvo shell.
 
 **Latitude for this iteration:** {latitude}
 
@@ -378,7 +378,7 @@ Whatever the app becomes, the shell must keep these four surfaces reachable and 
 1. **Feedback Overlay** — reachable from every screen, every mode. The user must always be able to open the feedback panel and submit new feedback about the page they are on.
 2. **Canvas overlay on every page** — the Canvas is NOT a standalone tab or dedicated route. It is an overlay the user can open on top of *any* page of the app to draw / annotate / sketch feedback about *that specific page*. Every route must support opening the Canvas on top of it; the feedback submission records which route the drawing was made on. A design that only lets the user draw on a single "Canvas tab" is wrong — the whole point is per-page visual feedback.
 3. **Inbox** — the list/overview of submitted feedback must remain visible and navigable, and each entry must preserve the page/route it was submitted from.
-4. **Sandbox pipeline** — the feedback → sandbox-job state machine (and the Advance / Retry / Reject / Run affordances) must keep working end-to-end so the *next* iteration can happen.
+4. **Lineage pipeline** — the feedback → lineage-job state machine (and the Advance / Retry / Reject / Run affordances) must keep working end-to-end so the *next* iteration can happen.
 
 If your change would break any of these four surfaces in the resulting app, it is wrong — redesign the change to preserve them. These invariants are load-bearing; they are what makes iteration N+1 possible.
 
@@ -409,9 +409,9 @@ The next iteration's agent will read these files first. Leaving them stale is th
 
 ## Per-iteration dev-server port
 
-This iteration's dev server MUST listen on **port {port}** (base `1430` + iteration `{n}`). The runner has already rewritten `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in this worktree to use port `{port}` so concurrent iteration runs don't collide. When the reviewer clicks **Run**, the runner also sets `NOIDE_ITERATION_PORT={port}` in the child environment.
+This iteration's dev server MUST listen on **port {port}** (base `1530` + iteration `{n}`). The runner has already rewritten `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in this worktree to use port `{port}` so concurrent iteration runs don't collide. When the reviewer clicks **Run**, the runner also sets `NOIDE_ITERATION_PORT={port}` in the child environment.
 
-If you rewrote the stack so the default files no longer exist, you MUST honour `NOIDE_ITERATION_PORT` in `scripts/run-iteration.sh` (or whatever startup script you ship) and bind the dev/server on that port. Never hardcode `1430` — it belongs to the host NoIDE.
+If you rewrote the stack so the default files no longer exist, you MUST honour `NOIDE_ITERATION_PORT` in `scripts/run-iteration.sh` (or whatever startup script you ship) and bind the dev/server on that port. Never hardcode `1530` — it belongs to the host Evolvo.
 
 ## Keep the iteration runnable — `scripts/run-iteration.sh`
 
@@ -421,8 +421,8 @@ If you rewrite the stack (e.g. move off Tauri/Leptos) you MUST create or update 
 
 - Start the current app in the foreground (the runner streams its stdout/stderr into a log file).
 - Bind the dev/server to `$NOIDE_ITERATION_PORT` (falling back to `{port}` for this iteration if the env var isn't set).
-- Respect `NOIDE_WORKSPACE_ROOT` if the app stores any state — the runner sets that env var to a per-iteration workspace directory so runs stay isolated from the host NoIDE.
-- Exit non-zero on startup failure so the reviewer sees a useful error in the sandbox notes.
+- Respect `NOIDE_WORKSPACE_ROOT` if the app stores any state — the runner sets that env var to a per-iteration workspace directory so runs stay isolated from the host Evolvo.
+- Exit non-zero on startup failure so the reviewer sees a useful error in the lineage notes.
 
 If you kept the default stack, you can skip the script and rely on the `cargo tauri dev` fallback.
 
@@ -435,7 +435,7 @@ Concrete steps for the default stack (adapt for whatever stack this iteration sh
 1. Run `cargo check -p noide_desktop` and `cargo check -p noide_ui --target wasm32-unknown-unknown`. Both must pass.
 2. Run `cargo test -p noide_desktop` and fix any regression you introduced. Add tests for new host-side logic.
 3. Start the app in the background: `NOIDE_ITERATION_PORT={port} cargo tauri dev` (or `bash scripts/run-iteration.sh`). Wait for the dev server to print its ready line (Trunk prints `server listening at http://127.0.0.1:{port}`). If the build fails or the server doesn't come up, fix the cause — do NOT claim success.
-4. Exercise the change: navigate to the affected route, trigger the feedback / canvas / sandbox path that the feedback is about, and confirm the user-visible behaviour matches what was asked for. Try to break it — empty inputs, fast clicks, edge cases adjacent to what the feedback described. If any of the four invariants (Feedback Overlay, per-page Canvas overlay, Inbox, Sandbox pipeline) regressed, that's a blocker: fix it before finishing.
+4. Exercise the change: navigate to the affected route, trigger the feedback / canvas / lineage path that the feedback is about, and confirm the user-visible behaviour matches what was asked for. Try to break it — empty inputs, fast clicks, edge cases adjacent to what the feedback described. If any of the four invariants (Feedback Overlay, per-page Canvas overlay, Inbox, Lineage pipeline) regressed, that's a blocker: fix it before finishing.
 5. Only after the app actually ran and the change actually worked, commit and return.
 
 If you genuinely cannot run the app in this environment (no display, missing system deps), say so plainly in your final summary — don't fake it. "I couldn't run the app because X" is acceptable; "looks good, tests pass" when you never started the binary is not.
@@ -444,7 +444,7 @@ If you genuinely cannot run the app in this environment (no display, missing sys
 
 When the change is verified:
 
-1. Stage and commit every file you touched (including updated `CLAUDE.md` / rules / agents). Use a conventional-commit subject like `feat(ui): <short>` or `fix(sandbox): <short>`. One focused commit is fine; multiple small commits are better when the work naturally splits.
+1. Stage and commit every file you touched (including updated `CLAUDE.md` / rules / agents). Use a conventional-commit subject like `feat(ui): <short>` or `fix(lineage): <short>`. One focused commit is fine; multiple small commits are better when the work naturally splits.
 2. Leave the iteration's app running so the reviewer lands on a live build. If you shut it down earlier to rebuild, start it again before returning: `NOIDE_ITERATION_PORT={port} cargo tauri dev` (or the equivalent for your stack). The reviewer's Run button will also launch it, but starting it here saves them a click and confirms startup worked.
 3. In your final summary mention the port this iteration is serving on ({port}) and how you verified the change.
 "#,
@@ -464,7 +464,7 @@ pub fn build_implementation_prompt(
     // it overrides the iteration-number-based latitude and forces the agent
     // back into bootstrap mode no matter how many iterations have happened.
     let work_step_4 = if is_new_app {
-        "4. **This is a `NewApp` feedback.** The user is asking you to build a NEW APP from scratch on top of the NoIDE shell. Treat the existing app code as disposable scaffolding: rename, delete, rewrite, and restructure whatever you need to produce the app the user described in the canvas + text + voice. The only things you must preserve are the four product invariants above (Feedback Overlay, Canvas per-page overlay, Inbox, Sandbox pipeline) and the ability to keep iterating. Everything else — the old app's domain, pages, data model, stack choices — is up for replacement."
+        "4. **This is a `NewApp` feedback.** The user is asking you to build a NEW APP from scratch on top of the Evolvo shell. Treat the existing app code as disposable scaffolding: rename, delete, rewrite, and restructure whatever you need to produce the app the user described in the canvas + text + voice. The only things you must preserve are the four product invariants above (Feedback Overlay, Canvas per-page overlay, Inbox, Lineage pipeline) and the ability to keep iterating. Everything else — the old app's domain, pages, data model, stack choices — is up for replacement."
     } else if iteration <= 3 {
         "4. Make the change the user described. On this iteration you are allowed — and expected — to restructure the codebase to fit the app the user drew. Touch as much as you need; just keep the four invariants above intact."
     } else if iteration <= 9 {
@@ -501,11 +501,11 @@ pub fn build_implementation_prompt(
     };
 
     format!(
-        r#"You are running inside a sandboxed git worktree of the NoIDE project. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Advance" on the resulting sandbox job. Your job: implement the change.
+        r#"You are running inside a sandboxed git worktree of the Evolvo project. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Advance" on the resulting lineage job. Your job: implement the change.
 
 {guidance}{new_app_banner}
 
-# Sandbox job
+# Lineage job
 
 - Job ID: `{job_id}`
 - Branch: `{branch}`
@@ -531,15 +531,15 @@ pub fn build_implementation_prompt(
    - Tests: `cargo test -p noide_desktop`
    If you rewrote the stack, run the equivalent checks for the new stack and update `CLAUDE.md` to document them.
 7. **Actually run the app** (see "Verify-before-done" above). Start it on the iteration's port, confirm the dev server comes up, and exercise the change in the running app. A green `cargo check` is not sufficient — the reviewer expects a binary that boots and does what the feedback asked.
-8. Commit your work with `git add -A && git commit` so the reviewer can diff the branch. Use a conventional-commit subject line like `feat(ui): …` or `fix(sandbox): …`.
+8. Commit your work with `git add -A && git commit` so the reviewer can diff the branch. Use a conventional-commit subject line like `feat(ui): …` or `fix(lineage): …`.
 9. Start the iteration's app again (if you shut it down to rebuild) so the reviewer lands on a live build when they open the worktree.
-10. Print a short summary (5-10 lines) of what you changed, which files were touched, how you verified the change ran, and — if invariants were at risk — how you preserved Feedback Overlay / Canvas / Inbox / Sandbox. Keep it focused — the reviewer reads this first.
+10. Print a short summary (5-10 lines) of what you changed, which files were touched, how you verified the change ran, and — if invariants were at risk — how you preserved Feedback Overlay / Canvas / Inbox / Lineage. Keep it focused — the reviewer reads this first.
 
 # Safety
 
 - You are on branch `{branch}` in an isolated worktree. Do not `git push`, do not switch branches, do not touch the main branch.
 - You are running with `--dangerously-skip-permissions`: file edits, `cargo`, `git`, `trunk`, `bash scripts/run-iteration.sh`, and other shell commands inside this worktree all run without prompting. The worktree + throwaway branch are the safety envelope — use the access; don't burn cycles apologising for "not being able to run cargo". You ARE able. Run the checks and the app.
-- If a dependency is genuinely missing on the host (e.g. `cargo` itself isn't installed) say so plainly and exit — do not fake success. But "I'm blocked from running cargo" is not a valid reason inside this sandbox; you have permission.
+- If a dependency is genuinely missing on the host (e.g. `cargo` itself isn't installed) say so plainly and exit — do not fake success. But "I'm blocked from running cargo" is not a valid reason inside this lineage; you have permission.
 - Your full transcript is being captured at `{log_file}` for reviewer audit.
 "#,
         guidance = guidance,
@@ -589,7 +589,7 @@ pub fn prepare_run(
     let job = &job;
     let source = resolve_source_repo().ok_or_else(|| {
         StoreError::Other(
-            "could not locate NoIDE source repo — set NOIDE_SOURCE_REPO or run from within the repo"
+            "could not locate Evolvo source repo — set NOIDE_SOURCE_REPO or run from within the repo"
                 .to_string(),
         )
     })?;
@@ -743,7 +743,7 @@ pub fn iteration_run_workspace(workspace_root: &Path, job_id: &str) -> PathBuf {
 /// iteration. We prefer `scripts/run-iteration.sh` at the worktree root so
 /// the agent can rewrite the stack freely and still expose a stable entry
 /// point. If the script isn't there, fall back to `cargo tauri dev` against
-/// the default NoIDE shell location (`app/src-tauri`).
+/// the default Evolvo shell location (`app/src-tauri`).
 pub struct ResolvedRunCommand {
     pub program: String,
     pub args: Vec<String>,
@@ -797,19 +797,19 @@ pub fn resolve_run_command(worktree: &Path) -> ResolvedRunCommand {
     }
 }
 
-/// Spawn the iteration's app from its sandbox worktree and stream output to
+/// Spawn the iteration's app from its lineage worktree and stream output to
 /// `iteration-run.log` under the job workspace. Fire-and-forget: the call
 /// returns as soon as the child is handed off to a dedicated thread; the
-/// status the user sees in the UI reflects the sandbox state machine, not
+/// status the user sees in the UI reflects the lineage state machine, not
 /// the run process itself. The child gets its own `NOIDE_WORKSPACE_ROOT`
 /// pointed at the per-job `run_workspace/` dir so it can't clobber the host
-/// NoIDE's feedback / sandbox data.
+/// Evolvo's feedback / lineage data.
 pub fn launch_iteration_run(store: Store, job_id: String) {
     std::thread::spawn(move || {
         let engine = SandboxEngine::new(&store);
 
         let Some(job) = store.load_sandbox_job(&job_id).ok().flatten() else {
-            let _ = engine.append_note(&job_id, "run requested but sandbox job record is missing");
+            let _ = engine.append_note(&job_id, "run requested but lineage job record is missing");
             return;
         };
         let Some(worktree_str) = job.worktree_path.clone() else {
@@ -939,7 +939,7 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
             Err(e) => {
                 let hint = if e.kind() == std::io::ErrorKind::NotFound {
                     format!(
-                        "`{}` was not found on PATH. On macOS, apps launched from Finder/Dock inherit a minimal PATH; install the toolchain or launch NoIDE from a shell where `{}` works. PATH used: {}",
+                        "`{}` was not found on PATH. On macOS, apps launched from Finder/Dock inherit a minimal PATH; install the toolchain or launch Evolvo from a shell where `{}` works. PATH used: {}",
                         cmd.program, cmd.program, path_env
                     )
                 } else {
@@ -1017,7 +1017,7 @@ mod tests {
         );
 
         assert!(prompt.contains("job-42"));
-        assert!(prompt.contains("sandbox/job-42"));
+        assert!(prompt.contains("lineage/job-42"));
         assert!(prompt.contains("Save button is laggy"));
         assert!(prompt.contains("The save button sometimes doesn't respond"));
         assert!(prompt.contains("the button feels laggy"));
@@ -1061,7 +1061,7 @@ mod tests {
             assert!(g.contains("Feedback Overlay"));
             assert!(g.contains("Canvas"));
             assert!(g.contains("Inbox"));
-            assert!(g.contains("Sandbox"));
+            assert!(g.contains("Lineage"));
             assert!(g.contains("CLAUDE.md"));
             assert!(g.contains(".claude/agents"));
         }
@@ -1152,12 +1152,12 @@ mod tests {
 
         fs::write(
             worktree.join("app/src-tauri/tauri.conf.json"),
-            r#"{"build":{"devUrl":"http://localhost:1430"}}"#,
+            r#"{"build":{"devUrl":"http://localhost:1530"}}"#,
         )
         .unwrap();
         fs::write(
             worktree.join("app/ui/Trunk.toml"),
-            "[serve]\nport = 1430\n",
+            "[serve]\nport = 1530\n",
         )
         .unwrap();
         // trunk-dev.sh intentionally omitted — rewrite should skip it cleanly.
@@ -1168,7 +1168,7 @@ mod tests {
 
         let conf = fs::read_to_string(worktree.join("app/src-tauri/tauri.conf.json")).unwrap();
         assert!(conf.contains(&port.to_string()));
-        assert!(!conf.contains("1430"));
+        assert!(!conf.contains("1530"));
 
         let trunk = fs::read_to_string(worktree.join("app/ui/Trunk.toml")).unwrap();
         assert!(trunk.contains(&port.to_string()));
@@ -1181,7 +1181,7 @@ mod tests {
         fs::create_dir_all(worktree.join("app/src-tauri")).unwrap();
         fs::write(
             worktree.join("app/src-tauri/tauri.conf.json"),
-            r#"{"devUrl":"http://localhost:1430"}"#,
+            r#"{"devUrl":"http://localhost:1530"}"#,
         )
         .unwrap();
         let changed = rewrite_iteration_port(&worktree, BASE_DEV_PORT).unwrap();
@@ -1216,7 +1216,7 @@ mod tests {
 
     #[test]
     fn branch_name_uses_sandbox_prefix() {
-        assert_eq!(branch_name("job-123"), "sandbox/job-123");
+        assert_eq!(branch_name("job-123"), "lineage/job-123");
     }
 
     #[test]
@@ -1236,7 +1236,7 @@ mod tests {
     #[test]
     fn resolve_source_repo_finds_noide_checkout() {
         let resolved = resolve_source_repo();
-        assert!(resolved.is_some(), "should find the NoIDE source repo under the test harness");
+        assert!(resolved.is_some(), "should find the Evolvo source repo under the test harness");
         let p = resolved.unwrap();
         assert!(p.join(".claude").join("agents").exists());
         assert!(p.join(".git").exists());

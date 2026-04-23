@@ -1,4 +1,4 @@
-# Rust conventions — NoIDE
+# Rust conventions — Evolvo
 
 Applies to both `app/src-tauri` (host, native target) and `app/ui` (WASM target).
 

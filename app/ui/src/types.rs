@@ -52,7 +52,7 @@ impl FeedbackStatus {
         match self {
             Self::New => "new",
             Self::Triaged => "triaged",
-            Self::InSandbox => "in sandbox",
+            Self::InSandbox => "in lineage",
             Self::Resolved => "resolved",
             Self::Rejected => "rejected",
         }

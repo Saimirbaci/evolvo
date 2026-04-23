@@ -1,5 +1,5 @@
 ---
-description: Run the full NoIDE build contract — cargo check/test/clippy on host + wasm check on UI. Report pass/fail per gate.
+description: Run the full Evolvo build contract — cargo check/test/clippy on host + wasm check on UI. Report pass/fail per gate.
 ---
 
 Run every gate and report which pass / fail. Do not stop on the first failure — run all gates so the user sees the full picture.

@@ -1,5 +1,5 @@
 ---
-description: Measure the NoIDE WASM bundle size — run trunk build and report dist/*.wasm sizes with a breakdown of top symbols if twiggy is available.
+description: Measure the Evolvo WASM bundle size — run trunk build and report dist/*.wasm sizes with a breakdown of top symbols if twiggy is available.
 ---
 
 Run a release WASM build and report size:

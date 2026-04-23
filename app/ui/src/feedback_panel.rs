@@ -215,7 +215,7 @@ pub fn FeedbackPanel(
                     }
                     on:click=submit
                 >
-                    {move || if submitting.get() { "Sending…" } else { "Submit to sandbox" }}
+                    {move || if submitting.get() { "Sending…" } else { "Submit to lineage" }}
                 </button>
             </div>
         </aside>

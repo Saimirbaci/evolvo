@@ -12,14 +12,14 @@ use crate::types::{AppHealth, FeedbackRecord, SandboxJobRecord};
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
 /// moves. Kept as a constant rather than a build-time env var so the binary
 /// ships with a known, auditable destination.
-const STAR_REPO_URL: &str = "https://github.com/saimirbaci/NoIDE";
+const STAR_REPO_URL: &str = "https://github.com/saimirbaci/Evolvo";
 
 fn star_us_link() -> leptos::prelude::AnyView {
     view! {
         <button
             class="app-bar-link star-us-link"
             title="Star this repo on GitHub"
-            aria-label="Star NoIDE on GitHub"
+            aria-label="Star Evolvo on GitHub"
             on:click=move |_| {
                 spawn_local(async move {
                     let _ = interop::open_external_url(STAR_REPO_URL).await;
@@ -37,7 +37,7 @@ pub enum View {
     #[default]
     Home,
     Inbox,
-    Sandbox,
+    Lineage,
 }
 
 impl View {
@@ -45,7 +45,7 @@ impl View {
         match self {
             Self::Home => "/",
             Self::Inbox => "/inbox",
-            Self::Sandbox => "/sandbox",
+            Self::Lineage => "/lineage",
         }
     }
 
@@ -53,12 +53,12 @@ impl View {
         match self {
             Self::Home => "Canvas",
             Self::Inbox => "Inbox",
-            Self::Sandbox => "Sandbox",
+            Self::Lineage => "Lineage",
         }
     }
 
     fn all() -> [View; 3] {
-        [Self::Home, Self::Inbox, Self::Sandbox]
+        [Self::Home, Self::Inbox, Self::Lineage]
     }
 }
 
@@ -90,7 +90,7 @@ pub fn App() -> impl IntoView {
         <div class="app-root">
             <header class="app-bar">
                 <div>
-                    <span class="app-bar-title">"NoIDE"</span>
+                    <span class="app-bar-title">"Evolvo"</span>
                     <span class="app-bar-subtitle">
                         {move || match health.get() {
                             Some(h) => format!("v{} • {}", h.app_version, h.workspace_path),
@@ -111,9 +111,9 @@ pub fn App() -> impl IntoView {
                             </button>
                         }.into_any();
                         // Inject the "Star Us" shortcut just before the
-                        // Sandbox tab so it sits at the left edge of the
-                        // sandbox section of the nav.
-                        if matches!(v, View::Sandbox) {
+                        // Lineage tab so it sits at the left edge of the
+                        // lineage section of the nav.
+                        if matches!(v, View::Lineage) {
                             vec![star_us_link(), primary]
                         } else {
                             vec![primary]
@@ -127,7 +127,7 @@ pub fn App() -> impl IntoView {
                     <HomePage controller=controller_for_home.clone() route=route />
                 }.into_any(),
                 View::Inbox => view! { <InboxPage /> }.into_any(),
-                View::Sandbox => view! { <SandboxPage /> }.into_any(),
+                View::Lineage => view! { <SandboxPage /> }.into_any(),
             }}
         </div>
     }
@@ -291,9 +291,9 @@ fn SandboxPage() -> impl IntoView {
     });
 
     view! {
-        <div class="sandbox-page">
-            <aside class="sandbox-sidebar">
-                <h2 class="sandbox-sidebar-title">"Sandbox"</h2>
+        <div class="lineage-page">
+            <aside class="lineage-sidebar">
+                <h2 class="lineage-sidebar-title">"Lineage"</h2>
                 {move || match items.get() {
                     None => view! { <div class="empty-state">"Loading…"</div> }.into_any(),
                     Some(Err(e)) => view! {
@@ -302,11 +302,11 @@ fn SandboxPage() -> impl IntoView {
                     Some(Ok(records)) => {
                         if records.is_empty() {
                             view! {
-                                <div class="empty-state">"No sandbox jobs yet."</div>
+                                <div class="empty-state">"No lineage jobs yet."</div>
                             }.into_any()
                         } else {
                             view! {
-                                <ul class="sandbox-list">
+                                <ul class="lineage-list">
                                     {records.into_iter().map(|r| {
                                         let id = r.id.clone();
                                         let id_for_click = id.clone();
@@ -314,12 +314,12 @@ fn SandboxPage() -> impl IntoView {
                                         view! {
                                             <li>
                                                 <button
-                                                    class="sandbox-list-item"
+                                                    class="lineage-list-item"
                                                     class:active=is_active
                                                     on:click=move |_| selected.set(Some(id_for_click.clone()))
                                                 >
-                                                    <div class="sandbox-list-item-head">
-                                                        <span class="sandbox-list-item-title">{r.title.clone()}</span>
+                                                    <div class="lineage-list-item-head">
+                                                        <span class="lineage-list-item-title">{r.title.clone()}</span>
                                                         <span class="list-card-status">{r.status.label()}</span>
                                                     </div>
                                                     <div class="list-card-meta">
@@ -339,14 +339,14 @@ fn SandboxPage() -> impl IntoView {
                     }
                 }}
             </aside>
-            <section class="sandbox-detail">
+            <section class="lineage-detail">
                 {move || {
                     let Some(Ok(records)) = items.get() else {
                         return view! { <div class="empty-state">"Loading…"</div> }.into_any();
                     };
                     let Some(id) = selected.get() else {
                         return view! {
-                            <div class="empty-state">"Select a sandbox job to view activity."</div>
+                            <div class="empty-state">"Select a lineage job to view activity."</div>
                         }.into_any();
                     };
                     let Some(record) = records.into_iter().find(|r| r.id == id) else {
@@ -427,10 +427,10 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
     let created = format_time(record.created_at_unix_ms);
 
     view! {
-        <div class="sandbox-detail-inner">
-            <header class="sandbox-detail-head">
+        <div class="lineage-detail-inner">
+            <header class="lineage-detail-head">
                 <div>
-                    <h3 class="sandbox-detail-title">{title}</h3>
+                    <h3 class="lineage-detail-title">{title}</h3>
                     <div class="list-card-meta">
                         {if iteration > 0 {
                             format!("iteration {iteration} · {created}")
@@ -442,7 +442,7 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
                 <span class="list-card-status">{status_label}</span>
             </header>
 
-            <p class="sandbox-detail-summary">{summary}</p>
+            <p class="lineage-detail-summary">{summary}</p>
 
             {match branch {
                 Some(b) => view! {
@@ -463,7 +463,7 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
                 None => view! { <span></span> }.into_any(),
             }}
 
-            <section class="sandbox-activity">
+            <section class="lineage-activity">
                 <h4>{format!("Activity ({} entries)", notes.len())}</h4>
                 {if notes.is_empty() {
                     view! {
@@ -471,7 +471,7 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
                     }.into_any()
                 } else {
                     view! {
-                        <ul class="sandbox-activity-list">
+                        <ul class="lineage-activity-list">
                             {notes.into_iter().map(|n| view! { <li>{n}</li> }).collect_view()}
                         </ul>
                     }.into_any()
@@ -484,12 +484,12 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
                 }
                 let submit = submit_fix.clone();
                 view! {
-                    <div class="sandbox-fix-form">
-                        <label class="sandbox-fix-label">
+                    <div class="lineage-fix-form">
+                        <label class="lineage-fix-label">
                             "Describe the problem or give Claude more context for the fix:"
                         </label>
                         <textarea
-                            class="sandbox-fix-textarea"
+                            class="lineage-fix-textarea"
                             placeholder="e.g. build failed because the new command wasn't registered in invoke_handler…"
                             prop:value=move || fix_text.get()
                             on:input=move |ev| {
@@ -497,7 +497,7 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
                                 fix_text.set(t.value());
                             }
                         ></textarea>
-                        <div class="sandbox-fix-actions">
+                        <div class="lineage-fix-actions">
                             <button
                                 class="secondary-btn"
                                 prop:disabled=move || fix_submitting.get()
@@ -520,7 +520,7 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
                 }.into_any()
             }}
 
-            <div class="sandbox-detail-actions">
+            <div class="lineage-detail-actions">
                 <button class="secondary-btn" on:click=reject_click>"Reject"</button>
                 <button
                     class="secondary-btn"
@@ -556,7 +556,7 @@ fn format_time(ms: u64) -> String {
     String::from(date.to_iso_string())
 }
 
-/// Bump `reload` after each delay (ms). Used to surface asynchronous sandbox
+/// Bump `reload` after each delay (ms). Used to surface asynchronous lineage
 /// notes (e.g. the Run button's background-thread spawn result) without
 /// requiring the user to navigate away and back.
 fn schedule_reloads(reload: RwSignal<u32>, delays_ms: &[i32]) {

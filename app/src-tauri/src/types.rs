@@ -19,12 +19,12 @@ pub enum FeedbackType {
     Confusion,
     Compliment,
     /// The user wants the agent to build a **new app from scratch** on top
-    /// of the NoIDE shell. Regardless of iteration number, a `NewApp` feedback
+    /// of the Evolvo shell. Regardless of iteration number, a `NewApp` feedback
     /// unlocks full "bootstrap" latitude in the prompt — the agent should
     /// treat the existing code as scaffolding and produce the app the user
     /// described in the canvas + text + voice, preserving only the four
     /// product invariants (Feedback Overlay, Canvas per-page overlay, Inbox,
-    /// Sandbox pipeline).
+    /// Lineage pipeline).
     NewApp,
 }
 
@@ -109,13 +109,13 @@ pub struct SandboxJobRecord {
     pub notes: Vec<String>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
-    /// Set once the sandbox pipeline has forked the source repo into a
+    /// Set once the lineage pipeline has forked the source repo into a
     /// worktree for this job. Stored as an absolute path string so the UI
     /// can display it; not used for path resolution on the backend.
     #[serde(default)]
     pub worktree_path: Option<String>,
     /// Branch name inside the source repo that the worktree was checked
-    /// out to (e.g. `sandbox/job-1700000000000`).
+    /// out to (e.g. `lineage/job-1700000000000`).
     #[serde(default)]
     pub branch_name: Option<String>,
     /// Absolute path to the `claude.log` file that captures the agent's
@@ -127,7 +127,7 @@ pub struct SandboxJobRecord {
     #[serde(default)]
     pub source_repo: Option<String>,
     /// 1-indexed iteration number for the evolving meta-app. Iteration 1 is
-    /// the first change ever applied to a fresh NoIDE shell; later iterations
+    /// the first change ever applied to a fresh Evolvo shell; later iterations
     /// progressively narrow the agent's freedom. `0` means "not yet
     /// allocated" — old records that pre-date the counter deserialize to 0
     /// and are treated as iteration 1 when they run.

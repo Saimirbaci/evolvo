@@ -1,10 +1,10 @@
-# Product invariants — NoIDE
+# Product invariants — Evolvo
 
 These are **load-bearing product invariants**. They outrank aesthetic preferences, refactor opportunities, and most feature requests. Every agent and skill in this repo must respect them. Breaking one is a product decision, not a code change — escalate to the user.
 
-## I-P1. Sandbox always stays
+## I-P1. Lineage always stays
 
-The **sandbox pipeline** (feedback → sandbox job → reviewable/approvable state machine in `app/src-tauri/src/sandbox.rs`) is a first-class, permanent feature of NoIDE. It is never optional, never feature-flagged off, never removed, never "temporarily disabled" during a refactor. Any change that deletes, bypasses, or silently no-ops the sandbox is rejected on sight.
+The **lineage pipeline** (feedback → lineage job → reviewable/approvable state machine in `app/src-tauri/src/lineage.rs`) is a first-class, permanent feature of Evolvo. It is never optional, never feature-flagged off, never removed, never "temporarily disabled" during a refactor. Any change that deletes, bypasses, or silently no-ops the lineage is rejected on sight.
 
 ## I-P2. Feedback Overlay always stays
 
@@ -39,17 +39,17 @@ A UI where a user sees two Feedback-related buttons and can't tell which one is 
 
 ## I-P4. Sandboxes are saveable and forkable into standalone apps
 
-A user can **save a sandbox** and **rename / fork it into another app**. This means:
+A user can **save a lineage** and **rename / fork it into another app**. This means:
 
-- Sandbox state (jobs, notes, the feedback that fed them, associated attachments) is persistable as a self-contained artifact on disk.
-- That artifact is portable — the user can take it and turn it into a new NoIDE-shaped app, with its own identity (name, workspace root), independent of the original.
+- Lineage state (jobs, notes, the feedback that fed them, associated attachments) is persistable as a self-contained artifact on disk.
+- That artifact is portable — the user can take it and turn it into a new Evolvo-shaped app, with its own identity (name, workspace root), independent of the original.
 - "Rename into another app" implies an export/clone operation that mints a new app identity, not an in-place mutation of the current one.
 
 Any storage, state-machine, or workspace-layout change must preserve the ability to implement this. If the proposed change makes sandboxes non-portable (embeds host-specific paths, bakes in the current app name, loses the feedback↔job↔attachment linkage), it's rejected.
 
 ## What this means operationally
 
-- **Every agent** treats Sandbox + Feedback Overlay as non-negotiable surfaces. Fixes, refactors, and rewrites must preserve them.
-- **Every design proposal** that touches the sandbox state machine or the overlay must explicitly state how it preserves I-P1 through I-P4.
+- **Every agent** treats Lineage + Feedback Overlay as non-negotiable surfaces. Fixes, refactors, and rewrites must preserve them.
+- **Every design proposal** that touches the lineage state machine or the overlay must explicitly state how it preserves I-P1 through I-P4.
 - **Canvas rewrites are allowed** — but the reviewer must verify the Canvas overlay is invokable on *every page/route* of the resulting app (not just one dedicated screen) before approving.
-- **Sandbox portability** is a first-class requirement, not a future nice-to-have. New fields on `SandboxJobRecord` should be serializable and self-describing, not pointers into host state.
+- **Lineage portability** is a first-class requirement, not a future nice-to-have. New fields on `SandboxJobRecord` should be serializable and self-describing, not pointers into host state.

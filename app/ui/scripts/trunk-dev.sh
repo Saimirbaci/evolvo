@@ -11,4 +11,4 @@ if [ -d "$LOCAL_BIN_DIR" ]; then
   export PATH="$LOCAL_BIN_DIR:$PATH"
 fi
 
-exec trunk serve --config Trunk.toml --port 1430 --address 127.0.0.1
+exec trunk serve --config Trunk.toml --port 1530 --address 127.0.0.1

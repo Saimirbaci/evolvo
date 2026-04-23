@@ -1,6 +1,6 @@
-//! Lightweight sandbox engine.
+//! Lightweight lineage engine.
 //!
-//! The sandbox concept from agent_swarm is a gated pipeline that turns user
+//! The lineage concept from agent_swarm is a gated pipeline that turns user
 //! feedback into reviewable proposals. Here we keep just the state-machine and
 //! persistence surface: every submitted feedback spawns a `SandboxJobRecord`
 //! that a reviewer can advance, approve, or reject. Rich automation (LLM
@@ -67,7 +67,7 @@ impl<'a> SandboxEngine<'a> {
         Self { store }
     }
 
-    /// Create a fresh pending sandbox job for a piece of feedback and link
+    /// Create a fresh pending lineage job for a piece of feedback and link
     /// the two records atomically (from the caller's perspective).
     pub fn enqueue_job_for_feedback(
         &self,
@@ -107,7 +107,7 @@ impl<'a> SandboxEngine<'a> {
         let mut job = self
             .store
             .load_sandbox_job(job_id)?
-            .ok_or_else(|| format!("sandbox job not found: {job_id}"))?;
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         if !transition.is_valid_from(job.status) {
             return Err(format!(
                 "transition {transition:?} not valid from {:?}",
@@ -125,7 +125,7 @@ impl<'a> SandboxEngine<'a> {
         let mut job = self
             .store
             .load_sandbox_job(job_id)?
-            .ok_or_else(|| format!("sandbox job not found: {job_id}"))?;
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         if !note.trim().is_empty() {
             job.notes.push(note.trim().to_string());
             job.updated_at_unix_ms = current_time_unix_ms();
@@ -146,7 +146,7 @@ impl<'a> SandboxEngine<'a> {
         let mut job = self
             .store
             .load_sandbox_job(job_id)?
-            .ok_or_else(|| format!("sandbox job not found: {job_id}"))?;
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         job.status = status;
         job.updated_at_unix_ms = current_time_unix_ms();
         self.store.save_sandbox_job(&job)?;
@@ -166,7 +166,7 @@ impl<'a> SandboxEngine<'a> {
         let mut job = self
             .store
             .load_sandbox_job(job_id)?
-            .ok_or_else(|| format!("sandbox job not found: {job_id}"))?;
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         job.worktree_path = Some(worktree_path);
         job.branch_name = Some(branch_name);
         job.log_path = Some(log_path);

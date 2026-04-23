@@ -1,4 +1,4 @@
-# Git workflow — NoIDE
+# Git workflow — Evolvo
 
 ## Branches
 
@@ -21,7 +21,7 @@ Scopes used in this repo:
 - `host` — anything in `app/src-tauri/`
 - `ui` — anything in `app/ui/`
 - `store` — specifically `store.rs`
-- `sandbox` — sandbox state machine
+- `lineage` — lineage state machine
 - `interop` — `app/ui/src/interop.rs`
 - `config` — Tauri / Trunk / Cargo config
 - `ci` — CI / scripts

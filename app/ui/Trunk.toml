@@ -4,7 +4,7 @@ dist = "dist"
 public_url = "/"
 
 [serve]
-port = 1430
+port = 1530
 open = false
 addresses = ["127.0.0.1"]
 disable_address_lookup = true
