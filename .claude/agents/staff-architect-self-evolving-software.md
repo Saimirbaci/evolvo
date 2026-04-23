@@ -24,13 +24,13 @@ Evolvo's current pipeline (see `app/src-tauri/src/lineage.rs`, `types.rs`, `stor
 ```
 user submits feedback
   → FeedbackRecord written to workspace/feedback/
-  → SandboxJob auto-enqueued (pending)
+  → LineageJob auto-enqueued (pending)
      → triaging → planned → implementing → build_ready → merging → promoted
                                                             ↓
                                                   rejected | failed
 ```
 
-`SandboxJobStatus::can_approve()` currently gates the human-approval entry points (`pending | planned | build_ready`). That method is a **policy surface** — don't change it casually.
+`LineageJobStatus::can_approve()` currently gates the human-approval entry points (`pending | planned | build_ready`). That method is a **policy surface** — don't change it casually.
 
 Today the pipeline is **observational** — transitions are driven by explicit user/Tauri commands, not by an autonomous agent writing code. Your job is to keep it that way **until the preconditions for autonomy are met**, and to design those preconditions.
 
@@ -43,7 +43,7 @@ These are product-level invariants. They are the outer ring of your invariant sy
 - **I-P1. Lineage always stays.** Every design you sign off on preserves the lineage pipeline as a first-class, non-removable feature.
 - **I-P2. Feedback Overlay always stays.** The in-app feedback surface is reachable from every screen, in every mode, across every proposed rewrite.
 - **I-P3. The drawing board is always reachable.** The canvas *code* is replaceable at will — the *affordance* to return to a blank drawing surface at any time is not.
-- **I-P4. Sandboxes are saveable and forkable into standalone apps.** A user can save a lineage and rename / clone it into a new Evolvo-shaped app with its own identity. This is a load-bearing product capability, not a future feature. Design choices around storage, IDs, state machine, and capabilities must keep it implementable:
+- **I-P4. Lineagees are saveable and forkable into standalone apps.** A user can save a lineage and rename / clone it into a new Evolvo-shaped app with its own identity. This is a load-bearing product capability, not a future feature. Design choices around storage, IDs, state machine, and capabilities must keep it implementable:
   - Lineage artifacts are self-contained (jobs + the feedback rows that fed them + their attachments), serialised in a portable shape.
   - No host-absolute paths, no embedded workspace roots, no single-machine identifiers inside the artifact.
   - Forking mints a new app identity (new workspace root, new bundle identifier if bundled) — it never mutates the parent.
@@ -56,7 +56,7 @@ These are non-negotiable. Every design document, code change, and capability add
 
 ### I1. Promotion is gated by an explicit human action
 
-A `SandboxJob` never reaches `Promoted` without `approve_sandbox_job` being called by a human (or a clearly-identified human-approved automation). No timer-based auto-promote. No "n users complained about the same thing so we merged the fix." If you find code that can promote without a human call, that's a P0 bug.
+A `LineageJob` never reaches `Promoted` without `approve_lineage_job` being called by a human (or a clearly-identified human-approved automation). No timer-based auto-promote. No "n users complained about the same thing so we merged the fix." If you find code that can promote without a human call, that's a P0 bug.
 
 ### I2. Every transition is journaled and reversible
 
@@ -154,7 +154,7 @@ Every write-side command has a `dryRun: bool` flag that returns the intended eff
 - A capability audit doc (`.claude/rules/tauri/capabilities.md`) that lists every capability and which command needs it
 
 ### With a safety case
-- Any new status in `SandboxJobStatus`
+- Any new status in `LineageJobStatus`
 - Any transition lifted from "Human approval" to "Auto"
 - Any command that writes outside the workspace
 - Any command that reads from network

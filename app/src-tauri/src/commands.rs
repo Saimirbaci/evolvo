@@ -1,13 +1,13 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tauri::State;
 
+use crate::lineage::{LineageEngine, Transition};
 use crate::runner;
-use crate::lineage::{SandboxEngine, Transition};
 use crate::state::AppState;
 use crate::store::StoreError;
 use crate::types::{
     current_time_unix_ms, AppHealth, EntityIdPayload, FeedbackRecord, FeedbackStatus,
-    SandboxJobRecord, SandboxJobStatus, SubmitFeedbackPayload,
+    LineageJobRecord, LineageJobStatus, SubmitFeedbackPayload,
 };
 
 const APP_NAME: &str = "Evolvo";
@@ -113,13 +113,13 @@ pub fn submit_feedback(
         window_height: payload.window_height,
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
-        sandbox_job_id: None,
+        lineage_job_id: None,
     };
 
     store.save_feedback(&record).map_err(store_error)?;
 
     // Enqueue a lineage job so reviewers can immediately triage.
-    let engine = SandboxEngine::new(&store);
+    let engine = LineageEngine::new(&store);
     let _ = engine
         .enqueue_job_for_feedback(&mut record)
         .map_err(store_error)?;
@@ -155,18 +155,18 @@ pub fn delete_feedback(
 }
 
 #[tauri::command]
-pub fn list_sandbox_jobs(state: State<'_, AppState>) -> Result<Vec<SandboxJobRecord>, String> {
-    state.store().list_sandbox_jobs().map_err(store_error)
+pub fn list_lineage_jobs(state: State<'_, AppState>) -> Result<Vec<LineageJobRecord>, String> {
+    state.store().list_lineage_jobs().map_err(store_error)
 }
 
 #[tauri::command]
-pub fn load_sandbox_job(
+pub fn load_lineage_job(
     state: State<'_, AppState>,
     payload: EntityIdPayload,
-) -> Result<Option<SandboxJobRecord>, String> {
+) -> Result<Option<LineageJobRecord>, String> {
     state
         .store()
-        .load_sandbox_job(&payload.id)
+        .load_lineage_job(&payload.id)
         .map_err(store_error)
 }
 
@@ -181,19 +181,19 @@ pub fn load_sandbox_job(
 /// - anything else → the normal state-machine transition, which will
 ///   surface an error if invalid.
 #[tauri::command]
-pub fn approve_sandbox_job(
+pub fn approve_lineage_job(
     state: State<'_, AppState>,
     payload: EntityIdPayload,
-) -> Result<SandboxJobRecord, String> {
+) -> Result<LineageJobRecord, String> {
     let store = state.store();
-    let engine = SandboxEngine::new(&store);
+    let engine = LineageEngine::new(&store);
 
     let job = store
-        .load_sandbox_job(&payload.id)
+        .load_lineage_job(&payload.id)
         .map_err(store_error)?
         .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
     match job.status {
-        SandboxJobStatus::Pending => start_implementation_run(&store, &engine, &job),
+        LineageJobStatus::Pending => start_implementation_run(&store, &engine, &job),
         _ => engine
             .transition(&payload.id, Transition::Approve)
             .map_err(store_error),
@@ -202,9 +202,9 @@ pub fn approve_sandbox_job(
 
 fn start_implementation_run(
     store: &crate::store::Store,
-    engine: &SandboxEngine<'_>,
-    job: &SandboxJobRecord,
-) -> Result<SandboxJobRecord, String> {
+    engine: &LineageEngine<'_>,
+    job: &LineageJobRecord,
+) -> Result<LineageJobRecord, String> {
     // Must have the linked feedback to build a useful prompt.
     let feedback = store
         .load_feedback(&job.feedback_id)
@@ -216,7 +216,7 @@ fn start_implementation_run(
         // happened, then surface the error to the frontend.
         let msg = store_error(e);
         let _ = engine.append_note(&job.id, &format!("failed to prepare run: {msg}"));
-        let _ = engine.force_status(&job.id, SandboxJobStatus::Failed);
+        let _ = engine.force_status(&job.id, LineageJobStatus::Failed);
         msg
     })?;
 
@@ -232,7 +232,7 @@ fn start_implementation_run(
         )
         .map_err(store_error)?;
     let updated = engine
-        .force_status(&job.id, SandboxJobStatus::Implementing)
+        .force_status(&job.id, LineageJobStatus::Implementing)
         .map_err(store_error)?;
 
     runner::launch_claude(store.clone(), job.id.clone(), prepared);
@@ -240,12 +240,12 @@ fn start_implementation_run(
 }
 
 #[tauri::command]
-pub fn reject_sandbox_job(
+pub fn reject_lineage_job(
     state: State<'_, AppState>,
     payload: EntityIdPayload,
-) -> Result<SandboxJobRecord, String> {
+) -> Result<LineageJobRecord, String> {
     let store = state.store();
-    let engine = SandboxEngine::new(&store);
+    let engine = LineageEngine::new(&store);
     engine
         .transition(&payload.id, Transition::Reject)
         .map_err(store_error)
@@ -255,17 +255,17 @@ pub fn reject_sandbox_job(
 /// Destroys the prior worktree + branch + job workspace so the fresh run
 /// starts from the current HEAD of the source repo, then dispatches through
 /// the same pipeline as the first Advance. Only valid when the job is in a
-/// state where a retry is meaningful (see `SandboxJobStatus::can_retry`).
+/// state where a retry is meaningful (see `LineageJobStatus::can_retry`).
 #[tauri::command]
-pub fn retry_sandbox_job(
+pub fn retry_lineage_job(
     state: State<'_, AppState>,
     payload: EntityIdPayload,
-) -> Result<SandboxJobRecord, String> {
+) -> Result<LineageJobRecord, String> {
     let store = state.store();
-    let engine = SandboxEngine::new(&store);
+    let engine = LineageEngine::new(&store);
 
     let job = store
-        .load_sandbox_job(&payload.id)
+        .load_lineage_job(&payload.id)
         .map_err(store_error)?
         .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
     if !job.status.can_retry() {
@@ -292,7 +292,7 @@ pub fn retry_sandbox_job(
     let _ = engine.append_note(&job.id, "retry requested — previous run torn down");
 
     let refreshed = store
-        .load_sandbox_job(&job.id)
+        .load_lineage_job(&job.id)
         .map_err(store_error)?
         .ok_or_else(|| format!("lineage job not found after cleanup: {}", job.id))?;
     start_implementation_run(&store, &engine, &refreshed)
@@ -300,19 +300,19 @@ pub fn retry_sandbox_job(
 
 /// Launch the app built in a lineage job's worktree. Only valid after the
 /// job has reached a state where a worktree exists and the agent has
-/// finished writing code (see `SandboxJobStatus::can_run`). The spawned
+/// finished writing code (see `LineageJobStatus::can_run`). The spawned
 /// process runs in the background with its own `NOIDE_WORKSPACE_ROOT` so it
 /// cannot see or mutate the host Evolvo's workspace.
 #[tauri::command]
-pub fn run_sandbox_job(
+pub fn run_lineage_job(
     state: State<'_, AppState>,
     payload: EntityIdPayload,
-) -> Result<SandboxJobRecord, String> {
+) -> Result<LineageJobRecord, String> {
     let store = state.store();
-    let engine = SandboxEngine::new(&store);
+    let engine = LineageEngine::new(&store);
 
     let job = store
-        .load_sandbox_job(&payload.id)
+        .load_lineage_job(&payload.id)
         .map_err(store_error)?
         .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
 
@@ -335,7 +335,7 @@ pub fn run_sandbox_job(
     // Return the current record (with the note appended) so the UI can
     // refresh without a second round-trip.
     store
-        .load_sandbox_job(&payload.id)
+        .load_lineage_job(&payload.id)
         .map_err(store_error)?
         .ok_or_else(|| format!("lineage job disappeared after run: {}", payload.id))
 }
@@ -348,12 +348,12 @@ pub struct NotePayload {
 }
 
 #[tauri::command]
-pub fn append_sandbox_note(
+pub fn append_lineage_note(
     state: State<'_, AppState>,
     payload: NotePayload,
-) -> Result<SandboxJobRecord, String> {
+) -> Result<LineageJobRecord, String> {
     let store = state.store();
-    let engine = SandboxEngine::new(&store);
+    let engine = LineageEngine::new(&store);
     engine
         .append_note(&payload.id, &payload.note)
         .map_err(store_error)
@@ -440,7 +440,11 @@ mod tests {
             feedback_text: text.into(),
             annotations: vec![],
             pasted_images_base64: (0..pasted).map(|_| tiny_png.clone()).collect(),
-            screenshot_base64: if with_screenshot { Some(tiny_png) } else { None },
+            screenshot_base64: if with_screenshot {
+                Some(tiny_png)
+            } else {
+                None
+            },
             voice_base64: None,
             voice_mime_type: None,
             voice_transcript: None,
@@ -482,17 +486,17 @@ mod tests {
                 window_height: payload.window_height,
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
-                sandbox_job_id: None,
+                lineage_job_id: None,
             };
             store.save_feedback(&rec).unwrap();
-            let engine = SandboxEngine::new(&store);
+            let engine = LineageEngine::new(&store);
             engine.enqueue_job_for_feedback(&mut rec).unwrap();
             rec
         };
 
-        assert!(record.sandbox_job_id.is_some());
+        assert!(record.lineage_job_id.is_some());
         assert_eq!(store.list_feedback().unwrap().len(), before_len + 1);
-        assert_eq!(store.list_sandbox_jobs().unwrap().len(), 1);
+        assert_eq!(store.list_lineage_jobs().unwrap().len(), 1);
     }
 
     #[test]

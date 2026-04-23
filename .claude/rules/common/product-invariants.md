@@ -37,7 +37,7 @@ Iterations must preserve this contract:
 
 A UI where a user sees two Feedback-related buttons and can't tell which one is live violates this invariant, regardless of how the code looks.
 
-## I-P4. Sandboxes are saveable and forkable into standalone apps
+## I-P4. Lineagees are saveable and forkable into standalone apps
 
 A user can **save a lineage** and **rename / fork it into another app**. This means:
 
@@ -45,11 +45,11 @@ A user can **save a lineage** and **rename / fork it into another app**. This me
 - That artifact is portable — the user can take it and turn it into a new Evolvo-shaped app, with its own identity (name, workspace root), independent of the original.
 - "Rename into another app" implies an export/clone operation that mints a new app identity, not an in-place mutation of the current one.
 
-Any storage, state-machine, or workspace-layout change must preserve the ability to implement this. If the proposed change makes sandboxes non-portable (embeds host-specific paths, bakes in the current app name, loses the feedback↔job↔attachment linkage), it's rejected.
+Any storage, state-machine, or workspace-layout change must preserve the ability to implement this. If the proposed change makes lineagees non-portable (embeds host-specific paths, bakes in the current app name, loses the feedback↔job↔attachment linkage), it's rejected.
 
 ## What this means operationally
 
 - **Every agent** treats Lineage + Feedback Overlay as non-negotiable surfaces. Fixes, refactors, and rewrites must preserve them.
 - **Every design proposal** that touches the lineage state machine or the overlay must explicitly state how it preserves I-P1 through I-P4.
 - **Canvas rewrites are allowed** — but the reviewer must verify the Canvas overlay is invokable on *every page/route* of the resulting app (not just one dedicated screen) before approving.
-- **Lineage portability** is a first-class requirement, not a future nice-to-have. New fields on `SandboxJobRecord` should be serializable and self-describing, not pointers into host state.
+- **Lineage portability** is a first-class requirement, not a future nice-to-have. New fields on `LineageJobRecord` should be serializable and self-describing, not pointers into host state.

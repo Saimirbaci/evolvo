@@ -18,7 +18,7 @@ Build changes must preserve these four invariants — authoritative text in `.cl
 - **I-P1. Lineage always stays.** No feature flag, no conditional compilation, no cargo feature that compiles out the lineage pipeline.
 - **I-P2. Feedback Overlay always stays.** Never tree-shaken away, never removed by a "minimal UI" build profile.
 - **I-P3. Drawing board is always reachable.** The canvas module may be swapped; the reachability must not regress through a build-time config.
-- **I-P4. Sandboxes are saveable and forkable into standalone apps.** The bundle / toolchain must keep lineage artifacts portable across machines (no embedded absolute paths, no host-specific binary formats in the artifact).
+- **I-P4. Lineagees are saveable and forkable into standalone apps.** The bundle / toolchain must keep lineage artifacts portable across machines (no embedded absolute paths, no host-specific binary formats in the artifact).
 
 If a build-side change (cargo feature, bundle config, capability trim, release profile) would violate any of these, refuse and route to `staff-architect-self-evolving-software`.
 

@@ -42,7 +42,7 @@ pub enum FeedbackStatus {
     #[default]
     New,
     Triaged,
-    InSandbox,
+    InLineage,
     Resolved,
     Rejected,
 }
@@ -52,7 +52,7 @@ impl FeedbackStatus {
         match self {
             Self::New => "new",
             Self::Triaged => "triaged",
-            Self::InSandbox => "in lineage",
+            Self::InLineage => "in lineage",
             Self::Resolved => "resolved",
             Self::Rejected => "rejected",
         }
@@ -61,7 +61,7 @@ impl FeedbackStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum SandboxJobStatus {
+pub enum LineageJobStatus {
     #[default]
     Pending,
     Triaging,
@@ -74,7 +74,7 @@ pub enum SandboxJobStatus {
     Failed,
 }
 
-impl SandboxJobStatus {
+impl LineageJobStatus {
     pub fn label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -123,18 +123,18 @@ pub struct FeedbackRecord {
     pub window_height: u32,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
-    pub sandbox_job_id: Option<String>,
+    pub lineage_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct SandboxJobRecord {
+pub struct LineageJobRecord {
     pub id: String,
     pub feedback_id: String,
     pub title: String,
     #[serde(default)]
     pub summary: String,
-    pub status: SandboxJobStatus,
+    pub status: LineageJobStatus,
     #[serde(default)]
     pub notes: Vec<String>,
     pub created_at_unix_ms: u64,

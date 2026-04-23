@@ -19,7 +19,7 @@
 //!   note explaining how to fix the environment.
 //!
 //! Source repo resolution order:
-//! 1. `NOIDE_SOURCE_REPO` env var.
+//! 1. `EVOLVO_SOURCE_REPO` env var.
 //! 2. Walk up from `CARGO_MANIFEST_DIR` (compile-time) for a directory that
 //!    has both `.git/` and `.claude/agents/`.
 //! 3. Walk up from the process CWD using the same check.
@@ -29,11 +29,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::lineage::SandboxEngine;
+use crate::lineage::LineageEngine;
 use crate::store::{Store, StoreError};
-use crate::types::{FeedbackRecord, SandboxJobRecord, SandboxJobStatus};
+use crate::types::{FeedbackRecord, LineageJobRecord, LineageJobStatus};
 
-const SANDBOX_WORKSPACES_DIR: &str = "sandbox_workspaces";
+const SANDBOX_WORKSPACES_DIR: &str = "lineage_workspaces";
 const WORKTREE_DIR: &str = "worktree";
 const INPUTS_DIR: &str = "inputs";
 const LOG_FILE: &str = "claude.log";
@@ -60,7 +60,7 @@ pub fn iteration_port(iteration: u32) -> u16 {
 
 /// Locate the Evolvo source repo that should be forked into the lineage.
 pub fn resolve_source_repo() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NOIDE_SOURCE_REPO") {
+    if let Ok(p) = std::env::var("EVOLVO_SOURCE_REPO") {
         let pb = PathBuf::from(p);
         if is_source_repo(&pb) {
             return Some(pb);
@@ -99,12 +99,12 @@ fn is_source_repo(p: &Path) -> bool {
     p.join(".git").exists() && p.join(".claude").join("agents").exists()
 }
 
-pub fn sandbox_workspaces_root(workspace_root: &Path) -> PathBuf {
+pub fn lineage_workspaces_root(workspace_root: &Path) -> PathBuf {
     workspace_root.join(SANDBOX_WORKSPACES_DIR)
 }
 
 pub fn job_workspace_dir(workspace_root: &Path, job_id: &str) -> PathBuf {
-    sandbox_workspaces_root(workspace_root).join(job_id)
+    lineage_workspaces_root(workspace_root).join(job_id)
 }
 
 pub fn worktree_path(workspace_root: &Path, job_id: &str) -> PathBuf {
@@ -230,7 +230,7 @@ pub fn create_worktree(source: &Path, dest: &Path, branch: &str) -> Result<(), S
 /// `BASE_DEV_PORT + N` instead of the base port. Best-effort: patches every
 /// file it recognises and ignores missing ones (the agent may have rewritten
 /// the stack, in which case they're responsible for handling the port via
-/// `scripts/run-iteration.sh` + the `NOIDE_ITERATION_PORT` env var).
+/// `scripts/run-iteration.sh` + the `EVOLVO_ITERATION_PORT` env var).
 ///
 /// Returns the list of files that were actually modified so callers can log
 /// a useful breadcrumb.
@@ -340,19 +340,19 @@ pub fn iteration_guidance(iteration: u32) -> String {
     let n = iteration.max(1);
     let port = iteration_port(n);
     let (phase, latitude) = match n {
-        1..=3 => (
+        1..=5 => (
             "Bootstrap phase",
             "You have wide latitude to make drastic architectural and source-code changes. \
              Treat the existing Evolvo shell as scaffolding: rip out, rename, restructure, and replace code \
              as needed to realise the app the user has described in the canvas, voice, and text. \
              Follow the user's described app (ERP, IDE, fitness tracker, whatever they drew) as faithfully as you can.",
         ),
-        4..=6 => (
+        6..=9 => (
             "Shaping phase",
             "Significant changes are still welcome when they move the app toward the user's described vision, \
              but prefer cohesive feature additions over wholesale rewrites. Refactor when it clearly serves the feedback.",
         ),
-        7..=9 => (
+        10..=12 => (
             "Consolidation phase",
             "Prefer targeted changes that extend or refine existing features. Only restructure code if the feedback \
              explicitly calls for it or the current shape blocks the change.",
@@ -409,9 +409,9 @@ The next iteration's agent will read these files first. Leaving them stale is th
 
 ## Per-iteration dev-server port
 
-This iteration's dev server MUST listen on **port {port}** (base `1530` + iteration `{n}`). The runner has already rewritten `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in this worktree to use port `{port}` so concurrent iteration runs don't collide. When the reviewer clicks **Run**, the runner also sets `NOIDE_ITERATION_PORT={port}` in the child environment.
+This iteration's dev server MUST listen on **port {port}** (base `1530` + iteration `{n}`). The runner has already rewritten `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in this worktree to use port `{port}` so concurrent iteration runs don't collide. When the reviewer clicks **Run**, the runner also sets `EVOLVO_ITERATION_PORT={port}` in the child environment.
 
-If you rewrote the stack so the default files no longer exist, you MUST honour `NOIDE_ITERATION_PORT` in `scripts/run-iteration.sh` (or whatever startup script you ship) and bind the dev/server on that port. Never hardcode `1530` — it belongs to the host Evolvo.
+If you rewrote the stack so the default files no longer exist, you MUST honour `EVOLVO_ITERATION_PORT` in `scripts/run-iteration.sh` (or whatever startup script you ship) and bind the dev/server on that port. Never hardcode `1530` — it belongs to the host Evolvo.
 
 ## Keep the iteration runnable — `scripts/run-iteration.sh`
 
@@ -420,8 +420,8 @@ The reviewer UI has a **Run** button that launches the app built in this iterati
 If you rewrite the stack (e.g. move off Tauri/Leptos) you MUST create or update `scripts/run-iteration.sh` so the Run button still works. The script should:
 
 - Start the current app in the foreground (the runner streams its stdout/stderr into a log file).
-- Bind the dev/server to `$NOIDE_ITERATION_PORT` (falling back to `{port}` for this iteration if the env var isn't set).
-- Respect `NOIDE_WORKSPACE_ROOT` if the app stores any state — the runner sets that env var to a per-iteration workspace directory so runs stay isolated from the host Evolvo.
+- Bind the dev/server to `$EVOLVO_ITERATION_PORT` (falling back to `{port}` for this iteration if the env var isn't set).
+- Respect `EVOLVO_WORKSPACE_ROOT` if the app stores any state — the runner sets that env var to a per-iteration workspace directory so runs stay isolated from the host Evolvo.
 - Exit non-zero on startup failure so the reviewer sees a useful error in the lineage notes.
 
 If you kept the default stack, you can skip the script and rely on the `cargo tauri dev` fallback.
@@ -432,9 +432,9 @@ Type-checking is not verification. Before you commit and return, you MUST actual
 
 Concrete steps for the default stack (adapt for whatever stack this iteration ships):
 
-1. Run `cargo check -p noide_desktop` and `cargo check -p noide_ui --target wasm32-unknown-unknown`. Both must pass.
-2. Run `cargo test -p noide_desktop` and fix any regression you introduced. Add tests for new host-side logic.
-3. Start the app in the background: `NOIDE_ITERATION_PORT={port} cargo tauri dev` (or `bash scripts/run-iteration.sh`). Wait for the dev server to print its ready line (Trunk prints `server listening at http://127.0.0.1:{port}`). If the build fails or the server doesn't come up, fix the cause — do NOT claim success.
+1. Run `cargo check -p evolvo_desktop` and `cargo check -p evolvo_ui --target wasm32-unknown-unknown`. Both must pass.
+2. Run `cargo test -p evolvo_desktop` and fix any regression you introduced. Add tests for new host-side logic.
+3. Start the app in the background: `EVOLVO_ITERATION_PORT={port} cargo tauri dev` (or `bash scripts/run-iteration.sh`). Wait for the dev server to print its ready line (Trunk prints `server listening at http://127.0.0.1:{port}`). If the build fails or the server doesn't come up, fix the cause — do NOT claim success.
 4. Exercise the change: navigate to the affected route, trigger the feedback / canvas / lineage path that the feedback is about, and confirm the user-visible behaviour matches what was asked for. Try to break it — empty inputs, fast clicks, edge cases adjacent to what the feedback described. If any of the four invariants (Feedback Overlay, per-page Canvas overlay, Inbox, Lineage pipeline) regressed, that's a blocker: fix it before finishing.
 5. Only after the app actually ran and the change actually worked, commit and return.
 
@@ -445,7 +445,7 @@ If you genuinely cannot run the app in this environment (no display, missing sys
 When the change is verified:
 
 1. Stage and commit every file you touched (including updated `CLAUDE.md` / rules / agents). Use a conventional-commit subject like `feat(ui): <short>` or `fix(lineage): <short>`. One focused commit is fine; multiple small commits are better when the work naturally splits.
-2. Leave the iteration's app running so the reviewer lands on a live build. If you shut it down earlier to rebuild, start it again before returning: `NOIDE_ITERATION_PORT={port} cargo tauri dev` (or the equivalent for your stack). The reviewer's Run button will also launch it, but starting it here saves them a click and confirms startup worked.
+2. Leave the iteration's app running so the reviewer lands on a live build. If you shut it down earlier to rebuild, start it again before returning: `EVOLVO_ITERATION_PORT={port} cargo tauri dev` (or the equivalent for your stack). The reviewer's Run button will also launch it, but starting it here saves them a click and confirms startup worked.
 3. In your final summary mention the port this iteration is serving on ({port}) and how you verified the change.
 "#,
     )
@@ -453,7 +453,7 @@ When the change is verified:
 
 pub fn build_implementation_prompt(
     feedback: &FeedbackRecord,
-    job: &SandboxJobRecord,
+    job: &LineageJobRecord,
     attachments: &[StagedAttachment],
     log_file: &Path,
 ) -> String {
@@ -493,7 +493,8 @@ pub fn build_implementation_prompt(
     let attachments_section = if attachments.is_empty() {
         String::new()
     } else {
-        let mut s = String::from("\n\n## Attachments (read these with the Read tool before planning)\n");
+        let mut s =
+            String::from("\n\n## Attachments (read these with the Read tool before planning)\n");
         for a in attachments {
             s.push_str(&format!("- **{}** — `{}`\n", a.role, a.path.display()));
         }
@@ -501,7 +502,7 @@ pub fn build_implementation_prompt(
     };
 
     format!(
-        r#"You are running inside a sandboxed git worktree of the Evolvo project. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Advance" on the resulting lineage job. Your job: implement the change.
+        r#"You are running inside a lineageed git worktree of the Evolvo project. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Advance" on the resulting lineage job. Your job: implement the change.
 
 {guidance}{new_app_banner}
 
@@ -526,9 +527,9 @@ pub fn build_implementation_prompt(
 {work_step_4}
 5. If the app's architecture, stack, domain model, or command surface changed materially: update `CLAUDE.md`, the relevant files under `.claude/rules/`, and the affected `.claude/agents/*.md` (and `.claude/skills/*` if present) so the next iteration's agent starts with accurate context. Stale docs are treated as a bug.
 6. Run the appropriate checks before finishing. The exact commands depend on the current stack — read `CLAUDE.md` for the build contract. For today's Rust + Leptos + Tauri shell the defaults are:
-   - Backend: `cargo check -p noide_desktop`
-   - UI: `cargo check -p noide_ui --target wasm32-unknown-unknown`
-   - Tests: `cargo test -p noide_desktop`
+   - Backend: `cargo check -p evolvo_desktop`
+   - UI: `cargo check -p evolvo_ui --target wasm32-unknown-unknown`
+   - Tests: `cargo test -p evolvo_desktop`
    If you rewrote the stack, run the equivalent checks for the new stack and update `CLAUDE.md` to document them.
 7. **Actually run the app** (see "Verify-before-done" above). Start it on the iteration's port, confirm the dev server comes up, and exercise the change in the running app. A green `cargo check` is not sufficient — the reviewer expects a binary that boots and does what the feedback asked.
 8. Commit your work with `git add -A && git commit` so the reviewer can diff the branch. Use a conventional-commit subject line like `feat(ui): …` or `fix(lineage): …`.
@@ -573,23 +574,23 @@ pub struct PreparedRun {
 /// first.
 pub fn prepare_run(
     store: &Store,
-    job: &SandboxJobRecord,
+    job: &LineageJobRecord,
     feedback: &FeedbackRecord,
 ) -> Result<PreparedRun, StoreError> {
     // Lazily allocate an iteration number for this job. We work on a local
-    // copy so the caller's `&SandboxJobRecord` signature stays intact; the
+    // copy so the caller's `&LineageJobRecord` signature stays intact; the
     // allocated iteration is persisted back onto the stored record so the
     // UI (and any retry) sees a stable value.
     let mut job = job.clone();
     if job.iteration == 0 {
         let n = store.allocate_iteration()?;
         job.iteration = n;
-        store.save_sandbox_job(&job)?;
+        store.save_lineage_job(&job)?;
     }
     let job = &job;
     let source = resolve_source_repo().ok_or_else(|| {
         StoreError::Other(
-            "could not locate Evolvo source repo — set NOIDE_SOURCE_REPO or run from within the repo"
+            "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
                 .to_string(),
         )
     })?;
@@ -653,7 +654,7 @@ pub fn prepare_run(
 /// happens on a dedicated OS thread.
 pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
     std::thread::spawn(move || {
-        let engine = SandboxEngine::new(&store);
+        let engine = LineageEngine::new(&store);
 
         let log_handle = match fs::File::create(&prepared.log_file) {
             Ok(f) => f,
@@ -662,16 +663,15 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
                     &job_id,
                     &format!("failed to open log {}: {e}", prepared.log_file.display()),
                 );
-                let _ = engine.force_status(&job_id, SandboxJobStatus::Failed);
+                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
                 return;
             }
         };
         let log_for_err = match log_handle.try_clone() {
             Ok(f) => f,
             Err(e) => {
-                let _ = engine
-                    .append_note(&job_id, &format!("failed to clone log handle: {e}"));
-                let _ = engine.force_status(&job_id, SandboxJobStatus::Failed);
+                let _ = engine.append_note(&job_id, &format!("failed to clone log handle: {e}"));
+                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
                 return;
             }
         };
@@ -706,7 +706,7 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
         match status {
             Ok(s) if s.success() => {
                 let _ = engine.append_note(&job_id, "claude code completed successfully");
-                let _ = engine.force_status(&job_id, SandboxJobStatus::BuildReady);
+                let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
             }
             Ok(s) => {
                 let _ = engine.append_note(
@@ -716,7 +716,7 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
                         prepared.log_file.display()
                     ),
                 );
-                let _ = engine.force_status(&job_id, SandboxJobStatus::Failed);
+                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
             }
             Err(e) => {
                 let _ = engine.append_note(
@@ -725,7 +725,7 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
                         "failed to launch claude ({e}) — ensure the `claude` CLI is installed and in PATH"
                     ),
                 );
-                let _ = engine.force_status(&job_id, SandboxJobStatus::Failed);
+                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
             }
         }
     });
@@ -801,14 +801,14 @@ pub fn resolve_run_command(worktree: &Path) -> ResolvedRunCommand {
 /// `iteration-run.log` under the job workspace. Fire-and-forget: the call
 /// returns as soon as the child is handed off to a dedicated thread; the
 /// status the user sees in the UI reflects the lineage state machine, not
-/// the run process itself. The child gets its own `NOIDE_WORKSPACE_ROOT`
+/// the run process itself. The child gets its own `EVOLVO_WORKSPACE_ROOT`
 /// pointed at the per-job `run_workspace/` dir so it can't clobber the host
 /// Evolvo's feedback / lineage data.
 pub fn launch_iteration_run(store: Store, job_id: String) {
     std::thread::spawn(move || {
-        let engine = SandboxEngine::new(&store);
+        let engine = LineageEngine::new(&store);
 
-        let Some(job) = store.load_sandbox_job(&job_id).ok().flatten() else {
+        let Some(job) = store.load_lineage_job(&job_id).ok().flatten() else {
             let _ = engine.append_note(&job_id, "run requested but lineage job record is missing");
             return;
         };
@@ -846,10 +846,8 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
         let log_for_err = match log_handle.try_clone() {
             Ok(f) => f,
             Err(e) => {
-                let _ = engine.append_note(
-                    &job_id,
-                    &format!("failed to clone run log handle: {e}"),
-                );
+                let _ =
+                    engine.append_note(&job_id, &format!("failed to clone run log handle: {e}"));
                 return;
             }
         };
@@ -913,8 +911,8 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
             .args(&cmd.args)
             .current_dir(&cmd.cwd)
             .env("PATH", &path_env)
-            .env("NOIDE_WORKSPACE_ROOT", &run_workspace)
-            .env("NOIDE_ITERATION_PORT", port.to_string())
+            .env("EVOLVO_WORKSPACE_ROOT", &run_workspace)
+            .env("EVOLVO_ITERATION_PORT", port.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_handle))
             .stderr(Stdio::from(log_for_err))
@@ -945,10 +943,8 @@ pub fn launch_iteration_run(store: Store, job_id: String) {
                 } else {
                     format!("spawn error: {e}")
                 };
-                let _ = engine.append_note(
-                    &job_id,
-                    &format!("failed to launch iteration run — {hint}"),
-                );
+                let _ = engine
+                    .append_note(&job_id, &format!("failed to launch iteration run — {hint}"));
             }
         }
     });
@@ -963,7 +959,7 @@ mod tests {
         FeedbackRecord {
             id: "fb-42".into(),
             feedback_type: FeedbackType::Bug,
-            status: FeedbackStatus::InSandbox,
+            status: FeedbackStatus::InLineage,
             page_route: "/".into(),
             feedback_text: "The save button sometimes doesn't respond".into(),
             annotations: vec![serde_json::json!({"type": "rect"})],
@@ -975,17 +971,17 @@ mod tests {
             window_height: 900,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
-            sandbox_job_id: Some("job-42".into()),
+            lineage_job_id: Some("job-42".into()),
         }
     }
 
-    fn mk_job() -> SandboxJobRecord {
-        SandboxJobRecord {
+    fn mk_job() -> LineageJobRecord {
+        LineageJobRecord {
             id: "job-42".into(),
             feedback_id: "fb-42".into(),
             title: "Save button is laggy".into(),
             summary: "…".into(),
-            status: SandboxJobStatus::Pending,
+            status: LineageJobStatus::Pending,
             notes: vec![],
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
@@ -1086,12 +1082,7 @@ mod tests {
         let mut job = mk_job();
         job.iteration = 15; // Would normally be "minor, surgical" phase.
 
-        let prompt = build_implementation_prompt(
-            &fb,
-            &job,
-            &[],
-            Path::new("/tmp/claude.log"),
-        );
+        let prompt = build_implementation_prompt(&fb, &job, &[], Path::new("/tmp/claude.log"));
         assert!(prompt.contains("NewApp"));
         assert!(prompt.contains("new app from scratch") || prompt.contains("NEW APP from scratch"));
         assert!(prompt.contains("overrides the iteration-phase latitude"));
@@ -1103,12 +1094,8 @@ mod tests {
     fn prompt_uses_job_iteration_when_set() {
         let mut job = mk_job();
         job.iteration = 10;
-        let prompt = build_implementation_prompt(
-            &mk_feedback(),
-            &job,
-            &[],
-            Path::new("/tmp/claude.log"),
-        );
+        let prompt =
+            build_implementation_prompt(&mk_feedback(), &job, &[], Path::new("/tmp/claude.log"));
         assert!(prompt.contains("Iteration: `10`"));
         assert!(prompt.contains("Maturation phase"));
         assert!(prompt.contains("minimal, focused change"));
@@ -1127,7 +1114,11 @@ mod tests {
         assert!(fallback.cwd.ends_with("app/src-tauri"));
 
         // With the script present, we prefer it.
-        fs::write(worktree.join("scripts").join("run-iteration.sh"), b"#!/bin/sh\n").unwrap();
+        fs::write(
+            worktree.join("scripts").join("run-iteration.sh"),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
         let chosen = resolve_run_command(&worktree);
         assert_eq!(chosen.program, "bash");
         assert!(chosen.args[0].ends_with("scripts/run-iteration.sh"));
@@ -1155,11 +1146,7 @@ mod tests {
             r#"{"build":{"devUrl":"http://localhost:1530"}}"#,
         )
         .unwrap();
-        fs::write(
-            worktree.join("app/ui/Trunk.toml"),
-            "[serve]\nport = 1530\n",
-        )
-        .unwrap();
+        fs::write(worktree.join("app/ui/Trunk.toml"), "[serve]\nport = 1530\n").unwrap();
         // trunk-dev.sh intentionally omitted — rewrite should skip it cleanly.
 
         let port = iteration_port(3);
@@ -1202,7 +1189,7 @@ mod tests {
     fn iteration_guidance_mentions_port_and_verification() {
         let g = iteration_guidance(2);
         assert!(g.contains(&iteration_port(2).to_string()));
-        assert!(g.contains("NOIDE_ITERATION_PORT"));
+        assert!(g.contains("EVOLVO_ITERATION_PORT"));
         assert!(g.contains("Verify-before-done"));
         assert!(g.contains("commit"));
     }
@@ -1211,11 +1198,11 @@ mod tests {
     fn iteration_run_log_path_nests_under_job_workspace() {
         let root = PathBuf::from("/tmp/ws");
         let p = iteration_run_log_path(&root, "job-7");
-        assert!(p.ends_with("sandbox_workspaces/job-7/iteration-run.log"));
+        assert!(p.ends_with("lineage_workspaces/job-7/iteration-run.log"));
     }
 
     #[test]
-    fn branch_name_uses_sandbox_prefix() {
+    fn branch_name_uses_lineage_prefix() {
         assert_eq!(branch_name("job-123"), "lineage/job-123");
     }
 
@@ -1224,19 +1211,22 @@ mod tests {
         let root = PathBuf::from("/tmp/ws");
         let worktree = worktree_path(&root, "job-9");
         assert!(worktree.starts_with(&root));
-        assert!(worktree.ends_with("sandbox_workspaces/job-9/worktree"));
+        assert!(worktree.ends_with("lineage_workspaces/job-9/worktree"));
 
         let log = log_path(&root, "job-9");
-        assert!(log.ends_with("sandbox_workspaces/job-9/claude.log"));
+        assert!(log.ends_with("lineage_workspaces/job-9/claude.log"));
 
         let inputs = inputs_path(&root, "job-9");
-        assert!(inputs.ends_with("sandbox_workspaces/job-9/inputs"));
+        assert!(inputs.ends_with("lineage_workspaces/job-9/inputs"));
     }
 
     #[test]
-    fn resolve_source_repo_finds_noide_checkout() {
+    fn resolve_source_repo_finds_evolvo_checkout() {
         let resolved = resolve_source_repo();
-        assert!(resolved.is_some(), "should find the Evolvo source repo under the test harness");
+        assert!(
+            resolved.is_some(),
+            "should find the Evolvo source repo under the test harness"
+        );
         let p = resolved.unwrap();
         assert!(p.join(".claude").join("agents").exists());
         assert!(p.join(".git").exists());
@@ -1249,8 +1239,12 @@ mod tests {
         store.init_workspace().unwrap();
         let fb = mk_feedback();
         // Put the referenced attachments into the store.
-        store.save_attachment(&fb.id, "canvas.png", b"png-bytes").unwrap();
-        store.save_attachment(&fb.id, "paste-0.png", b"paste-bytes").unwrap();
+        store
+            .save_attachment(&fb.id, "canvas.png", b"png-bytes")
+            .unwrap();
+        store
+            .save_attachment(&fb.id, "paste-0.png", b"paste-bytes")
+            .unwrap();
 
         let inputs = temp.path().join("job-42").join("inputs");
         let staged = stage_attachments(&store, &fb, &inputs).unwrap();

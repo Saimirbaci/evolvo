@@ -5,9 +5,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
-use crate::types::{
-    AppHealth, FeedbackRecord, SandboxJobRecord, SubmitFeedbackPayload,
-};
+use crate::types::{AppHealth, FeedbackRecord, LineageJobRecord, SubmitFeedbackPayload};
 
 fn js_error(v: JsValue) -> String {
     v.as_string()
@@ -80,24 +78,24 @@ pub async fn list_feedback() -> Result<Vec<FeedbackRecord>, String> {
     invoke_command("list_feedback").await
 }
 
-pub async fn list_sandbox_jobs() -> Result<Vec<SandboxJobRecord>, String> {
-    invoke_command("list_sandbox_jobs").await
+pub async fn list_lineage_jobs() -> Result<Vec<LineageJobRecord>, String> {
+    invoke_command("list_lineage_jobs").await
 }
 
-pub async fn approve_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
-    invoke_command_with_args("approve_sandbox_job", &IdArg { id }).await
+pub async fn approve_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
+    invoke_command_with_args("approve_lineage_job", &IdArg { id }).await
 }
 
-pub async fn reject_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
-    invoke_command_with_args("reject_sandbox_job", &IdArg { id }).await
+pub async fn reject_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
+    invoke_command_with_args("reject_lineage_job", &IdArg { id }).await
 }
 
-pub async fn retry_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
-    invoke_command_with_args("retry_sandbox_job", &IdArg { id }).await
+pub async fn retry_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
+    invoke_command_with_args("retry_lineage_job", &IdArg { id }).await
 }
 
-pub async fn run_sandbox_job(id: &str) -> Result<SandboxJobRecord, String> {
-    invoke_command_with_args("run_sandbox_job", &IdArg { id }).await
+pub async fn run_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
+    invoke_command_with_args("run_lineage_job", &IdArg { id }).await
 }
 
 #[derive(Serialize)]
@@ -106,8 +104,8 @@ struct NoteArgs<'a> {
     note: &'a str,
 }
 
-pub async fn append_sandbox_note(id: &str, note: &str) -> Result<SandboxJobRecord, String> {
-    invoke_command_with_args("append_sandbox_note", &NoteArgs { id, note }).await
+pub async fn append_lineage_note(id: &str, note: &str) -> Result<LineageJobRecord, String> {
+    invoke_command_with_args("append_lineage_note", &NoteArgs { id, note }).await
 }
 
 #[derive(Serialize)]

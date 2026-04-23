@@ -2,11 +2,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::types::{FeedbackRecord, SandboxJobRecord};
+use crate::types::{FeedbackRecord, LineageJobRecord};
 
 const WORKSPACE_DIR_NAME: &str = "evolvo_workspace";
 const FEEDBACK_DIR: &str = "feedback";
-const SANDBOX_JOBS_DIR: &str = "sandbox_jobs";
+const SANDBOX_JOBS_DIR: &str = "lineage_jobs";
 const ATTACHMENTS_DIR: &str = "attachments";
 const ITERATION_FILE: &str = "iteration.json";
 
@@ -71,7 +71,7 @@ impl WorkspaceLayout {
         self.root.join(FEEDBACK_DIR)
     }
 
-    pub fn sandbox_jobs_dir(&self) -> PathBuf {
+    pub fn lineage_jobs_dir(&self) -> PathBuf {
         self.root.join(SANDBOX_JOBS_DIR)
     }
 
@@ -83,7 +83,7 @@ impl WorkspaceLayout {
         vec![
             self.root.clone(),
             self.feedback_dir(),
-            self.sandbox_jobs_dir(),
+            self.lineage_jobs_dir(),
             self.root.join(ATTACHMENTS_DIR),
         ]
     }
@@ -116,8 +116,8 @@ impl Store {
         self.layout.feedback_dir().join(format!("{id}.json"))
     }
 
-    fn sandbox_job_path(&self, id: &str) -> PathBuf {
-        self.layout.sandbox_jobs_dir().join(format!("{id}.json"))
+    fn lineage_job_path(&self, id: &str) -> PathBuf {
+        self.layout.lineage_jobs_dir().join(format!("{id}.json"))
     }
 
     pub fn save_feedback(&self, rec: &FeedbackRecord) -> Result<(), StoreError> {
@@ -151,25 +151,25 @@ impl Store {
         Ok(true)
     }
 
-    pub fn save_sandbox_job(&self, rec: &SandboxJobRecord) -> Result<(), StoreError> {
+    pub fn save_lineage_job(&self, rec: &LineageJobRecord) -> Result<(), StoreError> {
         self.init_workspace()?;
         let json = serde_json::to_string_pretty(rec)?;
-        fs::write(self.sandbox_job_path(&rec.id), json)?;
+        fs::write(self.lineage_job_path(&rec.id), json)?;
         Ok(())
     }
 
-    pub fn load_sandbox_job(&self, id: &str) -> Result<Option<SandboxJobRecord>, StoreError> {
-        let path = self.sandbox_job_path(id);
+    pub fn load_lineage_job(&self, id: &str) -> Result<Option<LineageJobRecord>, StoreError> {
+        let path = self.lineage_job_path(id);
         if !path.exists() {
             return Ok(None);
         }
         let bytes = fs::read(&path)?;
-        let rec: SandboxJobRecord = serde_json::from_slice(&bytes)?;
+        let rec: LineageJobRecord = serde_json::from_slice(&bytes)?;
         Ok(Some(rec))
     }
 
-    pub fn list_sandbox_jobs(&self) -> Result<Vec<SandboxJobRecord>, StoreError> {
-        list_json_entities::<SandboxJobRecord>(&self.layout.sandbox_jobs_dir())
+    pub fn list_lineage_jobs(&self) -> Result<Vec<LineageJobRecord>, StoreError> {
+        list_json_entities::<LineageJobRecord>(&self.layout.lineage_jobs_dir())
     }
 
     /// Allocate the next iteration number for this workspace. The counter is
@@ -244,7 +244,8 @@ fn list_json_entities<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<
             continue;
         }
         match fs::read(&path).and_then(|bytes| {
-            serde_json::from_slice::<T>(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            serde_json::from_slice::<T>(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }) {
             Ok(rec) => items.push(rec),
             Err(err) => {
@@ -273,9 +274,7 @@ pub fn default_workspace_root() -> PathBuf {
         return PathBuf::from(explicit);
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".evolvo")
-            .join(WORKSPACE_DIR_NAME);
+        return PathBuf::from(home).join(".evolvo").join(WORKSPACE_DIR_NAME);
     }
     PathBuf::from(WORKSPACE_DIR_NAME)
 }
@@ -283,7 +282,7 @@ pub fn default_workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FeedbackStatus, FeedbackType, SandboxJobStatus};
+    use crate::types::{FeedbackStatus, FeedbackType, LineageJobStatus};
     use tempfile::tempdir;
 
     fn sample(id: &str) -> FeedbackRecord {
@@ -302,7 +301,7 @@ mod tests {
             window_height: 100,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10,
-            sandbox_job_id: None,
+            lineage_job_id: None,
         }
     }
 
@@ -326,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn attachments_are_sandboxed_by_feedback_id() {
+    fn attachments_are_lineageed_by_feedback_id() {
         let temp = tempdir().unwrap();
         let store = Store::new(temp.path().to_path_buf());
         store.init_workspace().unwrap();
@@ -339,21 +338,24 @@ mod tests {
             store.read_attachment("fb-1", "screenshot.png").unwrap(),
             Some(vec![1, 2, 3])
         );
-        assert!(store.read_attachment("fb-2", "screenshot.png").unwrap().is_none());
+        assert!(store
+            .read_attachment("fb-2", "screenshot.png")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
-    fn sandbox_job_crud() {
+    fn lineage_job_crud() {
         let temp = tempdir().unwrap();
         let store = Store::new(temp.path().to_path_buf());
         store.init_workspace().unwrap();
 
-        let job = SandboxJobRecord {
+        let job = LineageJobRecord {
             id: "job-1".into(),
             feedback_id: "fb-1".into(),
             title: "Fix".into(),
             summary: "Summary".into(),
-            status: SandboxJobStatus::Pending,
+            status: LineageJobStatus::Pending,
             notes: vec![],
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
@@ -363,10 +365,10 @@ mod tests {
             source_repo: None,
             iteration: 0,
         };
-        store.save_sandbox_job(&job).unwrap();
-        assert_eq!(store.list_sandbox_jobs().unwrap().len(), 1);
-        let back = store.load_sandbox_job("job-1").unwrap().unwrap();
-        assert_eq!(back.status, SandboxJobStatus::Pending);
+        store.save_lineage_job(&job).unwrap();
+        assert_eq!(store.list_lineage_jobs().unwrap().len(), 1);
+        let back = store.load_lineage_job("job-1").unwrap().unwrap();
+        assert_eq!(back.status, LineageJobStatus::Pending);
     }
 
     #[test]

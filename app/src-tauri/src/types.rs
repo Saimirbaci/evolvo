@@ -34,7 +34,7 @@ pub enum FeedbackStatus {
     #[default]
     New,
     Triaged,
-    InSandbox,
+    InLineage,
     Resolved,
     Rejected,
 }
@@ -58,12 +58,12 @@ pub struct FeedbackRecord {
     pub window_height: u32,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
-    pub sandbox_job_id: Option<String>,
+    pub lineage_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum SandboxJobStatus {
+pub enum LineageJobStatus {
     #[default]
     Pending,
     Triaging,
@@ -76,7 +76,7 @@ pub enum SandboxJobStatus {
     Failed,
 }
 
-impl SandboxJobStatus {
+impl LineageJobStatus {
     pub fn can_approve(self) -> bool {
         matches!(self, Self::Pending | Self::Planned | Self::BuildReady)
     }
@@ -99,12 +99,12 @@ impl SandboxJobStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct SandboxJobRecord {
+pub struct LineageJobRecord {
     pub id: String,
     pub feedback_id: String,
     pub title: String,
     pub summary: String,
-    pub status: SandboxJobStatus,
+    pub status: LineageJobStatus,
     #[serde(default)]
     pub notes: Vec<String>,
     pub created_at_unix_ms: u64,
@@ -182,12 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_can_approve() {
-        assert!(SandboxJobStatus::Pending.can_approve());
-        assert!(SandboxJobStatus::Planned.can_approve());
-        assert!(SandboxJobStatus::BuildReady.can_approve());
-        assert!(!SandboxJobStatus::Rejected.can_approve());
-        assert!(!SandboxJobStatus::Promoted.can_approve());
+    fn lineage_can_approve() {
+        assert!(LineageJobStatus::Pending.can_approve());
+        assert!(LineageJobStatus::Planned.can_approve());
+        assert!(LineageJobStatus::BuildReady.can_approve());
+        assert!(!LineageJobStatus::Rejected.can_approve());
+        assert!(!LineageJobStatus::Promoted.can_approve());
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
             window_height: 600,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
-            sandbox_job_id: None,
+            lineage_job_id: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"feedbackType\":\"bug\""));

@@ -67,11 +67,9 @@ pub fn FeedbackPanel(
 
                 // Composite: page as backdrop, annotation PNG stretched on top.
                 let screenshot = match (page_b64.as_deref(), anno_url.as_deref()) {
-                    (Some(page), Some(anno)) => {
-                        composite_page_and_annotations(page, anno)
-                            .await
-                            .or_else(|| Some(page.to_string()))
-                    }
+                    (Some(page), Some(anno)) => composite_page_and_annotations(page, anno)
+                        .await
+                        .or_else(|| Some(page.to_string())),
                     (Some(page), None) => Some(page.to_string()),
                     (None, Some(anno)) => Some(
                         anno.split(',')
@@ -129,7 +127,10 @@ pub fn FeedbackPanel(
     let on_resize_down = move |ev: PointerEvent| {
         ev.prevent_default();
         ev.stop_propagation();
-        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<Element>().ok()) {
+        if let Some(target) = ev
+            .current_target()
+            .and_then(|t| t.dyn_into::<Element>().ok())
+        {
             let _ = target.set_pointer_capture(ev.pointer_id());
         }
         let (w, h) = size.get_untracked().unwrap_or_else(current_panel_size);
@@ -148,7 +149,10 @@ pub fn FeedbackPanel(
     };
     let on_resize_up = move |ev: PointerEvent| {
         resize_origin.set(None);
-        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<Element>().ok()) {
+        if let Some(target) = ev
+            .current_target()
+            .and_then(|t| t.dyn_into::<Element>().ok())
+        {
             let _ = target.release_pointer_capture(ev.pointer_id());
         }
     };
@@ -164,7 +168,10 @@ pub fn FeedbackPanel(
             }
         }
         ev.prevent_default();
-        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<Element>().ok()) {
+        if let Some(target) = ev
+            .current_target()
+            .and_then(|t| t.dyn_into::<Element>().ok())
+        {
             let _ = target.set_pointer_capture(ev.pointer_id());
         }
         let (ox, oy) = offset.get_untracked();
@@ -180,7 +187,10 @@ pub fn FeedbackPanel(
     };
     let on_handle_up = move |ev: PointerEvent| {
         drag_origin.set(None);
-        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<Element>().ok()) {
+        if let Some(target) = ev
+            .current_target()
+            .and_then(|t| t.dyn_into::<Element>().ok())
+        {
             let _ = target.release_pointer_capture(ev.pointer_id());
         }
     };
@@ -284,7 +294,7 @@ pub fn FeedbackPanel(
                     }
                     on:click=submit
                 >
-                    {move || if submitting.get() { "Sending…" } else { "Submit to sandbox" }}
+                    {move || if submitting.get() { "Sending…" } else { "Submit to lineage" }}
                 </button>
             </div>
             <div
@@ -305,7 +315,9 @@ pub fn FeedbackPanel(
 /// the starting point the first time the user grabs the resize handle so the
 /// panel doesn't jump from its CSS-driven stretched height to a fixed value.
 fn current_panel_size() -> (f64, f64) {
-    let Some(doc) = window().and_then(|w| w.document()) else { return (320.0, 480.0) };
+    let Some(doc) = window().and_then(|w| w.document()) else {
+        return (320.0, 480.0);
+    };
     let Some(el) = doc.query_selector(".panel").ok().flatten() else {
         return (320.0, 480.0);
     };
@@ -331,9 +343,7 @@ fn hide_overlays_for_capture() -> HiddenHandles {
         if let Ok(Some(node)) = doc.query_selector(sel) {
             if let Ok(el) = node.dyn_into::<HtmlElement>() {
                 let style = el.style();
-                let prior = style
-                    .get_property_value("visibility")
-                    .unwrap_or_default();
+                let prior = style.get_property_value("visibility").unwrap_or_default();
                 let _ = style.set_property("visibility", "hidden");
                 nodes.push((el, prior));
             }
@@ -389,14 +399,10 @@ async fn composite_page_and_annotations(page_b64: &str, anno_data_url: &str) -> 
         .ok()?;
     canvas.set_width(pw);
     canvas.set_height(ph);
-    let ctx: CanvasRenderingContext2d = canvas
-        .get_context("2d")
-        .ok()
-        .flatten()?
-        .dyn_into()
-        .ok()?;
+    let ctx: CanvasRenderingContext2d = canvas.get_context("2d").ok().flatten()?.dyn_into().ok()?;
 
-    ctx.draw_image_with_html_image_element(&page_img, 0.0, 0.0).ok()?;
+    ctx.draw_image_with_html_image_element(&page_img, 0.0, 0.0)
+        .ok()?;
 
     // Map the canvas-surface's CSS-pixel rect onto the captured image.
     // The capture may include native window chrome (title bar on macOS) so
@@ -404,8 +410,18 @@ async fn composite_page_and_annotations(page_b64: &str, anno_data_url: &str) -> 
     // chrome height. We scale by width ratio and offset vertically by that
     // chrome band.
     let win = window()?;
-    let inner_w = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0);
-    let inner_h = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0);
+    let inner_w = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+        .max(1.0);
+    let inner_h = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+        .max(1.0);
     let (dx, dy, dw, dh) = {
         let surface = doc
             .query_selector(".canvas-surface")
@@ -427,14 +443,8 @@ async fn composite_page_and_annotations(page_b64: &str, anno_data_url: &str) -> 
         }
     };
 
-    ctx.draw_image_with_html_image_element_and_dw_and_dh(
-        &anno_img,
-        dx,
-        dy,
-        dw,
-        dh,
-    )
-    .ok()?;
+    ctx.draw_image_with_html_image_element_and_dw_and_dh(&anno_img, dx, dy, dw, dh)
+        .ok()?;
 
     let url = canvas.to_data_url_with_type("image/png").ok()?;
     url.split(',').nth(1).map(str::to_string)

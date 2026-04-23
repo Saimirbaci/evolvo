@@ -19,7 +19,7 @@ Evolvo is a **Tauri 2** desktop app with a **Leptos 0.8 (CSR / WASM)** frontend.
 ```
 ~/.evolvo/noide_workspace/
 ├── feedback/           # {id}.json — FeedbackRecord
-├── sandbox_jobs/       # {id}.json — SandboxJobRecord
+├── lineage_jobs/       # {id}.json — LineageJobRecord
 └── attachments/{feedback_id}/
     ├── canvas.png      # optional canvas screenshot
     ├── paste-N.png     # pasted images
@@ -57,9 +57,9 @@ The Tauri config wires the UI build/serve at `app/ui/scripts/trunk-{dev,build}.s
 Defined in `app/src-tauri/src/types.rs`. All wire types are `serde(rename_all = "camelCase")` — the Leptos side sees camelCase JSON, the Rust side owns snake_case.
 
 - `FeedbackRecord` — one user submission. Holds canvas screenshot ref, pasted images, voice file, annotations (arbitrary JSON), window size, status.
-- `FeedbackStatus` — `new → triaged → in_sandbox → resolved | rejected`.
-- `SandboxJobRecord` — created automatically when feedback is submitted. Status machine in `lineage.rs`.
-- `SandboxJobStatus` — `pending → triaging → planned → implementing → build_ready → merging → promoted | rejected | failed`. `can_approve()` gates UI action.
+- `FeedbackStatus` — `new → triaged → in_lineage → resolved | rejected`.
+- `LineageJobRecord` — created automatically when feedback is submitted. Status machine in `lineage.rs`.
+- `LineageJobStatus` — `pending → triaging → planned → implementing → build_ready → merging → promoted | rejected | failed`. `can_approve()` gates UI action.
 - `SubmitFeedbackPayload` — the Tauri command input; carries base64 for all binary attachments.
 
 ## Tauri commands (all invoked from the UI via `interop.rs`)
@@ -69,8 +69,8 @@ See `app/src-tauri/src/commands.rs` and `lib.rs::run()` / `main.rs` for registra
 - `app_health` → `AppHealth`
 - `submit_feedback(SubmitFeedbackPayload)` → `FeedbackRecord` (also enqueues a lineage job)
 - `list_feedback` / `load_feedback` / `delete_feedback`
-- `list_sandbox_jobs` / `load_sandbox_job`
-- `approve_sandbox_job` / `reject_sandbox_job` / `append_sandbox_note`
+- `list_lineage_jobs` / `load_lineage_job`
+- `approve_lineage_job` / `reject_lineage_job` / `append_lineage_note`
 - `open_workspace_path`
 
 Every new command MUST be registered in the `invoke_handler` in `src-tauri/src/lib.rs` AND mirrored in `app/ui/src/interop.rs`.
@@ -117,7 +117,7 @@ See `.claude/rules/common/product-invariants.md` for authoritative text. In shor
 - **Feedback Overlay always stays.** Reachable from every screen, every mode.
 - **The Canvas is a per-page overlay, not a tab.** The canvas module may be rewritten or replaced, but the resulting app must let the user open the Canvas overlay *on top of every page / route* to annotate the actual screen they have feedback about. A dedicated "canvas tab" where the canvas only exists as its own screen violates this invariant.
 - **One trigger opens BOTH Canvas overlay and Feedback panel.** Every Iteration ships a single Feedback FAB bound to a single `panel_open` signal — clicking it brings up the drawing surface *and* the submission panel together. Iterations must keep this: exactly one affordance, one signal, both surfaces visible together. Never a separate "draw" button and "send feedback" button; never leave a stale prior trigger behind after redesign; the button must be clearly labelled (`aria-label` + visible `title`) so the user knows what it does.
-- **Sandboxes are saveable and forkable into standalone apps.** Lineage state is a portable, self-contained artifact that can be renamed / cloned into a new Evolvo-shaped app with its own identity.
+- **Lineagees are saveable and forkable into standalone apps.** Lineage state is a portable, self-contained artifact that can be renamed / cloned into a new Evolvo-shaped app with its own identity.
 
 These outrank refactor aesthetics and most feature requests. Changes that violate them are product decisions — escalate.
 
@@ -214,7 +214,7 @@ When the work is done and verified:
 1. `git add -A && git commit -m "<conventional commit>"` — include `CLAUDE.md`, rules, and agent updates in the same commit when they travel with a behaviour change.
 2. Start the iteration's app (`cargo tauri dev` or the equivalent for the current stack) so the reviewer lands on a live build. Leave it running.
 3. In your final summary note which port the iteration is serving on and how you verified it.
-4. Change the SandboxJob status to `build_ready` so the next iteration can start from it.
+4. Change the LineageJob status to `build_ready` so the next iteration can start from it.
 
 ## Rules & agents
 
@@ -232,7 +232,7 @@ Agents:
 # After each session:
 - Commit the changes with a message describing the work done.
 - Start the new version of the app (the iteration you just built) so the reviewer can see it live when they start their review.
-- Update the SandboxJob status to `build_ready` so the next iteration can start from it.
+- Update the LineageJob status to `build_ready` so the next iteration can start from it.
 - In your final summary, note which port the iteration is serving on and how you verified it.
 - If this is the first iteation, create a new agent in the Lineage with staff-product-manager role which knows about the app being built and can provide feedback.
 - Call the new agent staff-product-manager and give it the task of reviewing the last iteration of the new app/feature/fix. The agent should give some recommendations to the user for the next iteration.

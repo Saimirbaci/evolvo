@@ -29,7 +29,7 @@ Unlike everywhere else you've worked, Evolvo has **no database**. The "queue" is
 ```
 ~/.evolvo/evolvo_workspace/                   # or $NOIDE_WORKSPACE_ROOT
 ├── feedback/       <id>.json               # FeedbackRecord
-├── sandbox_jobs/   <id>.json               # SandboxJobRecord
+├── lineage_jobs/   <id>.json               # LineageJobRecord
 └── attachments/{feedback_id}/
     ├── canvas.png
     ├── paste-N.png
@@ -40,10 +40,10 @@ Schema: see `app/src-tauri/src/types.rs`. Key fields on `FeedbackRecord`:
 
 - **Content**: `feedbackText`, `annotations` (arbitrary JSON), `pastedImages`, `screenshotFilename`, `voiceFilename`, `voiceTranscript`
 - **Context**: `pageRoute`, `windowWidth` / `windowHeight`
-- **Triage/lifecycle**: `feedbackType` (`bug|feature_request|improvement|confusion|compliment`), `status` (`new|triaged|in_sandbox|resolved|rejected`), `sandboxJobId`
+- **Triage/lifecycle**: `feedbackType` (`bug|feature_request|improvement|confusion|compliment`), `status` (`new|triaged|in_lineage|resolved|rejected`), `lineageJobId`
 - **Time**: `createdAtUnixMs`, `updatedAtUnixMs`
 
-And on `SandboxJobRecord`: `status` with the ladder `pending → triaging → planned → implementing → build_ready → merging → promoted | rejected | failed`, plus `notes: Vec<String>`.
+And on `LineageJobRecord`: `status` with the ladder `pending → triaging → planned → implementing → build_ready → merging → promoted | rejected | failed`, plus `notes: Vec<String>`.
 
 There is no `priority`, no `duplicate_count`, no `resolution_note` field. If you need those, propose adding them — don't invent them in-band.
 
@@ -56,7 +56,7 @@ Before anything else, these four invariants always hold — see `.claude/rules/c
 - **I-P1. Lineage always stays.** The feedback → lineage-job pipeline is permanent. A fix must never remove, bypass, or silently no-op it.
 - **I-P2. Feedback Overlay always stays.** The in-app feedback surface is reachable from every screen. A fix that hides it on some route is wrong.
 - **I-P3. The drawing board is always reachable.** The canvas *implementation* may be rewritten or replaced; the *affordance* (get back to a blank drawing surface at any time) must always exist.
-- **I-P4. Sandboxes are saveable and forkable into standalone apps.** Lineage state is persistable as a self-contained, portable artifact that can be renamed / cloned into a new app.
+- **I-P4. Lineagees are saveable and forkable into standalone apps.** Lineage state is persistable as a self-contained, portable artifact that can be renamed / cloned into a new app.
 
 If a feedback row asks for something that would break any of these, it's not in your lane — close with a `WONT_FIX:` note explaining which invariant it collides with, or escalate to `staff-architect-self-evolving-software` if the user seems to want a policy change.
 
@@ -136,13 +136,13 @@ And for UI-visible changes, run `cargo tauri dev` and actually exercise the flow
 
 Evolvo doesn't have `resolution_note` / `resolved_by` columns. The close-the-loop move is:
 
-1. **Update the feedback JSON in place** — bump `status` to `resolved` (or `rejected`), update `updatedAtUnixMs`, and if a lineage job was created, advance it through its state machine via the existing `approve_sandbox_job` / `append_sandbox_note` commands rather than editing the JSON directly.
+1. **Update the feedback JSON in place** — bump `status` to `resolved` (or `rejected`), update `updatedAtUnixMs`, and if a lineage job was created, advance it through its state machine via the existing `approve_lineage_job` / `append_lineage_note` commands rather than editing the JSON directly.
 2. **Reference the feedback ID prefix in your commit message** — `fix(ui): … — feedback:a1b2c3d4`.
-3. **For duplicates**: pick one canonical row to resolve, and in the others set `status = "resolved"` with a note via `append_sandbox_note` pointing at the canonical ID. (If dedupe becomes frequent, propose a `parentFeedbackId` field — don't retrofit one inline.)
+3. **For duplicates**: pick one canonical row to resolve, and in the others set `status = "resolved"` with a note via `append_lineage_note` pointing at the canonical ID. (If dedupe becomes frequent, propose a `parentFeedbackId` field — don't retrofit one inline.)
 
 **Ask the user before the first write to a workspace in a session.** Then batch.
 
-For "won't fix" and "needs info": since there is no dedicated field today, use `append_sandbox_note` with a clear prefix:
+For "won't fix" and "needs info": since there is no dedicated field today, use `append_lineage_note` with a clear prefix:
 - `WONT_FIX: <reason>. Alternative: <what we did instead>.`
 - `NEEDS_INFO: <the specific question>.`
 
@@ -180,7 +180,7 @@ Counts: implemented / deferred / already-shipped / duplicates-merged / wont-fix 
 - `sanitise_filename` misses reported by a concrete input
 
 ### Ship with a test
-- Any change to `FeedbackRecord` / `SandboxJobRecord` serde shape — pin it with a `_round_trips_camel_case` and a `_tolerates_extra_fields` test
+- Any change to `FeedbackRecord` / `LineageJobRecord` serde shape — pin it with a `_round_trips_camel_case` and a `_tolerates_extra_fields` test
 - Any change to the lineage state machine — pin every transition
 - Any attachment write/read path — pin the sanitise + scope-by-id behavior
 

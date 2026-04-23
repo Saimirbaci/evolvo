@@ -2,7 +2,7 @@
 //!
 //! The lineage concept from agent_swarm is a gated pipeline that turns user
 //! feedback into reviewable proposals. Here we keep just the state-machine and
-//! persistence surface: every submitted feedback spawns a `SandboxJobRecord`
+//! persistence surface: every submitted feedback spawns a `LineageJobRecord`
 //! that a reviewer can advance, approve, or reject. Rich automation (LLM
 //! triage, build, merge) lives behind this boundary and can be added later
 //! without changing the API.
@@ -15,10 +15,10 @@
 
 use crate::store::{Store, StoreError};
 use crate::types::{
-    current_time_unix_ms, FeedbackRecord, FeedbackStatus, SandboxJobRecord, SandboxJobStatus,
+    current_time_unix_ms, FeedbackRecord, FeedbackStatus, LineageJobRecord, LineageJobStatus,
 };
 
-pub struct SandboxEngine<'a> {
+pub struct LineageEngine<'a> {
     store: &'a Store,
 }
 
@@ -34,8 +34,8 @@ pub enum Transition {
 }
 
 impl Transition {
-    pub fn is_valid_from(self, from: SandboxJobStatus) -> bool {
-        use SandboxJobStatus as S;
+    pub fn is_valid_from(self, from: LineageJobStatus) -> bool {
+        use LineageJobStatus as S;
         use Transition as T;
         matches!(
             (self, from),
@@ -49,20 +49,20 @@ impl Transition {
         )
     }
 
-    pub fn target(self, _from: SandboxJobStatus) -> SandboxJobStatus {
+    pub fn target(self, _from: LineageJobStatus) -> LineageJobStatus {
         match self {
-            Self::Triage => SandboxJobStatus::Triaging,
-            Self::Plan => SandboxJobStatus::Planned,
-            Self::StartImplementation => SandboxJobStatus::Implementing,
-            Self::MarkBuildReady => SandboxJobStatus::BuildReady,
-            Self::Approve => SandboxJobStatus::Promoted,
-            Self::Reject => SandboxJobStatus::Rejected,
-            Self::Fail => SandboxJobStatus::Failed,
+            Self::Triage => LineageJobStatus::Triaging,
+            Self::Plan => LineageJobStatus::Planned,
+            Self::StartImplementation => LineageJobStatus::Implementing,
+            Self::MarkBuildReady => LineageJobStatus::BuildReady,
+            Self::Approve => LineageJobStatus::Promoted,
+            Self::Reject => LineageJobStatus::Rejected,
+            Self::Fail => LineageJobStatus::Failed,
         }
     }
 }
 
-impl<'a> SandboxEngine<'a> {
+impl<'a> LineageEngine<'a> {
     pub fn new(store: &'a Store) -> Self {
         Self { store }
     }
@@ -72,15 +72,15 @@ impl<'a> SandboxEngine<'a> {
     pub fn enqueue_job_for_feedback(
         &self,
         feedback: &mut FeedbackRecord,
-    ) -> Result<SandboxJobRecord, StoreError> {
+    ) -> Result<LineageJobRecord, StoreError> {
         let now = current_time_unix_ms();
         let id = format!("job-{now}");
-        let job = SandboxJobRecord {
+        let job = LineageJobRecord {
             id: id.clone(),
             feedback_id: feedback.id.clone(),
             title: derive_title(feedback),
             summary: feedback.feedback_text.clone(),
-            status: SandboxJobStatus::Pending,
+            status: LineageJobStatus::Pending,
             notes: Vec::new(),
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
@@ -90,10 +90,10 @@ impl<'a> SandboxEngine<'a> {
             source_repo: None,
             iteration: 0,
         };
-        self.store.save_sandbox_job(&job)?;
+        self.store.save_lineage_job(&job)?;
 
-        feedback.sandbox_job_id = Some(id);
-        feedback.status = FeedbackStatus::InSandbox;
+        feedback.lineage_job_id = Some(id);
+        feedback.status = FeedbackStatus::InLineage;
         feedback.updated_at_unix_ms = now;
         self.store.save_feedback(feedback)?;
         Ok(job)
@@ -103,33 +103,31 @@ impl<'a> SandboxEngine<'a> {
         &self,
         job_id: &str,
         transition: Transition,
-    ) -> Result<SandboxJobRecord, StoreError> {
+    ) -> Result<LineageJobRecord, StoreError> {
         let mut job = self
             .store
-            .load_sandbox_job(job_id)?
+            .load_lineage_job(job_id)?
             .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         if !transition.is_valid_from(job.status) {
-            return Err(format!(
-                "transition {transition:?} not valid from {:?}",
-                job.status
-            )
-            .into());
+            return Err(
+                format!("transition {transition:?} not valid from {:?}", job.status).into(),
+            );
         }
         job.status = transition.target(job.status);
         job.updated_at_unix_ms = current_time_unix_ms();
-        self.store.save_sandbox_job(&job)?;
+        self.store.save_lineage_job(&job)?;
         Ok(job)
     }
 
-    pub fn append_note(&self, job_id: &str, note: &str) -> Result<SandboxJobRecord, StoreError> {
+    pub fn append_note(&self, job_id: &str, note: &str) -> Result<LineageJobRecord, StoreError> {
         let mut job = self
             .store
-            .load_sandbox_job(job_id)?
+            .load_lineage_job(job_id)?
             .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         if !note.trim().is_empty() {
             job.notes.push(note.trim().to_string());
             job.updated_at_unix_ms = current_time_unix_ms();
-            self.store.save_sandbox_job(&job)?;
+            self.store.save_lineage_job(&job)?;
         }
         Ok(job)
     }
@@ -141,15 +139,15 @@ impl<'a> SandboxEngine<'a> {
     pub fn force_status(
         &self,
         job_id: &str,
-        status: SandboxJobStatus,
-    ) -> Result<SandboxJobRecord, StoreError> {
+        status: LineageJobStatus,
+    ) -> Result<LineageJobRecord, StoreError> {
         let mut job = self
             .store
-            .load_sandbox_job(job_id)?
+            .load_lineage_job(job_id)?
             .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         job.status = status;
         job.updated_at_unix_ms = current_time_unix_ms();
-        self.store.save_sandbox_job(&job)?;
+        self.store.save_lineage_job(&job)?;
         Ok(job)
     }
 
@@ -162,28 +160,23 @@ impl<'a> SandboxEngine<'a> {
         branch_name: String,
         log_path: String,
         source_repo: String,
-    ) -> Result<SandboxJobRecord, StoreError> {
+    ) -> Result<LineageJobRecord, StoreError> {
         let mut job = self
             .store
-            .load_sandbox_job(job_id)?
+            .load_lineage_job(job_id)?
             .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
         job.worktree_path = Some(worktree_path);
         job.branch_name = Some(branch_name);
         job.log_path = Some(log_path);
         job.source_repo = Some(source_repo);
         job.updated_at_unix_ms = current_time_unix_ms();
-        self.store.save_sandbox_job(&job)?;
+        self.store.save_lineage_job(&job)?;
         Ok(job)
     }
 }
 
 fn derive_title(feedback: &FeedbackRecord) -> String {
-    let first_line = feedback
-        .feedback_text
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim();
+    let first_line = feedback.feedback_text.lines().next().unwrap_or("").trim();
     if first_line.is_empty() {
         format!("Feedback {}", feedback.id)
     } else if first_line.len() > 80 {
@@ -215,7 +208,7 @@ mod tests {
             window_height: 100,
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
-            sandbox_job_id: None,
+            lineage_job_id: None,
         }
     }
 
@@ -225,14 +218,14 @@ mod tests {
         let store = Store::new(temp.path().to_path_buf());
         store.init_workspace().unwrap();
 
-        let engine = SandboxEngine::new(&store);
+        let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
         let job = engine.enqueue_job_for_feedback(&mut fb).unwrap();
 
-        assert_eq!(fb.sandbox_job_id.as_deref(), Some(job.id.as_str()));
-        assert_eq!(fb.status, FeedbackStatus::InSandbox);
+        assert_eq!(fb.lineage_job_id.as_deref(), Some(job.id.as_str()));
+        assert_eq!(fb.status, FeedbackStatus::InLineage);
         assert_eq!(job.feedback_id, "fb-1");
-        assert_eq!(job.status, SandboxJobStatus::Pending);
+        assert_eq!(job.status, LineageJobStatus::Pending);
         assert_eq!(job.title, "button should be rounder");
     }
 
@@ -242,13 +235,13 @@ mod tests {
         let store = Store::new(temp.path().to_path_buf());
         store.init_workspace().unwrap();
 
-        let engine = SandboxEngine::new(&store);
+        let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
         let job = engine.enqueue_job_for_feedback(&mut fb).unwrap();
 
         // Pending -> Triaging ok
         let j2 = engine.transition(&job.id, Transition::Triage).unwrap();
-        assert_eq!(j2.status, SandboxJobStatus::Triaging);
+        assert_eq!(j2.status, LineageJobStatus::Triaging);
 
         // Cannot go Pending -> BuildReady (invalid from Triaging state)
         let bad = engine.transition(&job.id, Transition::MarkBuildReady);
@@ -262,11 +255,11 @@ mod tests {
         let ready = engine
             .transition(&job.id, Transition::MarkBuildReady)
             .unwrap();
-        assert_eq!(ready.status, SandboxJobStatus::BuildReady);
+        assert_eq!(ready.status, LineageJobStatus::BuildReady);
 
         // BuildReady -> Approve -> Promoted
         let promoted = engine.transition(&job.id, Transition::Approve).unwrap();
-        assert_eq!(promoted.status, SandboxJobStatus::Promoted);
+        assert_eq!(promoted.status, LineageJobStatus::Promoted);
     }
 
     #[test]
@@ -275,11 +268,11 @@ mod tests {
         let store = Store::new(temp.path().to_path_buf());
         store.init_workspace().unwrap();
 
-        let engine = SandboxEngine::new(&store);
+        let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
         let job = engine.enqueue_job_for_feedback(&mut fb).unwrap();
         let out = engine.transition(&job.id, Transition::Reject).unwrap();
-        assert_eq!(out.status, SandboxJobStatus::Rejected);
+        assert_eq!(out.status, LineageJobStatus::Rejected);
     }
 
     #[test]
@@ -288,7 +281,7 @@ mod tests {
         let store = Store::new(temp.path().to_path_buf());
         store.init_workspace().unwrap();
 
-        let engine = SandboxEngine::new(&store);
+        let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
         let job = engine.enqueue_job_for_feedback(&mut fb).unwrap();
         let j2 = engine.append_note(&job.id, "needs more detail").unwrap();

@@ -7,7 +7,7 @@ use crate::canvas::{CanvasController, CanvasSurface};
 use crate::feedback_panel::FeedbackPanel;
 use crate::interop;
 use crate::toolbar::Toolbar;
-use crate::types::{AppHealth, SandboxJobRecord};
+use crate::types::{AppHealth, LineageJobRecord};
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
 /// moves. Kept as a constant rather than a build-time env var so the binary
@@ -29,7 +29,8 @@ fn star_us_link() -> leptos::prelude::AnyView {
             <span class="star-us-icon" aria-hidden="true">"★"</span>
             "Star Us"
         </button>
-    }.into_any()
+    }
+    .into_any()
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Default)]
@@ -118,7 +119,7 @@ pub fn App() -> impl IntoView {
 
             {move || match view_sig.get() {
                 View::Home => view! { <HomePage panel_open=panel_open /> }.into_any(),
-                View::Lineage => view! { <SandboxPage /> }.into_any(),
+                View::Lineage => view! { <LineagePage /> }.into_any(),
             }}
 
             {move || {
@@ -205,14 +206,14 @@ fn FeedbackFab(controller: CanvasController, is_open: RwSignal<bool>) -> impl In
 }
 
 #[component]
-fn SandboxPage() -> impl IntoView {
-    let items: RwSignal<Option<Result<Vec<SandboxJobRecord>, String>>> = RwSignal::new(None);
+fn LineagePage() -> impl IntoView {
+    let items: RwSignal<Option<Result<Vec<LineageJobRecord>, String>>> = RwSignal::new(None);
     let reload = RwSignal::new(0_u32);
     let selected: RwSignal<Option<String>> = RwSignal::new(None);
     Effect::new(move |_: Option<()>| {
         let _ = reload.get();
         spawn_local(async move {
-            let result = interop::list_sandbox_jobs().await;
+            let result = interop::list_lineage_jobs().await;
             items.set(Some(result));
         });
     });
@@ -220,7 +221,9 @@ fn SandboxPage() -> impl IntoView {
     // Keep selection valid — if nothing selected but records exist, select the
     // first; if the selected id disappeared, fall back.
     Effect::new(move |_: Option<()>| {
-        let Some(Ok(ref records)) = items.get() else { return };
+        let Some(Ok(ref records)) = items.get() else {
+            return;
+        };
         let current = selected.get_untracked();
         let valid = current
             .as_ref()
@@ -293,7 +296,7 @@ fn SandboxPage() -> impl IntoView {
                     let Some(record) = records.into_iter().find(|r| r.id == id) else {
                         return view! { <div class="empty-state">"No selection."</div> }.into_any();
                     };
-                    view! { <SandboxDetail record=record reload=reload /> }.into_any()
+                    view! { <LineageDetail record=record reload=reload /> }.into_any()
                 }}
             </section>
         </div>
@@ -301,7 +304,7 @@ fn SandboxPage() -> impl IntoView {
 }
 
 #[component]
-fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoView {
+fn LineageDetail(record: LineageJobRecord, reload: RwSignal<u32>) -> impl IntoView {
     let can_approve = record.status.can_approve();
     let can_retry = record.status.can_retry();
     let can_run = record.status.can_run() && record.worktree_path.is_some();
@@ -318,21 +321,21 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
     let approve_click = move |_| {
         let id = approve_id.clone();
         spawn_local(async move {
-            let _ = interop::approve_sandbox_job(&id).await;
+            let _ = interop::approve_lineage_job(&id).await;
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
     let reject_click = move |_| {
         let id = reject_id.clone();
         spawn_local(async move {
-            let _ = interop::reject_sandbox_job(&id).await;
+            let _ = interop::reject_lineage_job(&id).await;
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
     let run_click = move |_| {
         let id = run_id.clone();
         spawn_local(async move {
-            let _ = interop::run_sandbox_job(&id).await;
+            let _ = interop::run_lineage_job(&id).await;
             reload.update(|v| *v = v.wrapping_add(1));
         });
         schedule_reloads(reload, &[1500, 4000, 10_000]);
@@ -347,9 +350,9 @@ fn SandboxDetail(record: SandboxJobRecord, reload: RwSignal<u32>) -> impl IntoVi
         spawn_local(async move {
             if !text.is_empty() {
                 let note = format!("User clarification: {text}");
-                let _ = interop::append_sandbox_note(&id, &note).await;
+                let _ = interop::append_lineage_note(&id, &note).await;
             }
-            let _ = interop::retry_sandbox_job(&id).await;
+            let _ = interop::retry_lineage_job(&id).await;
             fix_submitting.set(false);
             fix_open.set(false);
             fix_text.set(String::new());
@@ -509,9 +512,6 @@ fn schedule_reloads(reload: RwSignal<u32>, delays_ms: &[i32]) {
         let cb = Closure::once_into_js(move || {
             r.update(|v| *v = v.wrapping_add(1));
         });
-        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
-            cb.unchecked_ref(),
-            ms,
-        );
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(cb.unchecked_ref(), ms);
     }
 }
