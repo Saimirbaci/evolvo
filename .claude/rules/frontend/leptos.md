@@ -10,7 +10,8 @@
 ## File boundaries
 
 - `main.rs` — mount only.
-- `app.rs` — top-level component + panel composition.
+- `shell.rs` — **invariant** chrome: app bar, Lineage nav/page, Star Us link, Feedback FAB, Canvas overlay + feedback panel composition. Owns `panel_open` and exposes `PanelOpen` via context. Do not re-implement any of this inside `app.rs`.
+- `app.rs` — the **NewApp content area**. Mounts `<Shell>` and renders the current app's Home content inside it. Iteration authors rewrite this file; they must not remove `<Shell>` or move chrome into it.
 - `canvas.rs` — all drawing / annotation state. Rendering uses `CanvasRenderingContext2d` via `web-sys`.
 - `toolbar.rs`, `feedback_panel.rs`, `voice.rs` — one panel/feature per file.
 - `interop.rs` — **only** place that talks to Tauri. Keep other modules Tauri-agnostic; pass closures/signals in.

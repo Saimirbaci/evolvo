@@ -25,7 +25,7 @@ A rewrite that makes the Canvas a separate tab, or that makes any page un-annota
 
 ## I-P3b. One trigger opens BOTH the Canvas overlay AND the Feedback panel
 
-The Canvas overlay and the Feedback submission panel are a **single surface from the user's point of view**, driven by a **single trigger** and a **single open/closed state**. Iteration zero implements this as the `FeedbackFab` button in `app/ui/src/app.rs` bound to a `panel_open: RwSignal<bool>` signal: one click opens the drawing surface and the submission panel together, another closes both.
+The Canvas overlay and the Feedback submission panel are a **single surface from the user's point of view**, driven by a **single trigger** and a **single open/closed state**. Iteration zero implements this as the `FeedbackFab` button in `app/ui/src/shell.rs` bound to a `panel_open: RwSignal<bool>` signal owned by the shell: one click opens the drawing surface and the submission panel together, another closes both. The FAB lives in the invariant shell precisely so it cannot be removed by a NewApp rewrite — NewApp work happens in `app/ui/src/app.rs` *inside* the shell.
 
 Iterations must preserve this contract:
 

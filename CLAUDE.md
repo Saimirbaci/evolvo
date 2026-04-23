@@ -80,7 +80,8 @@ Every new command MUST be registered in the `invoke_handler` in `src-tauri/src/l
 ```
 app/ui/src/
 ├── main.rs            # mount_to_body
-├── app.rs             # top-level <App/> component + routing/panels
+├── app.rs             # NewApp Home content mounted inside <Shell/> — iterations rewrite this
+├── shell.rs           # INVARIANT chrome: app bar, Lineage page, Star Us, Feedback FAB, Canvas overlay
 ├── canvas.rs          # the drawing / annotation canvas (large — ~1k lines)
 ├── feedback_panel.rs  # submission form + attachments
 ├── toolbar.rs         # canvas tools
@@ -120,6 +121,15 @@ See `.claude/rules/common/product-invariants.md` for authoritative text. In shor
 - **Lineagees are saveable and forkable into standalone apps.** Lineage state is a portable, self-contained artifact that can be renamed / cloned into a new Evolvo-shaped app with its own identity.
 
 These outrank refactor aesthetics and most feature requests. Changes that violate them are product decisions — escalate.
+
+## `shell.rs` is invariant; `app.rs` is where the NewApp lives
+
+The UI is split into two layers:
+
+- **`app/ui/src/shell.rs`** — the permanent Evolvo chrome. Owns the app bar, the Lineage navigation + page, the "Star Us" link, the single Feedback FAB, and the Canvas overlay + feedback panel composition. **Every iteration keeps mounting `<Shell>`.** The shell is what enforces I-P1 through I-P3b (Lineage always reachable, Feedback Overlay always reachable, Canvas overlay on every page, one trigger for both surfaces). Do not delete, duplicate, or re-implement this chrome inside `app.rs` — if a chrome change is needed, edit `shell.rs` directly.
+- **`app/ui/src/app.rs`** — the **NewApp content area**. When the user asks for a NewApp, this is the file that gets rewritten: replace `HomePage` with the new app's root component / router / layout and add further modules alongside it. Keep `App` mounting `<Shell>` with the new content as its children. Because the shell wraps the content, every page/route of the NewApp is automatically annotatable — the Canvas overlay mounts on top of whatever `app.rs` renders when the user clicks the FAB.
+
+Shell exposes `PanelOpen` via `provide_context` so NewApp content can read the Canvas/Feedback open state (e.g. to hide copy from the submission screenshot) without re-implementing the FAB.
 
 ## Canvas + Feedback overlay rules (load-bearing, easy to regress)
 
