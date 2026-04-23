@@ -208,6 +208,30 @@ Type-checks and unit tests do not prove the feature works. Before claiming a cha
 
 If you genuinely cannot run the app in the current environment, say so plainly in your summary — don't claim success you didn't observe.
 
+## Debugging a lineage run — `claude.log` is JSONL
+
+Each lineage job's `claude.log` (under `~/.evolvo/evolvo_workspace/lineage_workspaces/<job-id>/`) is captured with `claude -p ... --output-format stream-json --verbose`, so it is **one JSON event per line**, not human-readable prose. Each line has a `type` (`system`, `assistant`, `user`, `result`, etc.); assistant messages carry `message.content[]` with `tool_use` / `text` entries; user messages carry `tool_result` entries.
+
+Useful one-liners (requires `jq`):
+
+```bash
+LOG=~/.evolvo/evolvo_workspace/lineage_workspaces/<job-id>/claude.log
+
+# Every tool call the agent made (name + truncated input)
+jq -c 'select(.type=="assistant") | .message.content[]?
+       | select(.type=="tool_use") | {name, input: (.input | tostring[0:200])}' "$LOG"
+
+# Did the agent actually Read the staged canvas.png?
+jq -c 'select(.type=="assistant") | .message.content[]?
+       | select(.type=="tool_use" and .name=="Read")
+       | .input.file_path' "$LOG" | grep -i canvas.png
+
+# Final assistant text
+jq -r 'select(.type=="result") | .result // .message.content[-1].text // empty' "$LOG"
+```
+
+If `claude.log` is empty or missing tool_use events for the staged attachments, the model never read them — surface that in the lineage notes rather than silently shipping an iteration that ignored the user's drawing.
+
 ## Lineage iteration port convention
 
 Each lineage iteration runs on its own dev-server port so multiple iterations can run side-by-side without collisions.

@@ -690,7 +690,7 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
         let _ = engine.append_note(
             &job_id,
             &format!(
-                "claude code starting (dangerously-skip-permissions, auth=subscription) in worktree {} — streaming to {}",
+                "claude code starting (dangerously-skip-permissions, auth=subscription, stream-json + verbose) in worktree {} — JSONL stream → {}",
                 prepared.worktree.display(),
                 prepared.log_file.display(),
             ),
@@ -702,10 +702,23 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
         // key has no balance but who are separately logged in via
         // `claude login`. Scrubbing `ANTHROPIC_AUTH_TOKEN` as well for the
         // same reason (internal Anthropic tooling override).
+        // `--output-format stream-json --verbose` makes the CLI emit one
+        // JSON event per line (system init, assistant/user messages, tool
+        // uses, tool results, final result). Without this, `-p` writes only
+        // the final assistant text and we have no way to tell — after the
+        // fact — whether the agent ever invoked `Read` on the staged
+        // attachments (canvas.png, annotations.json, voice recording). The
+        // log is no longer human-readable prose; pipe it through `jq` to
+        // inspect. See `docs/debugging.md` or just:
+        //     tail -f claude.log | jq -c 'select(.type=="assistant").message.content[]?
+        //                                   | select(.type=="tool_use") | {name, input}'
         let status = Command::new("claude")
             .arg("-p")
             .arg(&prepared.prompt)
             .arg("--dangerously-skip-permissions")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose")
             .current_dir(&prepared.worktree)
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_AUTH_TOKEN")
