@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::types::{FeedbackRecord, SandboxJobRecord};
 
-const WORKSPACE_DIR_NAME: &str = "noide_workspace";
+const WORKSPACE_DIR_NAME: &str = "evolvo_workspace";
 const FEEDBACK_DIR: &str = "feedback";
 const SANDBOX_JOBS_DIR: &str = "sandbox_jobs";
 const ATTACHMENTS_DIR: &str = "attachments";
@@ -274,7 +274,7 @@ pub fn default_workspace_root() -> PathBuf {
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
-            .join(".noide")
+            .join(".evolvo")
             .join(WORKSPACE_DIR_NAME);
     }
     PathBuf::from(WORKSPACE_DIR_NAME)
