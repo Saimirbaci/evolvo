@@ -1,0 +1,599 @@
+//! Invariant application shell.
+//!
+//! `Shell` is the permanent chrome wrapped around whatever app the current
+//! iteration is building. It owns the four load-bearing surfaces that every
+//! iteration must preserve:
+//!
+//! - the app bar with the Lineage navigation + "Star Us" link,
+//! - the single Feedback FAB that opens the Canvas overlay **and** the
+//!   feedback submission panel together (one trigger, one signal, both
+//!   surfaces — see I-P3b in `.claude/rules/common/product-invariants.md`),
+//! - the Canvas overlay + Toolbar, mountable on top of any page,
+//! - the Lineage review page.
+//!
+//! The concrete app being built on top of Evolvo lives in `app.rs` and is
+//! passed in as `children` — those children render on the Home route inside
+//! the shell. `app.rs` can be rewritten freely by each iteration; `shell.rs`
+//! is invariant.
+//!
+//! The shell exposes `panel_open` via context so children can react to the
+//! Canvas overlay being open (e.g. to hide copy from a page screenshot).
+
+use leptos::prelude::*;
+use leptos::task::spawn_local;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+
+use crate::canvas::{CanvasController, CanvasSurface};
+use crate::feedback_panel::FeedbackPanel;
+use crate::interop;
+use crate::toolbar::Toolbar;
+use crate::types::{AppHealth, LineageJobRecord};
+
+/// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
+/// moves. Kept as a constant rather than a build-time env var so the binary
+/// ships with a known, auditable destination.
+const STAR_REPO_URL: &str = "https://github.com/saimirbaci/Evolvo";
+
+/// Context exposed by `Shell` so children (the NewApp content) can observe
+/// whether the Canvas overlay / Feedback panel is currently open.
+#[derive(Copy, Clone)]
+pub struct PanelOpen(pub RwSignal<bool>);
+
+fn star_us_link() -> AnyView {
+    view! {
+        <button
+            class="app-bar-link star-us-link"
+            title="Star this repo on GitHub"
+            aria-label="Star Evolvo on GitHub"
+            on:click=move |_| {
+                spawn_local(async move {
+                    let _ = interop::open_external_url(STAR_REPO_URL).await;
+                });
+            }
+        >
+            <span class="star-us-icon" aria-hidden="true">"★"</span>
+            "Star Us"
+        </button>
+    }
+    .into_any()
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Default)]
+pub enum View {
+    #[default]
+    Home,
+    Lineage,
+}
+
+impl View {
+    fn route(self) -> &'static str {
+        match self {
+            Self::Home => "/",
+            Self::Lineage => "/lineage",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Home => "Canvas",
+            Self::Lineage => "Lineage",
+        }
+    }
+
+    fn all() -> [View; 2] {
+        [Self::Home, Self::Lineage]
+    }
+}
+
+#[component]
+pub fn Shell(children: ChildrenFn) -> impl IntoView {
+    let view_sig: RwSignal<View> = RwSignal::new(View::Home);
+    let route: RwSignal<String> = RwSignal::new(View::Home.route().to_string());
+    let controller = CanvasController::new();
+    let health: RwSignal<Option<AppHealth>> = RwSignal::new(None);
+    let panel_open: RwSignal<bool> = RwSignal::new(false);
+
+    provide_context(PanelOpen(panel_open));
+
+    Effect::new(move |already: Option<()>| {
+        if already.is_some() {
+            return;
+        }
+        spawn_local(async move {
+            if let Ok(h) = interop::app_health().await {
+                health.set(Some(h));
+            }
+        });
+    });
+
+    Effect::new(move |_| {
+        route.set(view_sig.get().route().to_string());
+    });
+
+    let ctrl_fab = controller.clone();
+    let ctrl_toolbar = controller.clone();
+    let ctrl_canvas = controller.clone();
+    let ctrl_panel = controller.clone();
+
+    view! {
+        <div class="app-root">
+            <header class="app-bar">
+                <div>
+                    <span class="app-bar-title">"Evolvo"</span>
+                    <span class="app-bar-subtitle">
+                        {move || match health.get() {
+                            Some(h) => format!("v{} • {}", h.app_version, h.workspace_path),
+                            None => "loading…".into(),
+                        }}
+                    </span>
+                </div>
+                <nav class="app-bar-actions">
+                    {View::all().into_iter().map(|v| {
+                        let is_active = move || view_sig.get() == v;
+                        view! {
+                            <button
+                                class="app-bar-link"
+                                class:active=is_active
+                                on:click=move |_| view_sig.set(v)
+                            >
+                                {v.label()}
+                            </button>
+                        }.into_any()
+                    }).collect_view()}
+                    {star_us_link()}
+                </nav>
+            </header>
+
+            {move || match view_sig.get() {
+                View::Home => children().into_any(),
+                View::Lineage => view! { <LineagePage /> }.into_any(),
+            }}
+
+            {move || {
+                if panel_open.get() {
+                    view! {
+                        <div class="canvas-overlay">
+                            <Toolbar controller=ctrl_toolbar.clone() />
+                            <CanvasSurface controller=ctrl_canvas.clone() />
+                        </div>
+                        <FeedbackPanel
+                            controller=ctrl_panel.clone()
+                            route=route
+                            is_open=panel_open
+                        />
+                    }.into_any()
+                } else {
+                    view! { <span></span> }.into_any()
+                }
+            }}
+
+            <FeedbackFab controller=ctrl_fab.clone() is_open=panel_open />
+        </div>
+    }
+}
+
+#[component]
+fn FeedbackFab(controller: CanvasController, is_open: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <button
+            class="fab"
+            class:fab-active=move || is_open.get()
+            title="Send feedback"
+            aria-label="Send feedback"
+            on:click=move |_| is_open.update(|v| *v = !*v)
+        >
+            {move || {
+                if is_open.get() {
+                    "×"
+                } else {
+                    "✎"
+                }
+            }}
+            {move || {
+                let pending = controller.pasted_base64.get().len() + controller.shapes.get().len();
+                if pending > 0 && !is_open.get() {
+                    view! { <span class="fab-badge">{pending}</span> }.into_any()
+                } else {
+                    view! { <span></span> }.into_any()
+                }
+            }}
+        </button>
+    }
+}
+
+#[component]
+fn LineagePage() -> impl IntoView {
+    let items: RwSignal<Option<Result<Vec<LineageJobRecord>, String>>> = RwSignal::new(None);
+    let reload = RwSignal::new(0_u32);
+    let selected: RwSignal<Option<String>> = RwSignal::new(None);
+    // Error surface for action buttons. Lives at the page level (not inside
+    // `LineageDetail`) so that when `items` reloads and the detail component
+    // is torn down + rebuilt, the error message persists long enough for the
+    // user to read it.
+    let action_error: RwSignal<Option<String>> = RwSignal::new(None);
+    Effect::new(move |_: Option<()>| {
+        let _ = reload.get();
+        spawn_local(async move {
+            let result = interop::list_lineage_jobs().await;
+            items.set(Some(result));
+        });
+    });
+
+    // Poll the backend every 2s so that (a) status changes driven by the
+    // background claude run surface without a user action and (b) edits made
+    // directly to the lineage_jobs JSON on disk are picked up without an app
+    // restart. The backend reads from disk on each call, so a simple reload
+    // bump is sufficient.
+    spawn_interval(reload, 2000);
+
+    // Keep selection valid — if nothing selected but records exist, select the
+    // first; if the selected id disappeared, fall back.
+    Effect::new(move |_: Option<()>| {
+        let Some(Ok(ref records)) = items.get() else {
+            return;
+        };
+        let current = selected.get_untracked();
+        let valid = current
+            .as_ref()
+            .map(|id| records.iter().any(|r| &r.id == id))
+            .unwrap_or(false);
+        if !valid {
+            selected.set(records.first().map(|r| r.id.clone()));
+        }
+    });
+
+    // Clear any lingering action error when the user switches to a different
+    // lineage job — the error was about the previous selection.
+    Effect::new(move |prev: Option<Option<String>>| {
+        let now = selected.get();
+        if let Some(p) = prev.as_ref() {
+            if p != &now {
+                action_error.set(None);
+            }
+        }
+        now
+    });
+
+    view! {
+        <div class="lineage-page">
+            <aside class="lineage-sidebar">
+                <h2 class="lineage-sidebar-title">"Lineage"</h2>
+                {move || match items.get() {
+                    None => view! { <div class="empty-state">"Loading…"</div> }.into_any(),
+                    Some(Err(e)) => view! {
+                        <div class="empty-state">{format!("Failed to load: {e}")}</div>
+                    }.into_any(),
+                    Some(Ok(records)) => {
+                        if records.is_empty() {
+                            view! {
+                                <div class="empty-state">"No lineage jobs yet."</div>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <ul class="lineage-list">
+                                    {records.into_iter().map(|r| {
+                                        let id = r.id.clone();
+                                        let id_for_click = id.clone();
+                                        let is_active = move || selected.get().as_deref() == Some(&id);
+                                        view! {
+                                            <li>
+                                                <button
+                                                    class="lineage-list-item"
+                                                    class:active=is_active
+                                                    on:click=move |_| selected.set(Some(id_for_click.clone()))
+                                                >
+                                                    <div class="lineage-list-item-head">
+                                                        <span class="lineage-list-item-title">{r.title.clone()}</span>
+                                                        <span class="list-card-status">{r.status.label()}</span>
+                                                    </div>
+                                                    <div class="list-card-meta">
+                                                        {if r.iteration > 0 {
+                                                            format!("iter {} · {}", r.iteration, format_time(r.created_at_unix_ms))
+                                                        } else {
+                                                            format_time(r.created_at_unix_ms)
+                                                        }}
+                                                    </div>
+                                                </button>
+                                            </li>
+                                        }
+                                    }).collect_view()}
+                                </ul>
+                            }.into_any()
+                        }
+                    }
+                }}
+            </aside>
+            <section class="lineage-detail">
+                {move || {
+                    let Some(Ok(records)) = items.get() else {
+                        return view! { <div class="empty-state">"Loading…"</div> }.into_any();
+                    };
+                    let Some(id) = selected.get() else {
+                        return view! {
+                            <div class="empty-state">"Select a lineage job to view activity."</div>
+                        }.into_any();
+                    };
+                    let Some(record) = records.into_iter().find(|r| r.id == id) else {
+                        return view! { <div class="empty-state">"No selection."</div> }.into_any();
+                    };
+                    view! { <LineageDetail record=record reload=reload action_error=action_error /> }.into_any()
+                }}
+            </section>
+        </div>
+    }
+}
+
+#[component]
+fn LineageDetail(
+    record: LineageJobRecord,
+    reload: RwSignal<u32>,
+    // Surface for backend errors from Evolve / Reject / Run / Fix. Owned by
+    // `LineagePage` so the message outlives this component's reconstruction
+    // when `items` reloads right after an action fires.
+    action_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let can_approve = record.status.can_approve();
+    let can_retry = record.status.can_retry();
+    let can_run = record.status.can_run() && record.worktree_path.is_some();
+    let approve_id = record.id.clone();
+    let reject_id = record.id.clone();
+    let retry_id = record.id.clone();
+    let run_id = record.id.clone();
+
+    // Inline "Fix" clarification editor state.
+    let fix_open: RwSignal<bool> = RwSignal::new(false);
+    let fix_text: RwSignal<String> = RwSignal::new(String::new());
+    let fix_submitting: RwSignal<bool> = RwSignal::new(false);
+
+    let approve_click = move |_| {
+        let id = approve_id.clone();
+        action_error.set(None);
+        spawn_local(async move {
+            if let Err(e) = interop::approve_lineage_job(&id).await {
+                action_error.set(Some(e));
+            }
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+    let reject_click = move |_| {
+        let id = reject_id.clone();
+        action_error.set(None);
+        spawn_local(async move {
+            if let Err(e) = interop::reject_lineage_job(&id).await {
+                action_error.set(Some(e));
+            }
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+    let run_click = move |_| {
+        let id = run_id.clone();
+        action_error.set(None);
+        spawn_local(async move {
+            if let Err(e) = interop::run_lineage_job(&id).await {
+                action_error.set(Some(e));
+            }
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+        schedule_reloads(reload, &[1500, 4000, 10_000]);
+    };
+    let submit_fix = move || {
+        if fix_submitting.get_untracked() {
+            return;
+        }
+        let text = fix_text.get_untracked().trim().to_string();
+        let id = retry_id.clone();
+        fix_submitting.set(true);
+        action_error.set(None);
+        spawn_local(async move {
+            if !text.is_empty() {
+                let note = format!("User clarification: {text}");
+                if let Err(e) = interop::append_lineage_note(&id, &note).await {
+                    action_error.set(Some(e));
+                }
+            }
+            if let Err(e) = interop::retry_lineage_job(&id).await {
+                action_error.set(Some(e));
+            }
+            fix_submitting.set(false);
+            fix_open.set(false);
+            fix_text.set(String::new());
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+
+    let branch = record.branch_name.clone();
+    let worktree = record.worktree_path.clone();
+    let log = record.log_path.clone();
+    let notes = record.notes.clone();
+    let iteration = record.iteration;
+    let title = record.title.clone();
+    let summary = record.summary.clone();
+    let status_label = record.status.label();
+    let created = format_time(record.created_at_unix_ms);
+
+    view! {
+        <div class="lineage-detail-inner">
+            <header class="lineage-detail-head">
+                <div>
+                    <h3 class="lineage-detail-title">{title}</h3>
+                    <div class="list-card-meta">
+                        {if iteration > 0 {
+                            format!("iteration {iteration} · {created}")
+                        } else {
+                            created
+                        }}
+                    </div>
+                </div>
+                <span class="list-card-status">{status_label}</span>
+            </header>
+
+            <p class="lineage-detail-summary">{summary}</p>
+
+            {match branch {
+                Some(b) => view! {
+                    <div class="list-card-meta"><strong>"branch: "</strong>{b}</div>
+                }.into_any(),
+                None => view! { <span></span> }.into_any(),
+            }}
+            {match worktree {
+                Some(w) => view! {
+                    <div class="list-card-meta"><strong>"worktree: "</strong><code>{w}</code></div>
+                }.into_any(),
+                None => view! { <span></span> }.into_any(),
+            }}
+            {match log {
+                Some(l) => view! {
+                    <div class="list-card-meta"><strong>"log: "</strong><code>{l}</code></div>
+                }.into_any(),
+                None => view! { <span></span> }.into_any(),
+            }}
+
+            <section class="lineage-activity">
+                <h4>{format!("Activity ({} entries)", notes.len())}</h4>
+                {if notes.is_empty() {
+                    view! {
+                        <div class="empty-state">"No activity yet."</div>
+                    }.into_any()
+                } else {
+                    view! {
+                        <ul class="lineage-activity-list">
+                            {notes.into_iter().map(|n| view! { <li>{n}</li> }).collect_view()}
+                        </ul>
+                    }.into_any()
+                }}
+            </section>
+
+            {move || {
+                if !fix_open.get() {
+                    return view! { <span></span> }.into_any();
+                }
+                let submit = submit_fix.clone();
+                view! {
+                    <div class="lineage-fix-form">
+                        <label class="lineage-fix-label">
+                            "Describe the problem or give Claude more context for the fix:"
+                        </label>
+                        <textarea
+                            class="lineage-fix-textarea"
+                            placeholder="e.g. build failed because the new command wasn't registered in invoke_handler…"
+                            prop:value=move || fix_text.get()
+                            on:input=move |ev| {
+                                let t = event_target::<web_sys::HtmlTextAreaElement>(&ev);
+                                fix_text.set(t.value());
+                            }
+                        ></textarea>
+                        <div class="lineage-fix-actions">
+                            <button
+                                class="secondary-btn"
+                                prop:disabled=move || fix_submitting.get()
+                                on:click=move |_| {
+                                    fix_open.set(false);
+                                    fix_text.set(String::new());
+                                }
+                            >
+                                "Cancel"
+                            </button>
+                            <button
+                                class="primary-btn"
+                                prop:disabled=move || fix_submitting.get()
+                                on:click=move |_| submit()
+                            >
+                                {move || if fix_submitting.get() { "Submitting…" } else { "Submit fix" }}
+                            </button>
+                        </div>
+                    </div>
+                }.into_any()
+            }}
+
+            {move || match action_error.get() {
+                Some(e) => view! {
+                    <div class="lineage-action-error" role="alert">
+                        <strong>"Action failed: "</strong>{e}
+                    </div>
+                }.into_any(),
+                None => view! { <span></span> }.into_any(),
+            }}
+
+            <div class="lineage-detail-actions">
+                <button class="secondary-btn" on:click=reject_click>"Reject"</button>
+                <button
+                    class="secondary-btn"
+                    prop:disabled=!can_retry
+                    on:click=move |_| fix_open.update(|v| *v = !*v)
+                    title="Send a clarification and re-run this iteration"
+                >
+                    "Fix"
+                </button>
+                <button
+                    class="secondary-btn"
+                    prop:disabled=!can_run
+                    on:click=run_click
+                    title="Launch the app built in this iteration's worktree"
+                >
+                    "Run"
+                </button>
+                <button
+                    class="primary-btn"
+                    prop:disabled=!can_approve
+                    on:click=approve_click
+                    title="Plan then implement the next iteration from this feedback"
+                >
+                    "Evolve"
+                </button>
+            </div>
+        </div>
+    }
+}
+
+fn format_time(ms: u64) -> String {
+    let date = js_sys::Date::new(&JsValue::from_f64(ms as f64));
+    String::from(date.to_iso_string())
+}
+
+/// Bump `reload` on a fixed interval until the component unmounts. Used by
+/// `LineagePage` so that (a) status changes from the background claude run
+/// surface without user action and (b) manual edits to `lineage_jobs/*.json`
+/// on disk are picked up without an app restart. `setInterval` keeps firing
+/// forever unless we clear it, so register an `on_cleanup` to stop when the
+/// Lineage view is unmounted.
+fn spawn_interval(reload: RwSignal<u32>, interval_ms: i32) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let cb = Closure::<dyn FnMut()>::new(move || {
+        reload.update(|v| *v = v.wrapping_add(1));
+    });
+    let handle = win
+        .set_interval_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            interval_ms,
+        )
+        .ok();
+    // The closure must outlive the interval; `forget` leaks it for the life
+    // of the page (one per LineagePage mount — bounded).
+    cb.forget();
+    on_cleanup(move || {
+        if let Some(h) = handle {
+            if let Some(win) = web_sys::window() {
+                win.clear_interval_with_handle(h);
+            }
+        }
+    });
+}
+
+/// Bump `reload` after each delay (ms). Used to surface asynchronous lineage
+/// notes (e.g. the Run button's background-thread spawn result) without
+/// requiring the user to navigate away and back.
+fn schedule_reloads(reload: RwSignal<u32>, delays_ms: &[i32]) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    for &ms in delays_ms {
+        let r = reload;
+        let cb = Closure::once_into_js(move || {
+            r.update(|v| *v = v.wrapping_add(1));
+        });
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(cb.unchecked_ref(), ms);
+    }
+}

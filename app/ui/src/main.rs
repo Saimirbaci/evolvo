@@ -2,6 +2,7 @@ mod app;
 mod canvas;
 mod feedback_panel;
 mod interop;
+mod shell;
 mod toolbar;
 mod types;
 mod voice;

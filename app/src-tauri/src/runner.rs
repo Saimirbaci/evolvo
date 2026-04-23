@@ -384,7 +384,18 @@ If your change would break any of these four surfaces in the resulting app, it i
 
 ## ONE button opens BOTH the Canvas overlay AND the Feedback panel — always
 
-This is a hard rule, not a suggestion. The host iteration zero ships a **single Feedback FAB** (`FeedbackFab` in `app/ui/src/app.rs`) bound to a **single `panel_open: RwSignal<bool>`** signal. Clicking it toggles the feedback surface open; while open, both the drawing surface (Canvas + Toolbar) and the Feedback submission panel are visible and usable together. There is never one button for "draw" and a second button for "send feedback" — they are the same action from the user's point of view.
+This is a hard rule, not a suggestion. The host iteration zero ships a **single Feedback FAB** (`FeedbackFab` in `app/ui/src/shell.rs`) bound to a **single `panel_open: RwSignal<bool>`** signal owned by the invariant shell. Clicking it toggles the feedback surface open; while open, both the drawing surface (Canvas + Toolbar) and the Feedback submission panel are visible and usable together. There is never one button for "draw" and a second button for "send feedback" — they are the same action from the user's point of view.
+
+## Where the NewApp goes — `app.rs` is yours, `shell.rs` is not
+
+The Leptos UI is split into two layers:
+
+- **`app/ui/src/shell.rs`** is the permanent Evolvo chrome: the app bar with the Lineage navigation + "Star Us" link, the Lineage review page, the single Feedback FAB, and the Canvas overlay + feedback panel composition. The shell is what guarantees the four invariants above — the FAB and overlay wrap whatever content renders inside. **`shell.rs` is invariant.** Do not delete, duplicate, or re-implement any of its pieces inside the NewApp. If the chrome genuinely needs to change, edit `shell.rs` directly and keep all four surfaces working.
+- **`app/ui/src/app.rs`** is the **NewApp content area**. When the user asks for a new app, this is where you build it: replace `HomePage` with the new app's root component (router, layout, pages, state) and add further modules alongside it. Keep `App` mounting `<Shell>` with the new content as its children. Because the shell wraps the content, every page/route of the NewApp is automatically annotatable — the Canvas overlay mounts on top of whatever `app.rs` renders when the user clicks the FAB.
+
+If your NewApp needs to react to the Canvas being open (for example, to hide copy that shouldn't appear in the submission screenshot), read `PanelOpen` from context — the shell provides it via `provide_context`. Do not re-implement the FAB or the `panel_open` signal inside `app.rs`.
+
+If you rewrite the UI stack off Leptos entirely, reproduce the same split in the replacement: a permanent shell module that owns the four invariant surfaces, and a NewApp content module mounted inside it.
 
 Rules you MUST follow when the iteration app keeps a Feedback affordance (i.e. always):
 
@@ -464,10 +475,10 @@ pub fn build_implementation_prompt(
     // it overrides the iteration-number-based latitude and forces the agent
     // back into bootstrap mode no matter how many iterations have happened.
     let work_step_4 = if is_new_app {
-        "4. **This is a `NewApp` feedback.** The user is asking you to build a NEW APP from scratch on top of the Evolvo shell. Treat the existing app code as disposable scaffolding: rename, delete, rewrite, and restructure whatever you need to produce the app the user described in the canvas + text + voice. The only things you must preserve are the four product invariants above (Feedback Overlay, Canvas per-page overlay, Inbox, Lineage pipeline) and the ability to keep iterating. Everything else — the old app's domain, pages, data model, stack choices — is up for replacement."
-    } else if iteration <= 3 {
+        "4. **This is a `NewApp` feedback.** The user is asking you to build a NEW APP from scratch on top of the Evolvo shell. Build the new app in `app/ui/src/app.rs` (and any new modules you add alongside it) mounted inside `<Shell>` — the NewApp content area is yours to rewrite freely. Do NOT touch `app/ui/src/shell.rs`: the shell (app bar, Lineage nav + page, Star Us link, Feedback FAB, Canvas overlay) is permanent and is what guarantees the four product invariants (Feedback Overlay, Canvas per-page overlay, Inbox, Lineage pipeline) survive the rewrite. Everything inside the shell — the old app's domain, pages, data model, even the choice of Leptos if you replace the whole UI stack — is up for replacement, as long as the equivalent of `<Shell>` keeps wrapping the new content and keeps those invariants reachable from every page."
+    } else if iteration <= 5 {
         "4. Make the change the user described. On this iteration you are allowed — and expected — to restructure the codebase to fit the app the user drew. Touch as much as you need; just keep the four invariants above intact."
-    } else if iteration <= 9 {
+    } else if iteration <= 10 {
         "4. Make a change that clearly resolves the feedback and moves the app toward the user's described vision. Refactor when it serves the goal; don't refactor for its own sake."
     } else {
         "4. Make the minimal, focused change that actually resolves the feedback. Do not refactor unrelated code unless the user explicitly asks for it."
