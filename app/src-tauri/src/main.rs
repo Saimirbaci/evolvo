@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use noide_desktop::commands;
-use noide_desktop::state::AppState;
+use evolvo_desktop::commands;
+use evolvo_desktop::state::AppState;
 
 fn main() {
     tauri::Builder::default()

@@ -270,7 +270,7 @@ fn sanitise_filename(name: &str) -> String {
 }
 
 pub fn default_workspace_root() -> PathBuf {
-    if let Ok(explicit) = std::env::var("NOIDE_WORKSPACE_ROOT") {
+    if let Ok(explicit) = std::env::var("EVOLVO_WORKSPACE_ROOT") {
         return PathBuf::from(explicit);
     }
     if let Some(home) = std::env::var_os("HOME") {

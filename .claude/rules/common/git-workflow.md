@@ -39,9 +39,9 @@ Every commit must leave the tree green:
 
 ```bash
 cargo check --workspace
-cargo test -p noide_desktop
-cargo clippy -p noide_desktop -- -D warnings   # if host code changed
-cargo check -p noide_ui --target wasm32-unknown-unknown   # if UI changed
+cargo test -p evolvo_desktop
+cargo clippy -p evolvo_desktop -- -D warnings   # if host code changed
+cargo check -p evolvo_ui --target wasm32-unknown-unknown   # if UI changed
 ```
 
 For UI-visible changes, also run `cargo tauri dev` once and eyeball the flow — type-check is not the same as "it works".
@@ -52,6 +52,6 @@ If a pre-commit hook fails, fix the root cause. Never bypass.
 
 ## Never commit
 
-- `~/.evolvo/noide_workspace/` contents (it's outside the repo anyway — but don't symlink it in).
+- `~/.evolvo/evolvo_workspace/` contents (it's outside the repo anyway — but don't symlink it in).
 - Real user feedback JSON. If you need a fixture, synthesize it.
 - Secrets, tokens, signed bundle certs.

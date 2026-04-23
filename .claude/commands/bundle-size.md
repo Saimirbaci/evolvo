@@ -16,7 +16,7 @@ twiggy top -n 20 dist/*.wasm
 
 If `cargo-bloat` is available, also run:
 ```bash
-cargo bloat --release --target wasm32-unknown-unknown -p noide_ui -n 20
+cargo bloat --release --target wasm32-unknown-unknown -p evolvo_ui -n 20
 ```
 
 Report:

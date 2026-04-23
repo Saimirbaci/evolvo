@@ -16,8 +16,8 @@ Also:
 After the changes, run:
 ```bash
 cargo check --workspace
-cargo test -p noide_desktop
-cargo check -p noide_ui --target wasm32-unknown-unknown
+cargo test -p evolvo_desktop
+cargo check -p evolvo_ui --target wasm32-unknown-unknown
 ```
 
 Confirm all three pass before reporting done.

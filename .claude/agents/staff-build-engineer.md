@@ -52,7 +52,7 @@ All seven must pass. If one of the last three is ignored in CI because "it's slo
 
 ### Iteration port convention
 
-Inside lineage worktrees, iteration `N` listens on `BASE_DEV_PORT + N` (base `1530`, defined in `app/src-tauri/src/runner.rs`). The runner rewrites `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in each worktree and sets `NOIDE_ITERATION_PORT` on the Run command. When you touch any of those three files, preserve the single-source `1530` literal (the rewriter does naive string replace) and honour `NOIDE_ITERATION_PORT` in any startup script you add.
+Inside lineage worktrees, iteration `N` listens on `BASE_DEV_PORT + N` (base `1530`, defined in `app/src-tauri/src/runner.rs`). The runner rewrites `app/src-tauri/tauri.conf.json`, `app/ui/Trunk.toml`, and `app/ui/scripts/trunk-dev.sh` in each worktree and sets `EVOLVO_ITERATION_PORT` on the Run command. When you touch any of those three files, preserve the single-source `1530` literal (the rewriter does naive string replace) and honour `EVOLVO_ITERATION_PORT` in any startup script you add.
 
 ---
 
@@ -83,7 +83,7 @@ Every UI dep ships to every user. Before adding one:
 
 - Every filesystem-touching test uses `tempfile::tempdir()`. No test writes to `~/.evolvo`. If one does, that's a bug — fix it, don't work around it.
 - Tests must not depend on ordering from `fs::read_dir` (it's platform-defined). Sort in the test.
-- `NOIDE_WORKSPACE_ROOT` is the knob for pointing tests/scripts at a throwaway workspace. Use it.
+- `EVOLVO_WORKSPACE_ROOT` is the knob for pointing tests/scripts at a throwaway workspace. Use it.
 
 ### 5. Bundle hygiene
 

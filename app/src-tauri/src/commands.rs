@@ -276,7 +276,7 @@ pub fn retry_lineage_job(
     }
 
     let source = runner::resolve_source_repo().ok_or_else(|| {
-        "could not locate Evolvo source repo — set NOIDE_SOURCE_REPO or run from within the repo"
+        "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
             .to_string()
     })?;
     let workspace_root = store.layout().root().to_path_buf();
@@ -301,7 +301,7 @@ pub fn retry_lineage_job(
 /// Launch the app built in a lineage job's worktree. Only valid after the
 /// job has reached a state where a worktree exists and the agent has
 /// finished writing code (see `LineageJobStatus::can_run`). The spawned
-/// process runs in the background with its own `NOIDE_WORKSPACE_ROOT` so it
+/// process runs in the background with its own `EVOLVO_WORKSPACE_ROOT` so it
 /// cannot see or mutate the host Evolvo's workspace.
 #[tauri::command]
 pub fn run_lineage_job(

@@ -25,18 +25,18 @@ Applies to both `app/src-tauri` (host, native target) and `app/ui` (WASM target)
 
 - All disk writes go through `Store` in `store.rs`. Do not spread `fs::write` calls across the crate.
 - All user-supplied filenames go through `sanitise_filename`. Path traversal is the only realistic local attack surface here — take it seriously.
-- Workspace root comes from `default_workspace_root()` (honours `NOIDE_WORKSPACE_ROOT`). Do not hardcode `~/.evolvo` anywhere else.
+- Workspace root comes from `default_workspace_root()` (honours `EVOLVO_WORKSPACE_ROOT`). Do not hardcode `~/.evolvo` anywhere else.
 
 ## Tests
 
 - Every filesystem test uses `tempfile::tempdir()` — never write to the real workspace from a test.
 - Unit tests co-locate with the module (`#[cfg(test)] mod tests`).
 - Integration tests for Tauri commands test the underlying logic (store + engine), not the `#[tauri::command]` shim (see the pattern in `commands.rs::tests::submit_feedback_stores_record_and_spawns_job`).
-- Run `cargo test -p noide_desktop` before claiming a host-side change is done.
+- Run `cargo test -p evolvo_desktop` before claiming a host-side change is done.
 
 ## Clippy / formatting
 
-- `cargo clippy -p noide_desktop -- -D warnings` must pass.
+- `cargo clippy -p evolvo_desktop -- -D warnings` must pass.
 - `cargo fmt --all` — default rustfmt, no custom config. Don't argue with the formatter.
 
 ## Dependencies

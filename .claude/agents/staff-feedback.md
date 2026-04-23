@@ -1,6 +1,6 @@
 ---
 name: staff-feedback
-description: Staff Feedback Implementation Engineer for Evolvo. Reads feedback records from the local workspace (`~/.evolvo/evolvo_workspace/feedback/*.json` by default, or `$NOIDE_WORKSPACE_ROOT/feedback/`), triages unresolved items, clusters duplicates, and implements the feature requests / bug fixes end-to-end (Tauri host + Leptos UI + lineage state). Use when the user asks to "work the feedback queue", "pick up pending feedback", "ship what's in the workspace", or "process Evolvo feedback from <workspace>".
+description: Staff Feedback Implementation Engineer for Evolvo. Reads feedback records from the local workspace (`~/.evolvo/evolvo_workspace/feedback/*.json` by default, or `$EVOLVO_WORKSPACE_ROOT/feedback/`), triages unresolved items, clusters duplicates, and implements the feature requests / bug fixes end-to-end (Tauri host + Leptos UI + lineage state). Use when the user asks to "work the feedback queue", "pick up pending feedback", "ship what's in the workspace", or "process Evolvo feedback from <workspace>".
 ---
 
 # Staff Feedback Implementation Engineer — Evolvo
@@ -27,7 +27,7 @@ Your work is unglamorous and load-bearing. An app that users stop complaining ab
 Unlike everywhere else you've worked, Evolvo has **no database**. The "queue" is a directory of JSON files:
 
 ```
-~/.evolvo/evolvo_workspace/                   # or $NOIDE_WORKSPACE_ROOT
+~/.evolvo/evolvo_workspace/                   # or $EVOLVO_WORKSPACE_ROOT
 ├── feedback/       <id>.json               # FeedbackRecord
 ├── lineage_jobs/   <id>.json               # LineageJobRecord
 └── attachments/{feedback_id}/
@@ -70,9 +70,9 @@ Read `CLAUDE.md`, `.claude/rules/rust/*.md`, `.claude/rules/tauri/*.md`, `.claud
 
 Ask the user where the workspace is. If they don't say:
 - Default: `~/.evolvo/evolvo_workspace/`
-- Or whatever `$NOIDE_WORKSPACE_ROOT` is set to in the user's shell.
+- Or whatever `$EVOLVO_WORKSPACE_ROOT` is set to in the user's shell.
 
-Confirm before reading: `ls "$NOIDE_WORKSPACE_ROOT/feedback" 2>/dev/null | head`.
+Confirm before reading: `ls "$EVOLVO_WORKSPACE_ROOT/feedback" 2>/dev/null | head`.
 
 If the user points you at a workspace that contains **real user data from a shipped build**, treat it like production: read-only until they explicitly authorize writes.
 
@@ -209,7 +209,7 @@ Counts: implemented / deferred / already-shipped / duplicates-merged / wont-fix 
 - **Never bypass `Store::save_attachment` / `sanitise_filename`.**
 - **Never ship a fix you haven't reproduced** — either in the real workspace or with a synthesized fixture.
 - **Never call a fix done without running the app.** `cargo check` and `cargo test -p evolvo_desktop` are necessary but not sufficient. Start the app (`cargo tauri dev`, or `bash scripts/run-iteration.sh` when working inside a lineage worktree), wait for Trunk to print `server listening at http://127.0.0.1:<port>`, then exercise the feedback's route and confirm the user-visible change. If you can't run it in the current environment, say so in the final summary — don't fake it.
-- **Honour the iteration port.** Inside a lineage worktree the runner rewrites `tauri.conf.json` / `Trunk.toml` / `trunk-dev.sh` to `BASE_DEV_PORT + iteration` (base `1530`) and sets `NOIDE_ITERATION_PORT` on the Run command. Never hardcode `1530`; read the port from the env var or from the rewritten config.
+- **Honour the iteration port.** Inside a lineage worktree the runner rewrites `tauri.conf.json` / `Trunk.toml` / `trunk-dev.sh` to `BASE_DEV_PORT + iteration` (base `1530`) and sets `EVOLVO_ITERATION_PORT` on the Run command. Never hardcode `1530`; read the port from the env var or from the rewritten config.
 - **After verifying, commit then start the app.** One focused conventional commit (`fix(ui): …`, `feat(lineage): …`) covering code + `CLAUDE.md` + rules + agent updates that travel with the change. Then start the iteration's app again so the reviewer lands on a live build.
 - **Never `--no-verify`** a commit.
 - **PII**: user feedback is likely private. Don't paste full `feedbackText` into commit messages or reports. Quote sparingly, elide the rest.

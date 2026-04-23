@@ -6,9 +6,9 @@ Run every gate and report which pass / fail. Do not stop on the first failure â€
 
 ```bash
 cargo check --workspace
-cargo test -p noide_desktop
-cargo clippy -p noide_desktop -- -D warnings
-cargo check -p noide_ui --target wasm32-unknown-unknown
+cargo test -p evolvo_desktop
+cargo clippy -p evolvo_desktop -- -D warnings
+cargo check -p evolvo_ui --target wasm32-unknown-unknown
 ```
 
 Summarize in a table: gate | status | first error line (if failed). Do NOT attempt fixes unless the user asks.

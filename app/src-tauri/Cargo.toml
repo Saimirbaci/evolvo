@@ -1,5 +1,5 @@
 [package]
-name = "noide_desktop"
+name = "evolvo_desktop"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,11 +7,11 @@ publish = false
 description = "Evolvo — white canvas feedback + lineage desktop app"
 
 [lib]
-name = "noide_desktop"
+name = "evolvo_desktop"
 path = "src/lib.rs"
 
 [[bin]]
-name = "noide_desktop"
+name = "evolvo_desktop"
 path = "src/main.rs"
 
 [build-dependencies]
