@@ -207,6 +207,9 @@ fn LineagePage() -> impl IntoView {
     let items: RwSignal<Option<Result<Vec<LineageJobRecord>, String>>> = RwSignal::new(None);
     let reload = RwSignal::new(0_u32);
     let selected: RwSignal<Option<String>> = RwSignal::new(None);
+    // Sort order for the sidebar list. `true` = newest first (default), which
+    // matches the user's mental model — recent work sits at the top.
+    let newest_first: RwSignal<bool> = RwSignal::new(true);
     // Error surface for action buttons. Lives at the page level (not inside
     // `LineageDetail`) so that when `items` reloads and the detail component
     // is torn down + rebuilt, the error message persists long enough for the
@@ -258,18 +261,32 @@ fn LineagePage() -> impl IntoView {
     view! {
         <div class="lineage-page">
             <aside class="lineage-sidebar">
-                <h2 class="lineage-sidebar-title">"Lineage"</h2>
+                <div class="lineage-sidebar-head">
+                    <h2 class="lineage-sidebar-title">"Lineage"</h2>
+                    <button
+                        class="lineage-sort-toggle"
+                        title="Toggle sort order by creation time"
+                        on:click=move |_| newest_first.update(|v| *v = !*v)
+                    >
+                        {move || if newest_first.get() { "Newest ↓" } else { "Oldest ↑" }}
+                    </button>
+                </div>
                 {move || match items.get() {
                     None => view! { <div class="empty-state">"Loading…"</div> }.into_any(),
                     Some(Err(e)) => view! {
                         <div class="empty-state">{format!("Failed to load: {e}")}</div>
                     }.into_any(),
-                    Some(Ok(records)) => {
+                    Some(Ok(mut records)) => {
                         if records.is_empty() {
                             view! {
                                 <div class="empty-state">"No lineage jobs yet."</div>
                             }.into_any()
                         } else {
+                            if newest_first.get() {
+                                records.sort_by(|a, b| b.created_at_unix_ms.cmp(&a.created_at_unix_ms));
+                            } else {
+                                records.sort_by(|a, b| a.created_at_unix_ms.cmp(&b.created_at_unix_ms));
+                            }
                             view! {
                                 <ul class="lineage-list">
                                     {records.into_iter().map(|r| {
@@ -283,10 +300,7 @@ fn LineagePage() -> impl IntoView {
                                                     class:active=is_active
                                                     on:click=move |_| selected.set(Some(id_for_click.clone()))
                                                 >
-                                                    <div class="lineage-list-item-head">
-                                                        <span class="lineage-list-item-title">{r.title.clone()}</span>
-                                                        <span class="list-card-status">{r.status.label()}</span>
-                                                    </div>
+                                                    <span class="lineage-list-item-title" title=r.title.clone()>{r.title.clone()}</span>
                                                     <div class="list-card-meta">
                                                         {if r.iteration > 0 {
                                                             format!("iter {} · {}", r.iteration, format_time(r.created_at_unix_ms))
@@ -294,6 +308,7 @@ fn LineagePage() -> impl IntoView {
                                                             format_time(r.created_at_unix_ms)
                                                         }}
                                                     </div>
+                                                    <span class="list-card-status">{r.status.label()}</span>
                                                 </button>
                                             </li>
                                         }
@@ -336,10 +351,22 @@ fn LineageDetail(
     let can_approve = record.status.can_approve();
     let can_retry = record.status.can_retry();
     let can_run = record.status.can_run() && record.worktree_path.is_some();
+    // Resume is offered when a multi-stage pipeline has progress on disk
+    // (some stages are tracked) AND at least one of them didn't finish
+    // green. Needs a worktree to pick up where Claude left off.
+    let can_resume = record.worktree_path.is_some()
+        && !record.stages.is_empty()
+        && record.stages.iter().any(|s| {
+            !matches!(
+                s.status,
+                crate::types::StageStatus::Green | crate::types::StageStatus::Skipped
+            )
+        });
     let approve_id = record.id.clone();
     let reject_id = record.id.clone();
     let retry_id = record.id.clone();
     let run_id = record.id.clone();
+    let resume_id = record.id.clone();
 
     // Inline "Fix" clarification editor state.
     let fix_open: RwSignal<bool> = RwSignal::new(false);
@@ -376,6 +403,19 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
         schedule_reloads(reload, &[1500, 4000, 10_000]);
+    };
+    let resume_click = move |_| {
+        let id = resume_id.clone();
+        action_error.set(None);
+        spawn_local(async move {
+            if let Err(e) = interop::resume_lineage_job(&id).await {
+                action_error.set(Some(e));
+            }
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+        // The pipeline runs on a background thread; nudge the UI to pick up
+        // stage transitions as Claude advances.
+        schedule_reloads(reload, &[2000, 6000, 15_000, 30_000]);
     };
     let submit_fix = move || {
         if fix_submitting.get_untracked() {
@@ -560,6 +600,14 @@ fn LineageDetail(
                     title="Send a clarification and re-run this iteration"
                 >
                     "Fix"
+                </button>
+                <button
+                    class="secondary-btn"
+                    prop:disabled=!can_resume
+                    on:click=resume_click
+                    title="Pick up the multi-stage pipeline from the first non-green stage, reusing the existing worktree and plan.json"
+                >
+                    "Resume"
                 </button>
                 <button
                     class="secondary-btn"

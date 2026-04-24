@@ -232,6 +232,34 @@ pub fn tail_stage_log(
     Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
+/// Re-enter the multi-stage pipeline for a job whose previous run
+/// failed or was interrupted. Reuses the existing worktree and plan.json;
+/// stages already green (or whose output is already recorded in
+/// `plan.stage`) are skipped — only the first non-green stage is
+/// re-dispatched to Claude. Returns the refreshed job record.
+#[tauri::command]
+pub fn resume_lineage_job(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<LineageJobRecord, String> {
+    let store = state.store();
+    let engine = LineageEngine::new(&store);
+
+    let job = store
+        .load_lineage_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
+
+    runner::resume_pipeline(store.clone(), job.id.clone())?;
+
+    // Surface the status flip immediately — `resume_pipeline` also sets
+    // `Implementing` on the background thread, but the caller wants the
+    // updated record to render *now*, not after the first stage finishes.
+    engine
+        .force_status(&job.id, LineageJobStatus::Implementing)
+        .map_err(store_error)
+}
+
 /// "Advance" button entry point. Behaviour depends on the job's current
 /// status:
 /// - `Pending` → fork the source repo into a lineage worktree, spawn

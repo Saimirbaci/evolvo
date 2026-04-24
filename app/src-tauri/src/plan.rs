@@ -389,22 +389,37 @@ pub struct PersistenceSmoke {
     pub expected_directory: String,
 }
 
+/// History entry recording one event in a stage's lifecycle (dispatch, write,
+/// validation outcome, free-form note). Every field is `#[serde(default)]`
+/// because this block is the most-drifted part of the plan when Claude writes
+/// it by hand: the golden example shows `{atUnixMs, stage, kind, message}`
+/// but sessions routinely produce `{stage, note}` or forget the timestamp.
+/// We tolerate any of those shapes so a single sloppy entry never poisons
+/// deserialisation of the whole plan — the validators still check *semantic*
+/// completeness downstream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
+    #[serde(default)]
     pub at_unix_ms: u64,
+    #[serde(default)]
     pub stage: String,
+    #[serde(default)]
     pub kind: HistoryKind,
+    /// Accept `"note"` as an alias so Claude's common drift
+    /// (`{"stage": "...", "note": "..."}`) still round-trips cleanly.
+    #[serde(default, alias = "note")]
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryKind {
     Started,
     Wrote,
     Validated,
     Rejected,
+    #[default]
     Note,
 }
 
@@ -838,6 +853,57 @@ mod tests {
         assert_eq!(back.history.len(), 1);
         assert_eq!(back.history[0].kind, HistoryKind::Started);
         assert_eq!(back.history[0].message, "hello");
+    }
+
+    #[test]
+    fn history_entry_tolerates_claude_drift() {
+        // The shapes Claude actually produces in the wild (and which broke
+        // one job before this regression test): `note` instead of `message`,
+        // `kind` missing, `atUnixMs` missing.
+        let shapes = [
+            // Golden shape.
+            r#"{"atUnixMs": 42, "stage": "backend_plan", "kind": "validated", "message": "ok"}"#,
+            // `note` alias for `message`.
+            r#"{"atUnixMs": 42, "stage": "backend_plan", "kind": "note", "note": "ok"}"#,
+            // Missing `kind`.
+            r#"{"atUnixMs": 42, "stage": "backend_plan", "message": "ok"}"#,
+            // Missing `atUnixMs`.
+            r#"{"stage": "backend_plan", "kind": "note", "message": "ok"}"#,
+            // All optional fields missing — still round-trips as a Note.
+            r#"{"stage": "backend_plan"}"#,
+            // Even the stage can be absent without aborting the whole plan.
+            r#"{}"#,
+        ];
+        for (i, raw) in shapes.iter().enumerate() {
+            let entry: HistoryEntry = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("shape {i} failed to decode: {raw}: {e}"));
+            // Just confirm it parsed without panic; we don't care about
+            // field-level defaults — the validator is what enforces semantics.
+            let _ = entry;
+        }
+    }
+
+    #[test]
+    fn plan_with_drifted_history_still_loads() {
+        // Reproduces the job-1776948054961 failure: BackendPlan wrote a
+        // history entry with `note` instead of `message` and no `kind`.
+        // Before the fix, this aborted the whole plan deserialisation.
+        let dir = tempdir().unwrap();
+        let raw = r#"{
+            "schemaVersion": 1,
+            "app": {"name": "Demo"},
+            "stage": "backend_planned",
+            "canvas": {"route": "/"},
+            "history": [
+                {"stage": "backend_plan", "atUnixMs": 1, "note": "7 entities, 18 commands planned"}
+            ]
+        }"#;
+        std::fs::write(dir.path().join(PLAN_FILENAME), raw).unwrap();
+        let plan = load_plan(dir.path()).unwrap().unwrap();
+        assert_eq!(plan.stage, PlanStage::BackendPlanned);
+        assert_eq!(plan.history.len(), 1);
+        assert_eq!(plan.history[0].message, "7 entities, 18 commands planned");
+        assert_eq!(plan.history[0].kind, HistoryKind::Note);
     }
 
     #[test]

@@ -314,7 +314,17 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
     r.finalize()
 }
 
-pub fn validate_frontend_impl(plan: &IterationPlan, worktree: &Path) -> StageReport {
+/// Minimum bytes of new CSS the FrontendImpl stage must add on top of the
+/// snapshot taken at pipeline start. 50 bytes is a loose floor — it rejects
+/// "touched the file but added nothing" and "added one empty selector" while
+/// leaving room for legitimately-small redesigns that mostly reuse classes.
+pub const STYLES_MIN_GROWTH_BYTES: u64 = 50;
+
+pub fn validate_frontend_impl(
+    plan: &IterationPlan,
+    worktree: &Path,
+    job_dir: &Path,
+) -> StageReport {
     let mut r = StageReport::new("frontend_impl");
     let interop_rs = read(&worktree.join("app/ui/src/interop.rs"));
     let app_rs = read(&worktree.join("app/ui/src/app.rs"));
@@ -345,6 +355,47 @@ pub fn validate_frontend_impl(plan: &IterationPlan, worktree: &Path) -> StageRep
         !has_stub_smell(&app_rs),
         "grep for TODO / unimplemented! / todo!()",
     );
+
+    // styles.css delta gate — the FrontendImpl stage must *add* CSS for the
+    // NewApp's new components / routes. A previous iteration shipped a
+    // behaviourally-correct app with zero styling because the model never
+    // touched `app/ui/styles.css`. The snapshot taken at pipeline start lives
+    // at `<job_dir>/inputs/styles.baseline.css`; we require the current file
+    // to exist and to have grown by at least `STYLES_MIN_GROWTH_BYTES`.
+    let styles_path = worktree.join("app/ui/styles.css");
+    let baseline_path = job_dir
+        .join("inputs")
+        .join(crate::stages::STYLES_BASELINE_FILENAME);
+    let styles_len = std::fs::metadata(&styles_path).map(|m| m.len()).ok();
+    let baseline_len = std::fs::metadata(&baseline_path).map(|m| m.len()).ok();
+    r.push(
+        "app/ui/styles.css exists",
+        styles_len.is_some(),
+        styles_path.display().to_string(),
+    );
+    match (styles_len, baseline_len) {
+        (Some(now), Some(base)) => {
+            let grew_by = now.saturating_sub(base);
+            r.push(
+                "app/ui/styles.css grew vs baseline",
+                grew_by >= STYLES_MIN_GROWTH_BYTES,
+                format!(
+                    "baseline={}B, current={}B, delta={}B (min {}B)",
+                    base, now, grew_by, STYLES_MIN_GROWTH_BYTES
+                ),
+            );
+        }
+        (Some(_), None) => {
+            // No baseline means the pipeline was launched before this gate
+            // existed; skip the delta check rather than failing legacy jobs.
+            r.push(
+                "app/ui/styles.css grew vs baseline",
+                true,
+                "no baseline snapshot — skipped",
+            );
+        }
+        _ => { /* first check already reported the missing file */ }
+    }
 
     match run_cargo(
         worktree,
@@ -655,6 +706,98 @@ mod tests {
         let r = r.finalize();
         assert!(r.passed);
         assert!(r.headline.contains("passed"));
+    }
+
+    #[test]
+    fn frontend_impl_rejects_untouched_styles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let ui_src = worktree.join("app/ui/src");
+        std::fs::create_dir_all(&ui_src).unwrap();
+        std::fs::write(ui_src.join("interop.rs"), "").unwrap();
+        std::fs::write(ui_src.join("app.rs"), "fn Home() {}\n").unwrap();
+
+        let styles_path = worktree.join("app/ui/styles.css");
+        let original = "body { color: black; }\n".repeat(20);
+        std::fs::create_dir_all(styles_path.parent().unwrap()).unwrap();
+        std::fs::write(&styles_path, &original).unwrap();
+
+        let inputs = job_dir.join("inputs");
+        std::fs::create_dir_all(&inputs).unwrap();
+        std::fs::write(
+            inputs.join(crate::stages::STYLES_BASELINE_FILENAME),
+            &original,
+        )
+        .unwrap();
+
+        let mut plan = seed_plan();
+        plan.frontend.components.push(crate::plan::ComponentPlan {
+            name: "Home".into(),
+            module: "app.rs".into(),
+            uses_commands: vec![],
+            summary: "".into(),
+            motivated_by_regions: vec![],
+        });
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let styles_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "app/ui/styles.css grew vs baseline")
+            .expect("styles growth check present");
+        assert!(
+            !styles_check.passed,
+            "untouched styles.css must fail the delta gate: {:?}",
+            styles_check
+        );
+    }
+
+    #[test]
+    fn frontend_impl_accepts_grown_styles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let ui_src = worktree.join("app/ui/src");
+        std::fs::create_dir_all(&ui_src).unwrap();
+        std::fs::write(ui_src.join("interop.rs"), "").unwrap();
+        std::fs::write(ui_src.join("app.rs"), "fn Home() {}\n").unwrap();
+
+        let styles_path = worktree.join("app/ui/styles.css");
+        let baseline = "body { color: black; }\n".to_string();
+        let current = format!(
+            "{}\n.home-card {{ padding: 16px; border-radius: 8px; background: #fff; }}\n",
+            baseline
+        );
+        std::fs::create_dir_all(styles_path.parent().unwrap()).unwrap();
+        std::fs::write(&styles_path, &current).unwrap();
+
+        let inputs = job_dir.join("inputs");
+        std::fs::create_dir_all(&inputs).unwrap();
+        std::fs::write(
+            inputs.join(crate::stages::STYLES_BASELINE_FILENAME),
+            &baseline,
+        )
+        .unwrap();
+
+        let mut plan = seed_plan();
+        plan.frontend.components.push(crate::plan::ComponentPlan {
+            name: "Home".into(),
+            module: "app.rs".into(),
+            uses_commands: vec![],
+            summary: "".into(),
+            motivated_by_regions: vec![],
+        });
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let styles_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "app/ui/styles.css grew vs baseline")
+            .expect("styles growth check present");
+        assert!(
+            styles_check.passed,
+            "grown styles.css must pass the delta gate: {:?}",
+            styles_check
+        );
     }
 
     #[test]

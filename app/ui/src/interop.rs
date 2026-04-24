@@ -152,3 +152,10 @@ pub async fn tail_stage_log(id: &str, stage: &str, max_bytes: Option<usize>) -> 
     )
     .await
 }
+
+/// Re-enter the multi-stage pipeline for a failed/interrupted job.
+/// Reuses the existing worktree and plan.json; stages already persisted
+/// in `plan.stage` are re-validated without re-invoking Claude.
+pub async fn resume_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
+    invoke_command_with_args("resume_lineage_job", &IdArg { id }).await
+}

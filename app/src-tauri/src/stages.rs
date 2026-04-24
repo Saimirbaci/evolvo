@@ -136,6 +136,34 @@ fn stage_annotations(
     Ok(Some(dest))
 }
 
+/// File name of the styles.css snapshot stashed under the job's `inputs/`
+/// dir at pipeline start. `validate_frontend_impl` compares the current
+/// `app/ui/styles.css` against this baseline to prove that the FrontendImpl
+/// stage actually added CSS rules for the NewApp components (a regression
+/// Claude has shipped more than once — a behaviourally-correct but
+/// unstyled app).
+pub const STYLES_BASELINE_FILENAME: &str = "styles.baseline.css";
+
+/// Copy `<worktree>/app/ui/styles.css` into
+/// `<job_dir>/inputs/styles.baseline.css` the first time the pipeline runs
+/// in this worktree. Idempotent — if the snapshot already exists (resume
+/// path) the existing baseline is kept so size comparisons stay stable
+/// across retries.
+pub fn snapshot_styles_baseline(worktree: &Path, job_dir: &Path) -> std::io::Result<()> {
+    let src = worktree.join("app/ui/styles.css");
+    if !src.exists() {
+        return Ok(());
+    }
+    let inputs_dir = job_dir.join("inputs");
+    std::fs::create_dir_all(&inputs_dir)?;
+    let dst = inputs_dir.join(STYLES_BASELINE_FILENAME);
+    if dst.exists() {
+        return Ok(());
+    }
+    std::fs::copy(&src, &dst)?;
+    Ok(())
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
@@ -165,10 +193,52 @@ fn derive_app_name(text: &str) -> String {
     }
 }
 
+/// Ordinal used to decide whether a stage's work is already on disk (i.e. the
+/// planner or implementer already wrote its section of the plan in a previous
+/// run). `Failed` and `Seeded` always resolve to zero so resuming those
+/// restarts from `BackendPlan`.
+fn plan_stage_ordinal(s: PlanStage) -> u32 {
+    match s {
+        PlanStage::Seeded | PlanStage::Failed => 0,
+        PlanStage::BackendPlanned => 1,
+        PlanStage::BackendImplemented => 2,
+        PlanStage::FrontendPlanned => 3,
+        PlanStage::FrontendImplemented => 4,
+        PlanStage::E2EPlanned => 5,
+        PlanStage::E2EImplemented => 6,
+        PlanStage::Completed => 7,
+    }
+}
+
+fn stage_completion_ordinal(k: StageKind) -> u32 {
+    match k {
+        StageKind::BackendPlan => 1,
+        StageKind::BackendImpl => 2,
+        StageKind::FrontendPlan => 3,
+        StageKind::FrontendImpl => 4,
+        StageKind::E2EPlan => 5,
+        StageKind::E2EImpl => 6,
+        StageKind::FinalReview => 7,
+    }
+}
+
+/// True iff `plan.stage` indicates this `stage`'s artefacts are already
+/// persisted (so resuming can skip the Claude dispatch and go straight to
+/// the validator).
+fn stage_already_done(plan_stage: PlanStage, stage: StageKind) -> bool {
+    plan_stage_ordinal(plan_stage) >= stage_completion_ordinal(stage)
+}
+
 /// Run one stage end-to-end: flip to Running, dispatch, reload the plan,
 /// run the validator, and persist the resulting `StageReport` on the job.
 /// Returns `Ok(true)` if the stage passed, `Ok(false)` if the validator
 /// rejected it, `Err(_)` on I/O or dispatcher errors.
+///
+/// **Resume behaviour:** if `plan.stage` on disk says this stage's output is
+/// already written (e.g. `BackendPlanned` for the `BackendPlan` stage), the
+/// Claude dispatch is skipped and the validator runs against the existing
+/// plan. This makes re-running the pipeline idempotent — useful after a
+/// deserialisation hiccup or transient dispatcher failure.
 pub fn run_stage<D: StageDispatcher>(
     store: &Store,
     engine: &LineageEngine<'_>,
@@ -178,58 +248,90 @@ pub fn run_stage<D: StageDispatcher>(
     job_dir: &Path,
     job_id: &str,
 ) -> Result<bool, String> {
-    engine
-        .update_stage(job_id, stage, |s| {
-            s.status = StageStatus::Running;
-            s.headline = Some(format!("running {}", stage.slug()));
-        })
-        .map_err(|e| format!("mark stage running: {e}"))?;
-
-    let plan_path = job_dir.join(crate::plan::PLAN_FILENAME);
-    let canvas_png = load_plan(job_dir)
+    let existing_plan_stage = load_plan(job_dir)
         .ok()
         .flatten()
-        .and_then(|p| p.canvas.png_path.map(PathBuf::from));
+        .map(|p| p.stage)
+        .unwrap_or(PlanStage::Seeded);
+    let resume_skip = stage_already_done(existing_plan_stage, stage);
 
-    let dispatch = StageDispatch {
-        stage,
-        worktree,
-        job_dir,
-        plan_path,
-        canvas_png,
-        job_id,
-    };
-    let log_path = dispatcher.dispatch(dispatch).map_err(|e| {
-        let _ = engine.update_stage(job_id, stage, |s| {
-            s.status = StageStatus::Failed;
-            s.headline = Some(format!("dispatcher error: {e}"));
-        });
-        e
-    })?;
+    if resume_skip {
+        let _ = engine.append_note(
+            job_id,
+            &format!(
+                "resume: plan.stage={} — skipping Claude dispatch for {} and re-validating existing artifacts",
+                existing_plan_stage.label(),
+                stage.slug()
+            ),
+        );
+        engine
+            .update_stage(job_id, stage, |s| {
+                s.status = StageStatus::Validating;
+                s.headline = Some(format!(
+                    "resumed — re-validating existing {} output",
+                    stage.slug()
+                ));
+            })
+            .map_err(|e| format!("mark validating (resume): {e}"))?;
+    } else {
+        engine
+            .update_stage(job_id, stage, |s| {
+                s.status = StageStatus::Running;
+                s.headline = Some(format!("running {}", stage.slug()));
+            })
+            .map_err(|e| format!("mark stage running: {e}"))?;
 
-    engine
-        .update_stage(job_id, stage, |s| {
-            s.status = StageStatus::Validating;
-            s.log_path = Some(log_path.display().to_string());
-        })
-        .map_err(|e| format!("mark validating: {e}"))?;
+        let plan_path = job_dir.join(crate::plan::PLAN_FILENAME);
+        let canvas_png = load_plan(job_dir)
+            .ok()
+            .flatten()
+            .and_then(|p| p.canvas.png_path.map(PathBuf::from));
+
+        let dispatch = StageDispatch {
+            stage,
+            worktree,
+            job_dir,
+            plan_path,
+            canvas_png,
+            job_id,
+        };
+        let log_path = dispatcher.dispatch(dispatch).map_err(|e| {
+            let _ = engine.update_stage(job_id, stage, |s| {
+                s.status = StageStatus::Failed;
+                s.headline = Some(format!("dispatcher error: {e}"));
+            });
+            e
+        })?;
+
+        engine
+            .update_stage(job_id, stage, |s| {
+                s.status = StageStatus::Validating;
+                s.log_path = Some(log_path.display().to_string());
+            })
+            .map_err(|e| format!("mark validating: {e}"))?;
+    }
 
     let plan = load_plan(job_dir)
         .map_err(|e| format!("reload plan: {e}"))?
         .ok_or_else(|| "plan.json missing after stage ran".to_string())?;
 
-    let report = run_validator(stage, &plan, worktree);
+    let report = run_validator(stage, &plan, worktree, job_dir);
     persist_stage_outcome(store, engine, job_id, job_dir, stage, &report)?;
     Ok(report.passed)
 }
 
-fn run_validator(stage: StageKind, plan: &IterationPlan, worktree: &Path) -> StageReport {
+fn run_validator(
+    stage: StageKind,
+    plan: &IterationPlan,
+    worktree: &Path,
+    job_dir: &Path,
+) -> StageReport {
     match stage {
         StageKind::BackendPlan => validate_backend_plan(plan),
         StageKind::FrontendPlan => validate_frontend_plan(plan),
         StageKind::E2EPlan => validate_e2e_plan(plan),
         StageKind::BackendImpl => validate_backend_impl(plan, worktree),
-        StageKind::FrontendImpl => validate_frontend_impl(plan, worktree),
+        StageKind::FrontendImpl => validate_frontend_impl(plan, worktree, job_dir),
         StageKind::E2EImpl => validate_e2e_impl(plan, worktree),
         StageKind::FinalReview => validate_final(plan),
     }
@@ -375,5 +477,31 @@ mod tests {
         assert_eq!(derive_app_name("Budget Tracker. With transactions."), "Budget Tracker");
         let long = "x".repeat(100);
         assert_eq!(derive_app_name(&long).chars().count(), 48);
+    }
+
+    #[test]
+    fn stage_already_done_respects_plan_stage_ordinal() {
+        use PlanStage::*;
+        use StageKind::*;
+        // Fresh plan: nothing is done.
+        for s in [BackendPlan, BackendImpl, FrontendPlan, FinalReview] {
+            assert!(!stage_already_done(Seeded, s));
+            assert!(!stage_already_done(Failed, s));
+        }
+        // Backend planned: only BackendPlan is done.
+        assert!(stage_already_done(BackendPlanned, BackendPlan));
+        assert!(!stage_already_done(BackendPlanned, BackendImpl));
+        assert!(!stage_already_done(BackendPlanned, FrontendPlan));
+        // Frontend implemented: everything through FrontendImpl is done.
+        assert!(stage_already_done(FrontendImplemented, BackendPlan));
+        assert!(stage_already_done(FrontendImplemented, BackendImpl));
+        assert!(stage_already_done(FrontendImplemented, FrontendPlan));
+        assert!(stage_already_done(FrontendImplemented, FrontendImpl));
+        assert!(!stage_already_done(FrontendImplemented, E2EPlan));
+        assert!(!stage_already_done(FrontendImplemented, FinalReview));
+        // Completed: every stage is done.
+        for s in [BackendPlan, BackendImpl, FrontendPlan, FrontendImpl, E2EPlan, E2EImpl, FinalReview] {
+            assert!(stage_already_done(Completed, s), "stage {s:?} should be done when plan Completed");
+        }
     }
 }

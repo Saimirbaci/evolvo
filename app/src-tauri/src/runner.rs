@@ -1153,6 +1153,13 @@ pub fn launch_pipeline(
             return;
         }
 
+        if let Err(e) = crate::stages::snapshot_styles_baseline(&prepared.worktree, &job_dir) {
+            let _ = engine.append_note(
+                &job_id,
+                &format!("pipeline: styles.css baseline snapshot failed — {e} (continuing; delta gate will be skipped)"),
+            );
+        }
+
         let _ = engine.append_note(
             &job_id,
             &format!(
@@ -1213,6 +1220,117 @@ pub fn launch_pipeline(
 pub fn is_multi_stage_candidate(feedback: &FeedbackRecord) -> bool {
     matches!(feedback.feedback_type, crate::types::FeedbackType::NewApp)
         && (feedback.screenshot_filename.is_some() || !feedback.annotations.is_empty())
+}
+
+/// Resume an interrupted multi-stage pipeline. Unlike `launch_pipeline`,
+/// this does NOT create a new worktree or rewrite the port — it reuses the
+/// worktree already on disk at `job.worktree_path` and re-enters the
+/// pipeline. `run_stage` consults `plan.stage` and skips dispatch for
+/// stages whose output is already persisted, so the net effect is: retry
+/// the first stage that did not reach `Green` last time.
+pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
+    let job = store
+        .load_lineage_job(&job_id)
+        .map_err(|e| format!("load job: {e}"))?
+        .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+
+    let feedback = store
+        .load_feedback(&job.feedback_id)
+        .map_err(|e| format!("load feedback: {e}"))?
+        .ok_or_else(|| format!("feedback {} not found for job {job_id}", job.feedback_id))?;
+
+    let worktree = job
+        .worktree_path
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or_else(|| "job has no worktree_path — cannot resume; retry the job instead".to_string())?;
+
+    if !worktree.exists() {
+        return Err(format!(
+            "worktree {} no longer exists — retry the job instead of resuming",
+            worktree.display()
+        ));
+    }
+
+    let root = store.layout().root().to_path_buf();
+    let job_dir = job_workspace_dir(&root, &job_id);
+    if !job_dir.join(crate::plan::PLAN_FILENAME).exists() {
+        return Err(format!(
+            "no plan.json under {} — nothing to resume",
+            job_dir.display()
+        ));
+    }
+
+    std::thread::spawn(move || {
+        let engine = LineageEngine::new(&store);
+        let _ = engine.append_note(
+            &job_id,
+            &format!(
+                "resume: re-entering pipeline in worktree {} — stages already green will be skipped",
+                worktree.display()
+            ),
+        );
+        let _ = engine.force_status(&job_id, LineageJobStatus::Implementing);
+
+        // Seed is idempotent: returns the existing plan when one is on disk.
+        if let Err(e) =
+            crate::stages::seed_plan_from_feedback(&store, &feedback, &job_id, &job_dir, job.iteration)
+        {
+            let _ = engine.append_note(&job_id, &format!("resume: seed plan failed — {e}"));
+            let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+            return;
+        }
+
+        // Idempotent: keeps the existing baseline when one is already on disk
+        // so resume doesn't re-capture a post-mutation styles.css as the
+        // "baseline".
+        if let Err(e) = crate::stages::snapshot_styles_baseline(&worktree, &job_dir) {
+            let _ = engine.append_note(
+                &job_id,
+                &format!("resume: styles.css baseline snapshot failed — {e} (continuing)"),
+            );
+        }
+
+        let dispatcher = ClaudeStageDispatcher;
+        match crate::stages::run_pipeline(
+            &store,
+            &engine,
+            &dispatcher,
+            &worktree,
+            &job_dir,
+            &job_id,
+        ) {
+            Ok(stages) => {
+                let all_green = stages.iter().all(|s| {
+                    matches!(
+                        s.status,
+                        crate::types::StageStatus::Green | crate::types::StageStatus::Skipped
+                    )
+                });
+                if all_green {
+                    let _ =
+                        engine.append_note(&job_id, "resume: all stages green — marking build ready");
+                    let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
+                } else {
+                    let first_red = stages
+                        .iter()
+                        .find(|s| matches!(s.status, crate::types::StageStatus::Failed))
+                        .map(|s| s.kind.slug())
+                        .unwrap_or("<unknown>");
+                    let _ = engine.append_note(
+                        &job_id,
+                        &format!("resume: stopped at {first_red} — marking failed"),
+                    );
+                    let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                }
+            }
+            Err(e) => {
+                let _ = engine.append_note(&job_id, &format!("resume: dispatcher error — {e}"));
+                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+            }
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]

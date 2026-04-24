@@ -24,6 +24,11 @@ Build the UI described in `plan.frontend` inside the worktree at
   cluster. Declare them in `app/ui/src/main.rs` or `app.rs` (whichever
   already hosts the module tree).
 - `app/ui/src/types.rs` — UI mirrors of any new wire types from the host.
+- **`app/ui/styles.css`** — Trunk bundles this single stylesheet. Every new
+  route/component you introduce MUST have matching CSS here: layout,
+  spacing, typography, focus states. An unstyled NewApp is a regression —
+  previous iterations shipped correct behaviour on a blank-white page and
+  it was unshippable. Add rules, do not remove existing shell/canvas CSS.
 
 ## Must NOT touch
 
@@ -43,6 +48,11 @@ Build the UI described in `plan.frontend` inside the worktree at
 - **Accessibility.** Icon-only buttons get `aria-label` + `title`.
 - **Feature list every web-sys type you reach for** in
   `app/ui/Cargo.toml`.
+- **Styling is not optional.** The validator snapshots `app/ui/styles.css`
+  at pipeline start and requires the file to grow by at least 50 bytes
+  before this stage passes. Write real CSS — class selectors used in
+  `app.rs`, layout, readable typography. A growth of exactly 0 bytes (you
+  never edited the file) fails the stage.
 
 ## Validation this stage will face
 
@@ -53,6 +63,8 @@ Build the UI described in `plan.frontend` inside the worktree at
 - For every component `name`, some `.rs` file under `app/ui/src/` contains
   `fn <name>`.
 - No stub smells in `app.rs`.
+- `app/ui/styles.css` exists and has grown by ≥ 50 bytes vs the snapshot
+  taken at pipeline start.
 - `cargo check -p evolvo_ui --target wasm32-unknown-unknown` exits 0.
 
 Run the check yourself before exiting.
