@@ -25,17 +25,23 @@
 //! 3. Walk up from the process CWD using the same check.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs as unix_fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::agent::{backend_for, AgentBackend};
 use crate::lineage::LineageEngine;
 use crate::store::{Store, StoreError};
-use crate::types::{FeedbackRecord, LineageJobRecord, LineageJobStatus};
+use crate::types::{AgentKind, FeedbackRecord, LineageJobRecord, LineageJobStatus};
 
 const SANDBOX_WORKSPACES_DIR: &str = "lineage_workspaces";
 const WORKTREE_DIR: &str = "worktree";
 const INPUTS_DIR: &str = "inputs";
+/// Default agent log filename. Retained for compatibility with tests /
+/// callers that refer to the historical Claude-only path; the runtime path
+/// is computed from `AgentBackend::log_filename`.
 const LOG_FILE: &str = "claude.log";
 const PROMPT_FILE: &str = "prompt.md";
 const METADATA_FILE: &str = "run.json";
@@ -115,8 +121,62 @@ pub fn inputs_path(workspace_root: &Path, job_id: &str) -> PathBuf {
     job_workspace_dir(workspace_root, job_id).join(INPUTS_DIR)
 }
 
+/// Legacy Claude-only log path. Kept for any external caller that still
+/// expects the `claude.log` filename; new code should prefer
+/// [`agent_log_path`] so each backend gets its own transcript filename.
 pub fn log_path(workspace_root: &Path, job_id: &str) -> PathBuf {
     job_workspace_dir(workspace_root, job_id).join(LOG_FILE)
+}
+
+/// Per-backend log path. The filename comes from the backend itself
+/// (`claude.log`, `codex.log`, `gemini.log`, `opencode.log`) so a single
+/// lineage workspace can host retries across different agents without
+/// clobbering the transcript.
+pub fn agent_log_path(workspace_root: &Path, job_id: &str, agent: AgentKind) -> PathBuf {
+    let filename = backend_for(agent).log_filename();
+    job_workspace_dir(workspace_root, job_id).join(filename)
+}
+
+/// Materialise the worktree-root project guide files an agent expects
+/// (`AGENTS.md` for Codex/OpenCode, `GEMINI.md` for Gemini, etc.) by
+/// symlinking them to the repo's existing `CLAUDE.md`. Best-effort: if a
+/// file with the same name already exists we leave it alone, and if the
+/// symlink syscall isn't available we fall back to `fs::copy`.
+///
+/// This keeps the four agents discovering the same canonical project
+/// context without forcing the repo to carry four duplicate copies.
+fn materialise_context_files(worktree: &Path, backend: &dyn AgentBackend) -> Vec<PathBuf> {
+    let mut created = Vec::new();
+    let source = worktree.join("CLAUDE.md");
+    if !source.exists() {
+        return created;
+    }
+    for rel in backend.context_files() {
+        // Only materialise top-level file aliases — skip directories like
+        // `.claude/agents` and other already-present files.
+        if rel.contains('/') {
+            continue;
+        }
+        if *rel == "CLAUDE.md" {
+            continue; // already the source
+        }
+        let dest = worktree.join(rel);
+        if dest.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        let linked = unix_fs::symlink(&source, &dest).is_ok();
+        #[cfg(not(unix))]
+        let linked = false;
+        if linked {
+            created.push(dest);
+            continue;
+        }
+        if fs::copy(&source, &dest).is_ok() {
+            created.push(dest);
+        }
+    }
+    created
 }
 
 pub fn prompt_path(workspace_root: &Path, job_id: &str) -> PathBuf {
@@ -523,6 +583,29 @@ pub fn build_implementation_prompt(
     attachments: &[StagedAttachment],
     log_file: &Path,
 ) -> String {
+    // Keep the historical signature green; callers that don't care about the
+    // agent get ClaudeCode phrasing, which is still a valid instruction for
+    // any CLI (they all recognise "read the project guide" regardless).
+    build_implementation_prompt_for(
+        feedback,
+        job,
+        attachments,
+        log_file,
+        AgentKind::ClaudeCode,
+    )
+}
+
+/// Agent-aware prompt builder. Substitutes `{agent_label}` and
+/// `{agent_context_files}` so the same template nudges Codex / Gemini /
+/// OpenCode to read `AGENTS.md` / `GEMINI.md` while keeping Claude on
+/// `CLAUDE.md`.
+pub fn build_implementation_prompt_for(
+    feedback: &FeedbackRecord,
+    job: &LineageJobRecord,
+    attachments: &[StagedAttachment],
+    log_file: &Path,
+    agent: AgentKind,
+) -> String {
     let iteration = if job.iteration == 0 { 1 } else { job.iteration };
     let is_new_app = matches!(feedback.feedback_type, crate::types::FeedbackType::NewApp);
     let guidance = iteration_guidance(iteration);
@@ -570,6 +653,8 @@ pub fn build_implementation_prompt(
     };
 
     let template = load_prompt("implementation.md", EMBEDDED_IMPLEMENTATION);
+    let backend = backend_for(agent);
+    let context_files = backend.context_files().to_vec().join(", ");
     template
         .replace("{guidance}", &guidance)
         .replace("{new_app_banner}", &new_app_banner)
@@ -584,6 +669,8 @@ pub fn build_implementation_prompt(
         .replace("{attachments_section}", &attachments_section)
         .replace("{work_step_4}", &work_step_4)
         .replace("{log_file}", &log_file.display().to_string())
+        .replace("{agent_label}", agent.label())
+        .replace("{agent_context_files}", &context_files)
 }
 
 /// Returned synchronously from `prepare_run` so the caller can persist the
@@ -600,13 +687,16 @@ pub struct PreparedRun {
 }
 
 /// Build the worktree, stage attachments, and write the prompt + metadata
-/// files. Does NOT launch claude — that happens in `launch_claude`, so the
-/// caller has the chance to persist artifact paths onto the job record
-/// first.
+/// files. Does NOT launch the agent — that happens in
+/// [`launch_agent_session`], so the caller has the chance to persist
+/// artifact paths onto the job record first. The `agent` argument picks
+/// the log filename, the prompt's `{agent_context_files}` substitution,
+/// and which worktree-root context-file aliases get materialised.
 pub fn prepare_run(
     store: &Store,
     job: &LineageJobRecord,
     feedback: &FeedbackRecord,
+    agent: AgentKind,
 ) -> Result<PreparedRun, StoreError> {
     // Lazily allocate an iteration number for this job. We work on a local
     // copy so the caller's `&LineageJobRecord` signature stays intact; the
@@ -632,7 +722,7 @@ pub fn prepare_run(
 
     let worktree = worktree_path(&root, &job.id);
     let inputs_dir = inputs_path(&root, &job.id);
-    let log_file = log_path(&root, &job.id);
+    let log_file = agent_log_path(&root, &job.id, agent);
     let prompt_file = prompt_path(&root, &job.id);
     let metadata_file = metadata_path(&root, &job.id);
     let branch = branch_name(&job.id);
@@ -640,13 +730,20 @@ pub fn prepare_run(
     create_worktree(&source, &worktree, &branch)?;
     let attachments = stage_attachments(store, feedback, &inputs_dir)?;
 
+    // Drop agent-appropriate context aliases (e.g. `AGENTS.md` → CLAUDE.md
+    // for Codex/OpenCode, `GEMINI.md` for Gemini) so each CLI picks up the
+    // same project guide under the name it expects. Best-effort; failures
+    // are swallowed because the worktree is already usable without them.
+    let backend = backend_for(agent);
+    let aliases = materialise_context_files(&worktree, backend.as_ref());
+
     // Each iteration gets its own dev-server port so users can run multiple
     // iterations side-by-side without collision. Rewrite the worktree's port
     // config before the agent starts so `cargo tauri dev` "just works".
     let port = iteration_port(job.iteration);
     let _ = rewrite_iteration_port(&worktree, port);
 
-    let prompt = build_implementation_prompt(feedback, job, &attachments, &log_file);
+    let prompt = build_implementation_prompt_for(feedback, job, &attachments, &log_file, agent);
     fs::write(&prompt_file, &prompt)?;
 
     let metadata = serde_json::json!({
@@ -659,6 +756,9 @@ pub fn prepare_run(
         "source_repo": source.display().to_string(),
         "log_file": log_file.display().to_string(),
         "prompt_file": prompt_file.display().to_string(),
+        "agent": agent,
+        "agent_binary": backend.binary(),
+        "agent_context_aliases": aliases.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         "attachments": attachments.iter().map(|a| serde_json::json!({
             "role": a.role,
             "path": a.path.display().to_string(),
@@ -680,12 +780,20 @@ pub fn prepare_run(
     })
 }
 
-/// Spawn `claude -p …` in `worktree`, stream its output to `log_file`, and
-/// transition the job when it finishes. Returns immediately; all I/O
-/// happens on a dedicated OS thread.
-pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
+/// Spawn the selected agent's CLI in `worktree`, stream its output to
+/// `log_file`, and transition the job when it finishes. Returns
+/// immediately; all I/O happens on a dedicated OS thread. The `agent`
+/// argument picks the binary, the flag set, and the env scrub list — see
+/// [`crate::agent`].
+pub fn launch_agent_session(
+    store: Store,
+    job_id: String,
+    prepared: PreparedRun,
+    agent: AgentKind,
+) {
     std::thread::spawn(move || {
         let engine = LineageEngine::new(&store);
+        let backend = backend_for(agent);
 
         let log_handle = match fs::File::create(&prepared.log_file) {
             Ok(f) => f,
@@ -710,53 +818,34 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
         let _ = engine.append_note(
             &job_id,
             &format!(
-                "claude code starting (dangerously-skip-permissions, auth=subscription, stream-json + verbose) in worktree {} — JSONL stream → {}",
+                "{agent_label} starting ({binary}) in worktree {} — transcript → {}",
                 prepared.worktree.display(),
                 prepared.log_file.display(),
+                agent_label = agent.label(),
+                binary = backend.binary(),
             ),
         );
 
-        // Force the Claude Max subscription auth path by scrubbing
-        // `ANTHROPIC_API_KEY` from the child environment. The CLI prefers the
-        // API key whenever it's present, which silently breaks users whose
-        // key has no balance but who are separately logged in via
-        // `claude login`. Scrubbing `ANTHROPIC_AUTH_TOKEN` as well for the
-        // same reason (internal Anthropic tooling override).
-        // `--output-format stream-json --verbose` makes the CLI emit one
-        // JSON event per line (system init, assistant/user messages, tool
-        // uses, tool results, final result). Without this, `-p` writes only
-        // the final assistant text and we have no way to tell — after the
-        // fact — whether the agent ever invoked `Read` on the staged
-        // attachments (canvas.png, annotations.json, voice recording). The
-        // log is no longer human-readable prose; pipe it through `jq` to
-        // inspect. See `docs/debugging.md` or just:
-        //     tail -f claude.log | jq -c 'select(.type=="assistant").message.content[]?
-        //                                   | select(.type=="tool_use") | {name, input}'
-        let status = Command::new("claude")
-            .arg("-p")
-            .arg(&prepared.prompt)
-            .arg("--dangerously-skip-permissions")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .current_dir(&prepared.worktree)
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("ANTHROPIC_AUTH_TOKEN")
-            .stdin(Stdio::null())
+        let status = backend
+            .build_command(&prepared.prompt, &prepared.worktree)
             .stdout(Stdio::from(log_handle))
             .stderr(Stdio::from(log_for_err))
             .status();
 
         match status {
             Ok(s) if s.success() => {
-                let _ = engine.append_note(&job_id, "claude code completed successfully");
+                let _ = engine.append_note(
+                    &job_id,
+                    &format!("{} completed successfully", agent.label()),
+                );
                 let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
             }
             Ok(s) => {
                 let _ = engine.append_note(
                     &job_id,
                     &format!(
-                        "claude exited with status {s} — see log {}",
+                        "{} exited with status {s} — see log {}",
+                        agent.label(),
                         prepared.log_file.display()
                     ),
                 );
@@ -766,13 +855,23 @@ pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
                 let _ = engine.append_note(
                     &job_id,
                     &format!(
-                        "failed to launch claude ({e}) — ensure the `claude` CLI is installed and in PATH"
+                        "failed to launch {} ({e}) — ensure the `{}` CLI is installed and in PATH",
+                        agent.label(),
+                        backend.binary(),
                     ),
                 );
                 let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
             }
         }
     });
+}
+
+/// Backward-compatible shim so old callers (and any external code the
+/// workspace still references) keep compiling. Forwards to
+/// [`launch_agent_session`] with the Claude backend.
+#[deprecated(note = "use launch_agent_session(..., AgentKind) so the runner can honour the selected agent")]
+pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
+    launch_agent_session(store, job_id, prepared, AgentKind::ClaudeCode);
 }
 
 pub fn iteration_run_log_path(workspace_root: &Path, job_id: &str) -> PathBuf {
@@ -1072,12 +1171,20 @@ fn render_stage_prompt(
         .replace("{{WORKTREE}}", &worktree.display().to_string())
 }
 
-/// Concrete `StageDispatcher` that spawns `claude -p <prompt>` per stage and
-/// streams its JSONL output to `<job_dir>/logs/<slug>.log`. Blocks the
-/// calling thread until Claude exits.
-pub struct ClaudeStageDispatcher;
+/// Concrete `StageDispatcher` that spawns the selected agent CLI per
+/// stage and streams its output to `<job_dir>/logs/<slug>.log`. Blocks the
+/// calling thread until the agent exits.
+pub struct AgentStageDispatcher {
+    pub agent: AgentKind,
+}
 
-impl crate::stages::StageDispatcher for ClaudeStageDispatcher {
+impl AgentStageDispatcher {
+    pub fn new(agent: AgentKind) -> Self {
+        Self { agent }
+    }
+}
+
+impl crate::stages::StageDispatcher for AgentStageDispatcher {
     fn dispatch(&self, ctx: crate::stages::StageDispatch<'_>) -> Result<PathBuf, String> {
         let plan = crate::plan::load_plan(ctx.job_dir)
             .map_err(|e| format!("load plan: {e}"))?
@@ -1095,25 +1202,18 @@ impl crate::stages::StageDispatcher for ClaudeStageDispatcher {
         let template = stage_prompt_template(ctx.stage);
         let prompt = render_stage_prompt(&template, &plan, ctx.worktree, &ctx.plan_path, ctx.job_id);
 
-        let status = Command::new("claude")
-            .arg("-p")
-            .arg(&prompt)
-            .arg("--dangerously-skip-permissions")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .current_dir(ctx.worktree)
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("ANTHROPIC_AUTH_TOKEN")
-            .stdin(Stdio::null())
+        let backend = backend_for(self.agent);
+        let status = backend
+            .build_command(&prompt, ctx.worktree)
             .stdout(Stdio::from(log_handle))
             .stderr(Stdio::from(log_err))
             .status()
-            .map_err(|e| format!("spawn claude for {}: {e}", ctx.stage.slug()))?;
+            .map_err(|e| format!("spawn {} for {}: {e}", backend.binary(), ctx.stage.slug()))?;
 
         if !status.success() {
             return Err(format!(
-                "claude exited {status} for stage {} — see {}",
+                "{} exited {status} for stage {} — see {}",
+                self.agent.label(),
                 ctx.stage.slug(),
                 log_path.display()
             ));
@@ -1121,6 +1221,11 @@ impl crate::stages::StageDispatcher for ClaudeStageDispatcher {
         Ok(log_path)
     }
 }
+
+/// Back-compat alias retained for any external code that still refers to
+/// the old name. New code should construct [`AgentStageDispatcher::new`].
+#[deprecated(note = "use AgentStageDispatcher::new(AgentKind)")]
+pub type ClaudeStageDispatcher = AgentStageDispatcher;
 
 /// Run the multi-stage NewApp pipeline for a prepared job. Seeds the plan,
 /// executes every stage, and flips the job to `BuildReady` on success or
@@ -1131,6 +1236,7 @@ pub fn launch_pipeline(
     job_id: String,
     feedback: FeedbackRecord,
     prepared: PreparedRun,
+    agent: AgentKind,
 ) {
     std::thread::spawn(move || {
         let engine = LineageEngine::new(&store);
@@ -1163,8 +1269,9 @@ pub fn launch_pipeline(
         let _ = engine.append_note(
             &job_id,
             &format!(
-                "multi-stage NewApp pipeline starting in worktree {} — stages: {}",
+                "multi-stage NewApp pipeline starting in worktree {} using {} — stages: {}",
                 prepared.worktree.display(),
+                agent.label(),
                 crate::types::StageKind::pipeline()
                     .iter()
                     .map(|s| s.slug())
@@ -1173,7 +1280,7 @@ pub fn launch_pipeline(
             ),
         );
 
-        let dispatcher = ClaudeStageDispatcher;
+        let dispatcher = AgentStageDispatcher::new(agent);
         match crate::stages::run_pipeline(
             &store,
             &engine,
@@ -1266,8 +1373,9 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
         let _ = engine.append_note(
             &job_id,
             &format!(
-                "resume: re-entering pipeline in worktree {} — stages already green will be skipped",
-                worktree.display()
+                "resume: re-entering pipeline ({agent_label}) in worktree {} — stages already green will be skipped",
+                worktree.display(),
+                agent_label = job.agent.label(),
             ),
         );
         let _ = engine.force_status(&job_id, LineageJobStatus::Implementing);
@@ -1291,7 +1399,7 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
             );
         }
 
-        let dispatcher = ClaudeStageDispatcher;
+        let dispatcher = AgentStageDispatcher::new(job.agent);
         match crate::stages::run_pipeline(
             &store,
             &engine,
@@ -1374,6 +1482,7 @@ mod tests {
             source_repo: None,
             iteration: 0,
             stages: Vec::new(),
+            agent: AgentKind::ClaudeCode,
         }
     }
 
@@ -1406,7 +1515,10 @@ mod tests {
         assert!(prompt.contains("/tmp/job-42/inputs/annotations.json"));
         assert!(prompt.contains("/tmp/job-42/claude.log"));
         assert!(prompt.contains(".claude/agents/"));
-        assert!(prompt.contains("dangerously-skip-permissions"));
+        // Agent-neutral phrasing: the prompt tells the model it's running with
+        // the CLI's permission-bypass flag. The literal flag text varies by
+        // backend (see `crate::agent`), so we only assert the concept.
+        assert!(prompt.contains("permission-bypass flag"));
     }
 
     #[test]
@@ -1614,6 +1726,36 @@ mod tests {
         let p = resolved.unwrap();
         assert!(p.join(".claude").join("agents").exists());
         assert!(p.join(".git").exists());
+    }
+
+    #[test]
+    fn agent_log_path_uses_backend_filename() {
+        let root = PathBuf::from("/tmp/ws");
+        assert!(agent_log_path(&root, "job-1", AgentKind::ClaudeCode)
+            .ends_with("lineage_workspaces/job-1/claude.log"));
+        assert!(agent_log_path(&root, "job-1", AgentKind::CodexCli)
+            .ends_with("lineage_workspaces/job-1/codex.log"));
+        assert!(agent_log_path(&root, "job-1", AgentKind::GeminiCli)
+            .ends_with("lineage_workspaces/job-1/gemini.log"));
+        assert!(agent_log_path(&root, "job-1", AgentKind::OpenCode)
+            .ends_with("lineage_workspaces/job-1/opencode.log"));
+    }
+
+    #[test]
+    fn prompt_for_codex_substitutes_agents_md_context() {
+        let prompt = build_implementation_prompt_for(
+            &mk_feedback(),
+            &mk_job(),
+            &[],
+            Path::new("/tmp/codex.log"),
+            AgentKind::CodexCli,
+        );
+        // Template may or may not use {agent_context_files} depending on
+        // user customisation; but {agent_label} should always render the
+        // codex label when present in the template. We only assert the
+        // substitution was executed without leaving the placeholder behind.
+        assert!(!prompt.contains("{agent_label}"));
+        assert!(!prompt.contains("{agent_context_files}"));
     }
 
     #[test]

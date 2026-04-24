@@ -282,7 +282,7 @@ pub fn default_workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FeedbackStatus, FeedbackType, LineageJobStatus};
+    use crate::types::{AgentKind, FeedbackStatus, FeedbackType, LineageJobStatus};
     use tempfile::tempdir;
 
     fn sample(id: &str) -> FeedbackRecord {
@@ -365,6 +365,7 @@ mod tests {
             source_repo: None,
             iteration: 0,
             stages: Vec::new(),
+            agent: AgentKind::ClaudeCode,
         };
         store.save_lineage_job(&job).unwrap();
         assert_eq!(store.list_lineage_jobs().unwrap().len(), 1);

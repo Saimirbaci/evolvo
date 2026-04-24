@@ -1,5 +1,54 @@
 use serde::{Deserialize, Serialize};
 
+/// Which CLI coding agent should run a given lineage job. Mirrors
+/// `evolvo_desktop::types::AgentKind` on the backend.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    #[default]
+    ClaudeCode,
+    CodexCli,
+    GeminiCli,
+    OpenCode,
+}
+
+impl AgentKind {
+    pub fn all() -> [AgentKind; 4] {
+        [
+            Self::ClaudeCode,
+            Self::CodexCli,
+            Self::GeminiCli,
+            Self::OpenCode,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::CodexCli => "Codex",
+            Self::GeminiCli => "Gemini",
+            Self::OpenCode => "OpenCode",
+        }
+    }
+
+    pub fn binary(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::CodexCli => "codex",
+            Self::GeminiCli => "gemini",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAvailability {
+    pub kind: AgentKind,
+    pub binary: String,
+    pub installed: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackType {
@@ -151,6 +200,8 @@ pub struct LineageJobRecord {
     pub iteration: u32,
     #[serde(default)]
     pub stages: Vec<StageState>,
+    #[serde(default)]
+    pub agent: AgentKind,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +310,8 @@ pub struct SubmitFeedbackPayload {
     pub voice_transcript: Option<String>,
     pub window_width: u32,
     pub window_height: u32,
+    #[serde(default)]
+    pub agent: Option<AgentKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

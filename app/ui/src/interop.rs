@@ -5,7 +5,10 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
-use crate::types::{AppHealth, FeedbackRecord, LineageJobRecord, StageState, SubmitFeedbackPayload};
+use crate::types::{
+    AgentAvailability, AppHealth, FeedbackRecord, LineageJobRecord, StageState,
+    SubmitFeedbackPayload,
+};
 
 fn js_error(v: JsValue) -> String {
     v.as_string()
@@ -158,4 +161,11 @@ pub async fn tail_stage_log(id: &str, stage: &str, max_bytes: Option<usize>) -> 
 /// in `plan.stage` are re-validated without re-invoking Claude.
 pub async fn resume_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
     invoke_command_with_args("resume_lineage_job", &IdArg { id }).await
+}
+
+/// Enumerate the available agent backends with per-binary install status.
+/// The UI uses this to grey out chips for agents the user hasn't
+/// installed. Cached server-side so repeated polls are cheap.
+pub async fn list_available_agents() -> Result<Vec<AgentAvailability>, String> {
+    invoke_command("list_available_agents").await
 }

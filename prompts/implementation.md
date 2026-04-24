@@ -18,7 +18,7 @@ of itself using visual,text and voice feedback. A user submitted feedback throug
 
 # How to work
 
-1. Read `CLAUDE.md` and skim the relevant files under `app/` to orient yourself. Also skim `.claude/rules/` and `.claude/agents/` so you know what docs you will be expected to update.
+1. Read the project guide(s) expected by your CLI ({agent_context_files}) and skim the relevant files under `app/` to orient yourself. Also skim `.claude/rules/` and `.claude/agents/` so you know what docs you will be expected to update — on non-Claude agents these files are symlinked from the worktree root under `AGENTS.md` / `GEMINI.md` so the same canonical guide applies.
 2. Read every file listed under Attachments above — the screenshot is often the clearest statement of intent of the app the user is building.
 3. When the work calls for a specialist, delegate via the Agent tool to one of the project agents defined in `.claude/agents/` (use whichever agents exist in this iteration of the repo — names may have changed).
 {work_step_4}
@@ -36,6 +36,6 @@ of itself using visual,text and voice feedback. A user submitted feedback throug
 # Safety
 
 - You are on branch `{branch}` in an isolated worktree. Do not `git push`, do not switch branches, do not touch the main branch.
-- You are running with `--dangerously-skip-permissions`: file edits, `cargo`, `git`, `trunk`, `bash scripts/run-iteration.sh`, and other shell commands inside this worktree all run without prompting. The worktree + throwaway branch are the safety envelope — use the access; don't burn cycles apologising for "not being able to run cargo". You ARE able. Run the checks and the app.
+- You are running as **{agent_label}** with the CLI's permission-bypass flag: file edits, `cargo`, `git`, `trunk`, `bash scripts/run-iteration.sh`, and other shell commands inside this worktree all run without prompting. The worktree + throwaway branch are the safety envelope — use the access; don't burn cycles apologising for "not being able to run cargo". You ARE able. Run the checks and the app.
 - If a dependency is genuinely missing on the host (e.g. `cargo` itself isn't installed) say so plainly and exit — do not fake success. But "I'm blocked from running cargo" is not a valid reason inside this lineage; you have permission.
 - Your full transcript is being captured at `{log_file}` for reviewer audit.

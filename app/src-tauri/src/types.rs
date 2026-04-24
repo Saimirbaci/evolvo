@@ -9,6 +9,52 @@ pub fn current_time_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Which CLI coding agent should run a given lineage job. Stored on the
+/// `LineageJobRecord` (and optionally submitted via `SubmitFeedbackPayload`)
+/// so that Retry / Resume use the same backend that enqueued the work. The
+/// concrete spawn wiring lives in `agent.rs`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    #[default]
+    ClaudeCode,
+    CodexCli,
+    GeminiCli,
+    OpenCode,
+}
+
+impl AgentKind {
+    pub fn all() -> [AgentKind; 4] {
+        [
+            Self::ClaudeCode,
+            Self::CodexCli,
+            Self::GeminiCli,
+            Self::OpenCode,
+        ]
+    }
+
+    /// Short human label used in the UI and in job notes.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::CodexCli => "Codex",
+            Self::GeminiCli => "Gemini",
+            Self::OpenCode => "OpenCode",
+        }
+    }
+
+    /// Stable slug used in log filenames and metadata. Keep in sync with
+    /// `agent::AgentBackend::log_filename`.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::CodexCli => "codex",
+            Self::GeminiCli => "gemini",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackType {
@@ -140,6 +186,12 @@ pub struct LineageJobRecord {
     /// older records without this field round-trip cleanly.
     #[serde(default)]
     pub stages: Vec<StageState>,
+    /// Which CLI coding agent was selected to run this job. Defaults to
+    /// `ClaudeCode` for pre-existing records that pre-date the multi-agent
+    /// feature. Retry / Resume reuse this value so a failed Codex run never
+    /// silently flips to Claude half-way through.
+    #[serde(default)]
+    pub agent: AgentKind,
 }
 
 /// Which stage of the multi-stage NewApp pipeline a `StageState` represents.
@@ -290,6 +342,21 @@ pub struct SubmitFeedbackPayload {
     pub voice_transcript: Option<String>,
     pub window_width: u32,
     pub window_height: u32,
+    /// Optional explicit agent selection. `None` falls back to
+    /// `AgentKind::default()` (Claude Code) so older UI builds keep working.
+    #[serde(default)]
+    pub agent: Option<AgentKind>,
+}
+
+/// Availability of a given agent CLI on the host. Returned by the
+/// `list_available_agents` Tauri command so the UI can grey out agents the
+/// user hasn't installed yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAvailability {
+    pub kind: AgentKind,
+    pub binary: String,
+    pub installed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,6 +419,36 @@ mod tests {
         assert!(json.contains("\"createdAtUnixMs\":1"));
         let back: FeedbackRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rec);
+    }
+
+    #[test]
+    fn agent_kind_round_trips_snake_case() {
+        let raw = serde_json::to_string(&AgentKind::ClaudeCode).unwrap();
+        assert_eq!(raw, "\"claude_code\"");
+        let back: AgentKind = serde_json::from_str("\"codex_cli\"").unwrap();
+        assert_eq!(back, AgentKind::CodexCli);
+        let back: AgentKind = serde_json::from_str("\"gemini_cli\"").unwrap();
+        assert_eq!(back, AgentKind::GeminiCli);
+        let back: AgentKind = serde_json::from_str("\"open_code\"").unwrap();
+        assert_eq!(back, AgentKind::OpenCode);
+    }
+
+    #[test]
+    fn lineage_job_record_defaults_agent_for_old_records() {
+        // Old records written before the multi-agent feature won't have the
+        // `agent` field; verify they deserialise as ClaudeCode.
+        let json = r#"{
+            "id": "job-1",
+            "feedbackId": "fb-1",
+            "title": "old",
+            "summary": "",
+            "status": "pending",
+            "createdAtUnixMs": 0,
+            "updatedAtUnixMs": 0
+        }"#;
+        let back: LineageJobRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(back.agent, AgentKind::ClaudeCode);
+        assert_eq!(back.iteration, 0);
     }
 
     #[test]

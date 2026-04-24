@@ -300,15 +300,15 @@ fn LineagePage() -> impl IntoView {
                                                     class:active=is_active
                                                     on:click=move |_| selected.set(Some(id_for_click.clone()))
                                                 >
-                                                    <span class="lineage-list-item-title" title=r.title.clone()>{r.title.clone()}</span>
-                                                    <div class="list-card-meta">
-                                                        {if r.iteration > 0 {
-                                                            format!("iter {} · {}", r.iteration, format_time(r.created_at_unix_ms))
-                                                        } else {
-                                                            format_time(r.created_at_unix_ms)
-                                                        }}
-                                                    </div>
-                                                    <span class="list-card-status">{r.status.label()}</span>
+                                        <span class="lineage-list-item-title" title=r.title.clone()>{r.title.clone()}</span>
+                                        <div class="list-card-meta">
+                                            {if r.iteration > 0 {
+                                                format!("iter {} · {} · {}", r.iteration, r.agent.label(), format_time(r.created_at_unix_ms))
+                                            } else {
+                                                format!("{} · {}", r.agent.label(), format_time(r.created_at_unix_ms))
+                                            }}
+                                        </div>
+                                        <span class="list-card-status">{r.status.label()}</span>
                                                 </button>
                                             </li>
                                         }
@@ -452,6 +452,7 @@ fn LineageDetail(
     let status_label = record.status.label();
     let created = format_time(record.created_at_unix_ms);
     let stages = record.stages.clone();
+    let agent_label = record.agent.label();
 
     view! {
         <div class="lineage-detail-inner">
@@ -466,7 +467,10 @@ fn LineageDetail(
                         }}
                     </div>
                 </div>
-                <span class="list-card-status">{status_label}</span>
+                <div class="lineage-detail-head-badges">
+                    <span class="lineage-agent-badge" title="Agent that ran this job">{agent_label}</span>
+                    <span class="list-card-status">{status_label}</span>
+                </div>
             </header>
 
             <p class="lineage-detail-summary">{summary}</p>

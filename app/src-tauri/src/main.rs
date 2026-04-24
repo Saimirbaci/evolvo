@@ -26,6 +26,7 @@ fn main() {
             commands::read_job_plan,
             commands::tail_stage_log,
             commands::resume_lineage_job,
+            commands::list_available_agents,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Evolvo desktop app");

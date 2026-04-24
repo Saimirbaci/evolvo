@@ -208,6 +208,23 @@ Type-checks and unit tests do not prove the feature works. Before claiming a cha
 
 If you genuinely cannot run the app in the current environment, say so plainly in your summary — don't claim success you didn't observe.
 
+## Which agent ran a lineage job
+A lineage job persists its selected agent as `agent` on the `LineageJobRecord` (`lineage_jobs/<job-id>.json`) and also in `run.json` under the job workspace. Supported backends and their transcripts:
+
+- **Claude Code** (`AgentKind::ClaudeCode`) — binary `claude`, transcript `claude.log` (stream-json / JSONL).
+- **Codex CLI** (`AgentKind::CodexCli`) — binary `codex`, transcript `codex.log` (`codex exec --json` JSONL with its own event schema).
+- **Gemini CLI** (`AgentKind::GeminiCli`) — binary `gemini`, transcript `gemini.log` (free-form text, no stable JSONL).
+- **OpenCode CLI** (`AgentKind::OpenCode`) — binary `opencode`, transcript `opencode.log`.
+
+Project-guide discovery differs per CLI; the runner materialises symlinks at the worktree root so all four agents pick up `CLAUDE.md`:
+- Claude Code reads `CLAUDE.md` and `.claude/agents/*` natively.
+- Codex / OpenCode see `AGENTS.md` (symlink to `CLAUDE.md`).
+- Gemini sees `GEMINI.md` (symlink to `CLAUDE.md`).
+
+The multi-stage NewApp pipeline works for every backend because it drives off `plan.json`, not the agent log (see `app/src-tauri/src/stages.rs`). Retry/Resume reuse the job's persisted `agent`, so a failed Codex run retries as Codex, not Claude.
+
+The feedback panel's Agent chip row probes `list_available_agents` on mount and greys out chips whose binary is not on PATH — install the missing CLI and restart Evolvo to re-probe (availability is cached per-process).
+
 ## Debugging a lineage run — `claude.log` is JSONL
 
 Each lineage job's `claude.log` (under `~/.evolvo/evolvo_workspace/lineage_workspaces/<job-id>/`) is captured with `claude -p ... --output-format stream-json --verbose`, so it is **one JSON event per line**, not human-readable prose. Each line has a `type` (`system`, `assistant`, `user`, `result`, etc.); assistant messages carry `message.content[]` with `tool_use` / `text` entries; user messages carry `tool_result` entries.
@@ -231,6 +248,13 @@ jq -r 'select(.type=="result") | .result // .message.content[-1].text // empty' 
 ```
 
 If `claude.log` is empty or missing tool_use events for the staged attachments, the model never read them — surface that in the lineage notes rather than silently shipping an iteration that ignored the user's drawing.
+
+### Other agents
+`codex.log` is also JSONL but with a different schema — each line has a `type` (`agent_message`, `tool_call`, `tool_result`, `task_complete`, etc.). Grep for `"type":"tool_call"` to see which tools fired and pipe through `jq` the same way.
+
+`gemini.log` has no standard JSONL — fall back to `grep -n 'tool:'` and `grep -n 'error'` for a quick triage.
+
+`opencode.log` shape depends on the provider OpenCode is configured with; start by tailing the file and adapting the Claude/Codex recipes as needed.
 
 ## Lineage iteration port convention
 

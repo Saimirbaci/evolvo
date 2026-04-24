@@ -1,14 +1,17 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tauri::State;
 
+use crate::agent;
 use crate::lineage::{LineageEngine, Transition};
 use crate::runner;
 use crate::state::AppState;
 use crate::store::StoreError;
 use crate::types::{
-    current_time_unix_ms, AppHealth, EntityIdPayload, FeedbackRecord, FeedbackStatus,
-    LineageJobRecord, LineageJobStatus, SubmitFeedbackPayload,
+    current_time_unix_ms, AgentAvailability, AppHealth, EntityIdPayload, FeedbackRecord,
+    FeedbackStatus, LineageJobRecord, LineageJobStatus, SubmitFeedbackPayload,
 };
+#[cfg(test)]
+use crate::types::AgentKind;
 
 const APP_NAME: &str = "Evolvo";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -118,13 +121,25 @@ pub fn submit_feedback(
 
     store.save_feedback(&record).map_err(store_error)?;
 
-    // Enqueue a lineage job so reviewers can immediately triage.
+    // Enqueue a lineage job so reviewers can immediately triage. The
+    // agent selection defaults to ClaudeCode so older UI builds (which
+    // don't send the field) continue to work unchanged.
+    let agent = payload.agent.unwrap_or_default();
     let engine = LineageEngine::new(&store);
     let _ = engine
-        .enqueue_job_for_feedback(&mut record)
+        .enqueue_job_for_feedback(&mut record, agent)
         .map_err(store_error)?;
 
     Ok(record)
+}
+
+/// Enumerate every known agent backend along with whether its CLI binary is
+/// present on PATH. The UI uses this to grey out chips for agents the user
+/// hasn't installed. Results are cached in-process (see `agent::is_installed`)
+/// so repeated polls from the feedback panel are cheap.
+#[tauri::command]
+pub fn list_available_agents() -> Result<Vec<AgentAvailability>, String> {
+    Ok(agent::availability())
 }
 
 #[tauri::command]
@@ -301,7 +316,7 @@ fn start_implementation_run(
         .map_err(store_error)?
         .ok_or_else(|| format!("feedback {} not found for job {}", job.feedback_id, job.id))?;
 
-    let prepared = runner::prepare_run(store, job, &feedback).map_err(|e| {
+    let prepared = runner::prepare_run(store, job, &feedback, job.agent).map_err(|e| {
         // Record the failure on the job so the reviewer sees why nothing
         // happened, then surface the error to the frontend.
         let msg = store_error(e);
@@ -326,9 +341,9 @@ fn start_implementation_run(
         .map_err(store_error)?;
 
     if runner::is_multi_stage_candidate(&feedback) {
-        runner::launch_pipeline(store.clone(), job.id.clone(), feedback, prepared);
+        runner::launch_pipeline(store.clone(), job.id.clone(), feedback, prepared, job.agent);
     } else {
-        runner::launch_claude(store.clone(), job.id.clone(), prepared);
+        runner::launch_agent_session(store.clone(), job.id.clone(), prepared, job.agent);
     }
     Ok(updated)
 }
@@ -544,6 +559,7 @@ mod tests {
             voice_transcript: None,
             window_width: 1024,
             window_height: 768,
+            agent: None,
         }
     }
 
@@ -584,7 +600,9 @@ mod tests {
             };
             store.save_feedback(&rec).unwrap();
             let engine = LineageEngine::new(&store);
-            engine.enqueue_job_for_feedback(&mut rec).unwrap();
+            engine
+                .enqueue_job_for_feedback(&mut rec, AgentKind::default())
+                .unwrap();
             rec
         };
 
@@ -598,5 +616,50 @@ mod tests {
         assert_eq!(guess_voice_ext(Some("audio/webm")), "webm");
         assert_eq!(guess_voice_ext(Some("audio/ogg;codecs=opus")), "ogg");
         assert_eq!(guess_voice_ext(None), "bin");
+    }
+
+    #[test]
+    fn submit_feedback_persists_explicit_agent_on_lineage_job() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+
+        // Directly exercise the enqueue path with a non-default agent and
+        // assert the record round-trips with the right AgentKind. We avoid
+        // the full `submit_feedback` shim here because it needs a tauri
+        // `State` handle; the engine call exercises the meaningful plumbing.
+        let mut rec = FeedbackRecord {
+            id: "fb-agent".into(),
+            feedback_type: FeedbackType::Bug,
+            status: FeedbackStatus::New,
+            page_route: "/".into(),
+            feedback_text: "use codex please".into(),
+            annotations: vec![],
+            pasted_images: vec![],
+            screenshot_filename: None,
+            voice_filename: None,
+            voice_transcript: None,
+            window_width: 100,
+            window_height: 100,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            lineage_job_id: None,
+        };
+        store.save_feedback(&rec).unwrap();
+        let engine = LineageEngine::new(&store);
+        let job = engine
+            .enqueue_job_for_feedback(&mut rec, AgentKind::CodexCli)
+            .unwrap();
+        assert_eq!(job.agent, AgentKind::CodexCli);
+        let loaded = store.load_lineage_job(&job.id).unwrap().unwrap();
+        assert_eq!(loaded.agent, AgentKind::CodexCli);
+    }
+
+    #[test]
+    fn list_available_agents_returns_every_variant() {
+        let all = list_available_agents().unwrap();
+        assert_eq!(all.len(), AgentKind::all().len());
+        for kind in AgentKind::all() {
+            assert!(all.iter().any(|a| a.kind == kind));
+        }
     }
 }

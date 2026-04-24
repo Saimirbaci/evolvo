@@ -10,7 +10,7 @@ use web_sys::{
 
 use crate::canvas::CanvasController;
 use crate::interop;
-use crate::types::{FeedbackType, SubmitFeedbackPayload};
+use crate::types::{AgentAvailability, AgentKind, FeedbackType, SubmitFeedbackPayload};
 use crate::voice::{VoiceRecorder, VoiceState};
 
 #[component]
@@ -20,10 +20,29 @@ pub fn FeedbackPanel(
     is_open: RwSignal<bool>,
 ) -> impl IntoView {
     let feedback_type = RwSignal::new(FeedbackType::Bug);
+    let agent = RwSignal::new(AgentKind::ClaudeCode);
+    // Per-agent availability snapshot; `None` = still loading, empty vec =
+    // backend probe failed (in which case we optimistically enable every
+    // chip so the feature isn't silently disabled by a probe bug).
+    let availability: RwSignal<Option<Vec<AgentAvailability>>> = RwSignal::new(None);
     let text = RwSignal::new(String::new());
     let submitting = RwSignal::new(false);
     let status: RwSignal<Option<Result<String, String>>> = RwSignal::new(None);
     let voice = VoiceState::new();
+
+    // Probe agent availability on mount. We only do this once per panel
+    // lifecycle; the backend caches results so multiple opens are cheap.
+    Effect::new(move |already: Option<()>| {
+        if already.is_some() {
+            return;
+        }
+        spawn_local(async move {
+            match interop::list_available_agents().await {
+                Ok(list) => availability.set(Some(list)),
+                Err(_) => availability.set(Some(Vec::new())),
+            }
+        });
+    });
 
     let submit = {
         let ctrl = controller.clone();
@@ -50,6 +69,7 @@ pub fn FeedbackPanel(
                 }
             };
             let feedback_type_v = feedback_type.get_untracked();
+            let agent_v = agent.get_untracked();
             let route_v = route.get_untracked();
             let text_v = text.get_untracked();
             let voice_b64 = voice.base64.get_untracked();
@@ -93,6 +113,7 @@ pub fn FeedbackPanel(
                     voice_transcript: transcript,
                     window_width: win_w,
                     window_height: win_h,
+                    agent: Some(agent_v),
                 };
 
                 match interop::submit_feedback(&payload).await {
@@ -227,6 +248,47 @@ pub fn FeedbackPanel(
             </div>
 
             <div class="panel-body">
+                <div class="panel-section-label">"Agent"</div>
+                <div class="type-chips agent-chips">
+                    {AgentKind::all().into_iter().map(|ak| {
+                        let is_active = move || agent.get() == ak;
+                        // An agent is enabled if the backend either hasn't
+                        // finished probing yet (optimistic), the probe
+                        // failed (empty list, also optimistic), or the
+                        // backend reports the binary as installed.
+                        let is_enabled = move || match availability.get() {
+                            None => true,
+                            Some(list) if list.is_empty() => true,
+                            Some(list) => list
+                                .iter()
+                                .find(|a| a.kind == ak)
+                                .map(|a| a.installed)
+                                .unwrap_or(true),
+                        };
+                        let tooltip = move || if is_enabled() {
+                            format!("Use {}", ak.label())
+                        } else {
+                            format!("Install `{}` on PATH to enable {}", ak.binary(), ak.label())
+                        };
+                        view! {
+                            <button
+                                class="type-chip agent-chip"
+                                class:active=is_active
+                                class:disabled=move || !is_enabled()
+                                prop:disabled=move || !is_enabled()
+                                title=tooltip
+                                on:click=move |_| {
+                                    if is_enabled() {
+                                        agent.set(ak)
+                                    }
+                                }
+                            >
+                                {ak.label()}
+                            </button>
+                        }
+                    }).collect_view()}
+                </div>
+
                 <div class="panel-section-label">"Type"</div>
                 <div class="type-chips">
                     {FeedbackType::all().into_iter().map(|ft| {
