@@ -177,7 +177,14 @@ impl AgentBackend for GeminiBackend {
 
     fn build_command(&self, prompt: &str, worktree: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
+        // `--skip-trust` suppresses the interactive "do you trust this
+        // workspace?" prompt that gemini-cli puts up the first time it
+        // runs in a directory it hasn't seen before. The lineage worktree
+        // is always a fresh path, so without this flag every run blocks on
+        // a TTY prompt and `--yolo` alone isn't enough — `--yolo` only
+        // disables tool-confirmation, not workspace trust.
         cmd.arg("--yolo")
+            .arg("--skip-trust")
             .arg("-p")
             .arg(prompt)
             .current_dir(worktree)
@@ -327,7 +334,7 @@ mod tests {
             .get_args()
             .map(|s| s.to_str().unwrap_or(""))
             .collect();
-        assert_eq!(args, vec!["--yolo", "-p", "hi"]);
+        assert_eq!(args, vec!["--yolo", "--skip-trust", "-p", "hi"]);
     }
 
     #[test]
