@@ -126,9 +126,18 @@ pub fn submit_feedback(
     // don't send the field) continue to work unchanged.
     let agent = payload.agent.unwrap_or_default();
     let engine = LineageEngine::new(&store);
-    let _ = engine
+    let job = engine
         .enqueue_job_for_feedback(&mut record, agent)
         .map_err(store_error)?;
+
+    // Auto-evolve: skip the manual "Evolve" click and fire the agent run
+    // immediately. We swallow run-prep errors so the feedback record is
+    // still reported as saved — the failure is recorded on the lineage
+    // job by `start_implementation_run` itself (note + status=Failed),
+    // which the user can then see on the Lineage tab.
+    if payload.auto_evolve {
+        let _ = start_implementation_run(&store, &engine, &job);
+    }
 
     Ok(record)
 }
@@ -565,6 +574,7 @@ mod tests {
             window_width: 1024,
             window_height: 768,
             agent: None,
+            auto_evolve: false,
         }
     }
 

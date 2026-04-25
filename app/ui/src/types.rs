@@ -312,6 +312,10 @@ pub struct SubmitFeedbackPayload {
     pub window_height: u32,
     #[serde(default)]
     pub agent: Option<AgentKind>,
+    /// Skip the manual Evolve click — start the agent run as soon as
+    /// `submit_feedback` finishes persisting the record.
+    #[serde(default)]
+    pub auto_evolve: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

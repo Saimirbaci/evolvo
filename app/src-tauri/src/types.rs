@@ -346,6 +346,15 @@ pub struct SubmitFeedbackPayload {
     /// `AgentKind::default()` (Claude Code) so older UI builds keep working.
     #[serde(default)]
     pub agent: Option<AgentKind>,
+    /// When true, `submit_feedback` immediately fires
+    /// `start_implementation_run` after enqueuing the lineage job — the
+    /// reviewer doesn't have to switch to the Lineage tab and click Evolve.
+    /// Defaults to false on the wire so older UI builds keep behaving as
+    /// before; the UI sets this from a per-submission checkbox that is
+    /// pre-checked for `NewApp` feedback (where the user almost always
+    /// wants the agent to start immediately).
+    #[serde(default)]
+    pub auto_evolve: bool,
 }
 
 /// Availability of a given agent CLI on the host. Returned by the
@@ -419,6 +428,39 @@ mod tests {
         assert!(json.contains("\"createdAtUnixMs\":1"));
         let back: FeedbackRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rec);
+    }
+
+    #[test]
+    fn submit_payload_auto_evolve_defaults_false_and_round_trips() {
+        // Older UI builds don't send the field; deserialise must default to
+        // false so they keep the old "manual Evolve" behaviour.
+        let json = r#"{
+            "feedbackType":"bug",
+            "feedbackText":"x",
+            "windowWidth":1,
+            "windowHeight":1,
+            "screenshotBase64":null,
+            "voiceBase64":null,
+            "voiceMimeType":null,
+            "voiceTranscript":null
+        }"#;
+        let p: SubmitFeedbackPayload = serde_json::from_str(json).unwrap();
+        assert!(!p.auto_evolve, "auto_evolve must default to false");
+
+        // And explicit `autoEvolve: true` rides through camel-cased.
+        let json_on = r#"{
+            "feedbackType":"new_app",
+            "feedbackText":"build me a budget tracker",
+            "windowWidth":1,
+            "windowHeight":1,
+            "screenshotBase64":null,
+            "voiceBase64":null,
+            "voiceMimeType":null,
+            "voiceTranscript":null,
+            "autoEvolve":true
+        }"#;
+        let p: SubmitFeedbackPayload = serde_json::from_str(json_on).unwrap();
+        assert!(p.auto_evolve);
     }
 
     #[test]

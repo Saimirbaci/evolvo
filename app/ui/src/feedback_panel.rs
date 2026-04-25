@@ -5,7 +5,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     window, CanvasRenderingContext2d, Element, HtmlCanvasElement, HtmlElement, HtmlImageElement,
-    HtmlTextAreaElement, PointerEvent,
+    HtmlInputElement, HtmlTextAreaElement, PointerEvent,
 };
 
 use crate::canvas::CanvasController;
@@ -29,6 +29,22 @@ pub fn FeedbackPanel(
     let submitting = RwSignal::new(false);
     let status: RwSignal<Option<Result<String, String>>> = RwSignal::new(None);
     let voice = VoiceState::new();
+    // Auto-evolve = skip the manual "Evolve" click and fire the agent
+    // run immediately on submit. Pre-checked for NewApp (where the user
+    // almost always wants the agent to start straight away) and unchecked
+    // for everything else so a misclick on Bug/Confusion/etc. doesn't
+    // unintentionally burn agent tokens. Whenever the user changes the
+    // feedback-type chip we re-apply that default — but we honour an
+    // explicit toggle: once the user has clicked the checkbox themselves,
+    // their choice is sticky for the rest of this panel session.
+    let auto_evolve = RwSignal::new(false);
+    let auto_evolve_user_set = RwSignal::new(false);
+    Effect::new(move |_| {
+        let ft = feedback_type.get();
+        if !auto_evolve_user_set.get_untracked() {
+            auto_evolve.set(matches!(ft, FeedbackType::NewApp));
+        }
+    });
 
     // Probe agent availability on mount. We only do this once per panel
     // lifecycle; the backend caches results so multiple opens are cheap.
@@ -70,6 +86,7 @@ pub fn FeedbackPanel(
             };
             let feedback_type_v = feedback_type.get_untracked();
             let agent_v = agent.get_untracked();
+            let auto_evolve_v = auto_evolve.get_untracked();
             let route_v = route.get_untracked();
             let text_v = text.get_untracked();
             let voice_b64 = voice.base64.get_untracked();
@@ -114,11 +131,17 @@ pub fn FeedbackPanel(
                     window_width: win_w,
                     window_height: win_h,
                     agent: Some(agent_v),
+                    auto_evolve: auto_evolve_v,
                 };
 
                 match interop::submit_feedback(&payload).await {
                     Ok(record) => {
-                        status.set(Some(Ok(format!("Sent • queued as {}", record.id))));
+                        let msg = if auto_evolve_v {
+                            format!("Sent • agent running for {}", record.id)
+                        } else {
+                            format!("Sent • queued as {}", record.id)
+                        };
+                        status.set(Some(Ok(msg)));
                         ctrl_reset.clear_all();
                         voice_reset.clear();
                         text.set(String::new());
@@ -346,6 +369,21 @@ pub fn FeedbackPanel(
                     Some(Err(err)) => view!{ <div class="status-line error">{err}</div> }.into_any(),
                     None => view!{ <span></span> }.into_any(),
                 }}
+                <label
+                    class="auto-evolve-toggle"
+                    title="If on, the agent starts working as soon as you submit — you don't have to switch to the Lineage tab and click Evolve."
+                >
+                    <input
+                        type="checkbox"
+                        prop:checked=move || auto_evolve.get()
+                        on:change=move |ev| {
+                            let target = event_target::<HtmlInputElement>(&ev);
+                            auto_evolve_user_set.set(true);
+                            auto_evolve.set(target.checked());
+                        }
+                    />
+                    <span>"Start agent immediately"</span>
+                </label>
                 <button
                     class="primary-btn"
                     prop:disabled=move || {
@@ -356,7 +394,15 @@ pub fn FeedbackPanel(
                     }
                     on:click=submit
                 >
-                    {move || if submitting.get() { "Sending…" } else { "Submit to lineage" }}
+                    {move || {
+                        if submitting.get() {
+                            "Sending…"
+                        } else if auto_evolve.get() {
+                            "Submit & Evolve"
+                        } else {
+                            "Submit to lineage"
+                        }
+                    }}
                 </button>
             </div>
             <div
