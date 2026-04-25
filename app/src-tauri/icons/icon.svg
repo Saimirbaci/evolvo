@@ -1,38 +1,81 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
-  <!-- Background: rounded-square in slate-900, echoing the app's dark chrome -->
-  <rect x="0" y="0" width="1024" height="1024" rx="208" ry="208" fill="#0f172a"/>
+  <!-- Background: rounded-square in slate-900, matches the app's dark chrome -->
+  <defs>
+    <linearGradient id="growth" x1="512" y1="880" x2="512" y2="140" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f59e0b"/>
+      <stop offset="0.45" stop-color="#fbbf24"/>
+      <stop offset="0.75" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <radialGradient id="seedGlow" cx="512" cy="860" r="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fbbf24" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#fbbf24" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
 
-  <!-- Subtle inner border to give the tile depth -->
+  <rect x="0" y="0" width="1024" height="1024" rx="208" ry="208" fill="#0f172a"/>
   <rect x="24" y="24" width="976" height="976" rx="188" ry="188"
         fill="none" stroke="#1e293b" stroke-width="4"/>
 
-  <!-- The white canvas: the product's core surface -->
-  <rect x="200" y="200" width="624" height="624" rx="56" ry="56" fill="#ffffff"/>
+  <!-- Soft glow around the seed -->
+  <circle cx="512" cy="860" r="220" fill="url(#seedGlow)"/>
 
-  <!-- Faint canvas grid to hint at "drawing board" without dominating -->
-  <g stroke="#e2e8f0" stroke-width="2" stroke-linecap="round">
-    <line x1="240" y1="360" x2="784" y2="360"/>
-    <line x1="240" y1="512" x2="784" y2="512"/>
-    <line x1="240" y1="664" x2="784" y2="664"/>
-    <line x1="392" y1="240" x2="392" y2="784"/>
-    <line x1="544" y1="240" x2="544" y2="784"/>
-    <line x1="696" y1="240" x2="696" y2="784"/>
+  <!-- Branching evolution tree: a seed at the bottom that forks upward,
+       each split smaller, suggesting iteration / lineage growth. -->
+  <g stroke="url(#growth)" stroke-width="34" stroke-linecap="round" fill="none">
+    <!-- Trunk -->
+    <path d="M512 860 L512 620"/>
+
+    <!-- First fork -->
+    <path d="M512 620 C 512 540, 360 540, 360 460"/>
+    <path d="M512 620 C 512 540, 664 540, 664 460"/>
+
+    <!-- Second fork (left) -->
+    <path d="M360 460 C 360 400, 270 400, 270 340" stroke-width="26"/>
+    <path d="M360 460 C 360 400, 450 400, 450 340" stroke-width="26"/>
+
+    <!-- Second fork (right) -->
+    <path d="M664 460 C 664 400, 574 400, 574 340" stroke-width="26"/>
+    <path d="M664 460 C 664 400, 754 400, 754 340" stroke-width="26"/>
+
+    <!-- Third fork — finer twigs -->
+    <path d="M270 340 C 270 300, 220 300, 220 250" stroke-width="18"/>
+    <path d="M270 340 C 270 300, 320 300, 320 250" stroke-width="18"/>
+    <path d="M450 340 C 450 300, 400 300, 400 250" stroke-width="18"/>
+    <path d="M450 340 C 450 300, 500 300, 500 250" stroke-width="18"/>
+    <path d="M574 340 C 574 300, 524 300, 524 250" stroke-width="18"/>
+    <path d="M574 340 C 574 300, 624 300, 624 250" stroke-width="18"/>
+    <path d="M754 340 C 754 300, 704 300, 704 250" stroke-width="18"/>
+    <path d="M754 340 C 754 300, 804 300, 804 250" stroke-width="18"/>
   </g>
 
-  <!-- Bold wordmark "Nø" — the "No IDE / No Idea" reading -->
-  <g font-family="ui-sans-serif, -apple-system, 'Helvetica Neue', Arial, sans-serif"
-     font-weight="900" font-size="420" text-anchor="middle">
-    <!-- N in slate-900 for strong contrast on the white canvas -->
-    <text x="430" y="640" fill="#0f172a" letter-spacing="-20">N</text>
-    <!-- Ø (O with a slash) in amber — the spark of an idea cutting through -->
-    <text x="660" y="640" fill="#f59e0b" letter-spacing="-20">ø</text>
+  <!-- Leaf nodes — each generation a brighter dot, like commits in a lineage -->
+  <g fill="#22d3ee">
+    <circle cx="220" cy="240" r="18"/>
+    <circle cx="320" cy="240" r="18"/>
+    <circle cx="400" cy="240" r="18"/>
+    <circle cx="500" cy="240" r="18"/>
+    <circle cx="524" cy="240" r="18"/>
+    <circle cx="624" cy="240" r="18"/>
+    <circle cx="704" cy="240" r="18"/>
+    <circle cx="804" cy="240" r="18"/>
   </g>
 
-  <!-- Pencil stroke across the canvas — the "drawing board is always reachable" mark -->
-  <g stroke="#f59e0b" stroke-width="18" stroke-linecap="round" fill="none" opacity="0.9">
-    <line x1="260" y1="756" x2="764" y2="268"/>
+  <!-- Mid-level nodes -->
+  <g fill="#34d399">
+    <circle cx="270" cy="340" r="16"/>
+    <circle cx="450" cy="340" r="16"/>
+    <circle cx="574" cy="340" r="16"/>
+    <circle cx="754" cy="340" r="16"/>
   </g>
-  <!-- Pencil tip spark -->
-  <circle cx="764" cy="268" r="28" fill="#f59e0b"/>
-  <circle cx="764" cy="268" r="14" fill="#ffffff"/>
+
+  <!-- First-fork nodes -->
+  <g fill="#fbbf24">
+    <circle cx="360" cy="460" r="18"/>
+    <circle cx="664" cy="460" r="18"/>
+  </g>
+
+  <!-- Seed: the origin feedback -->
+  <circle cx="512" cy="860" r="44" fill="#f59e0b"/>
+  <circle cx="512" cy="860" r="22" fill="#fff7ed"/>
 </svg>
