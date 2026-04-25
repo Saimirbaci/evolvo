@@ -75,12 +75,12 @@ impl FeedbackType {
 
     pub fn all() -> [FeedbackType; 6] {
         [
-            Self::Bug,
+            Self::NewApp,
             Self::FeatureRequest,
             Self::Improvement,
+            Self::Bug,
             Self::Confusion,
             Self::Compliment,
-            Self::NewApp,
         ]
     }
 }

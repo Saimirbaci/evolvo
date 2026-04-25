@@ -1370,6 +1370,11 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
 
     std::thread::spawn(move || {
         let engine = LineageEngine::new(&store);
+        // The caller (`commands::resume_lineage_job`) has already flipped
+        // status to `Implementing` synchronously before spawning this
+        // thread — don't re-flip it here, that would race with whatever
+        // else updates the record (e.g. `update_stage` from the first
+        // stage that runs below).
         let _ = engine.append_note(
             &job_id,
             &format!(
@@ -1378,7 +1383,6 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
                 agent_label = job.agent.label(),
             ),
         );
-        let _ = engine.force_status(&job_id, LineageJobStatus::Implementing);
 
         // Seed is idempotent: returns the existing plan when one is on disk.
         if let Err(e) =

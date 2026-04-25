@@ -265,14 +265,19 @@ pub fn resume_lineage_job(
         .map_err(store_error)?
         .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
 
+    // Flip to `Implementing` synchronously *before* spawning the resume
+    // thread so the UI sees the change immediately AND so the spawned
+    // thread's first writes (`append_note` + `force_status`) cannot race
+    // this status write — `save_lineage_job` is plain `fs::write`, no
+    // locking, so a write from main racing the thread's read-modify-write
+    // would silently clobber the resume note that the thread just appended.
+    let updated = engine
+        .force_status(&job.id, LineageJobStatus::Implementing)
+        .map_err(store_error)?;
+
     runner::resume_pipeline(store.clone(), job.id.clone())?;
 
-    // Surface the status flip immediately — `resume_pipeline` also sets
-    // `Implementing` on the background thread, but the caller wants the
-    // updated record to render *now*, not after the first stage finishes.
-    engine
-        .force_status(&job.id, LineageJobStatus::Implementing)
-        .map_err(store_error)
+    Ok(updated)
 }
 
 /// "Advance" button entry point. Behaviour depends on the job's current

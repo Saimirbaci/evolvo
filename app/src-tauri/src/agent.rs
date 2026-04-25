@@ -67,6 +67,7 @@ fn enriched_path() -> String {
         parts.push(format!("{home}/.cargo/bin"));
         parts.push(format!("{home}/.local/bin"));
         parts.push(format!("{home}/.bun/bin"));
+        parts.push(format!("{home}/.opencode/bin"));
         parts.push(format!("{home}/.volta/bin"));
         parts.push(format!("{home}/.nvm/versions/node/current/bin"));
         parts.push(format!("{home}/.npm-global/bin"));

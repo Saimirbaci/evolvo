@@ -552,7 +552,7 @@ fn LineageDetail(
                 view! {
                     <div class="lineage-fix-form">
                         <label class="lineage-fix-label">
-                            "Describe the problem or give Claude more context for the fix:"
+                            "Reset the iteration — optionally tell the agent what went wrong so the fresh run has more context:"
                         </label>
                         <textarea
                             class="lineage-fix-textarea"
@@ -601,9 +601,9 @@ fn LineageDetail(
                     class="secondary-btn"
                     prop:disabled=!can_retry
                     on:click=move |_| fix_open.update(|v| *v = !*v)
-                    title="Send a clarification and re-run this iteration"
+                    title="Reset this iteration — tear down the worktree and re-run from scratch (optional clarification note)"
                 >
-                    "Fix"
+                    "Reset"
                 </button>
                 <button
                     class="secondary-btn"

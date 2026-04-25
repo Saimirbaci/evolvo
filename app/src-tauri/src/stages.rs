@@ -375,8 +375,15 @@ fn persist_stage_outcome(
     Ok(())
 }
 
+/// Advance `plan.stage` monotonically. During resume the pipeline re-runs
+/// validators for already-green upstream stages; without the ordinal guard
+/// below, finishing `BackendPlan` after a previous run reached
+/// `FrontendImplemented` would regress `plan.stage` from ord 4 back to ord
+/// 1, which makes `stage_already_done` return false for every subsequent
+/// stage and causes the agent to be re-dispatched against artifacts that
+/// already exist on disk.
 fn advance_plan_stage(plan: &mut IterationPlan, finished: StageKind) {
-    plan.stage = match finished {
+    let candidate = match finished {
         StageKind::BackendPlan => PlanStage::BackendPlanned,
         StageKind::BackendImpl => PlanStage::BackendImplemented,
         StageKind::FrontendPlan => PlanStage::FrontendPlanned,
@@ -385,6 +392,9 @@ fn advance_plan_stage(plan: &mut IterationPlan, finished: StageKind) {
         StageKind::E2EImpl => PlanStage::E2EImplemented,
         StageKind::FinalReview => PlanStage::Completed,
     };
+    if plan_stage_ordinal(candidate) > plan_stage_ordinal(plan.stage) {
+        plan.stage = candidate;
+    }
 }
 
 /// Run the full canonical pipeline, stopping at the first red stage.
@@ -503,5 +513,28 @@ mod tests {
         for s in [BackendPlan, BackendImpl, FrontendPlan, FrontendImpl, E2EPlan, E2EImpl, FinalReview] {
             assert!(stage_already_done(Completed, s), "stage {s:?} should be done when plan Completed");
         }
+    }
+
+    #[test]
+    fn advance_plan_stage_is_monotonic() {
+        // Resume re-validates upstream green stages; finishing BackendPlan
+        // after the plan already reached FrontendImplemented must NOT
+        // regress plan.stage — otherwise stage_already_done flips false
+        // for downstream stages and the agent is re-dispatched against
+        // artifacts that are already on disk.
+        let mut plan = IterationPlan::default();
+        plan.stage = PlanStage::FrontendImplemented;
+
+        advance_plan_stage(&mut plan, StageKind::BackendPlan);
+        assert_eq!(plan.stage, PlanStage::FrontendImplemented, "BackendPlan must not regress");
+
+        advance_plan_stage(&mut plan, StageKind::FrontendImpl);
+        assert_eq!(plan.stage, PlanStage::FrontendImplemented, "same-ordinal must not bump");
+
+        advance_plan_stage(&mut plan, StageKind::E2EPlan);
+        assert_eq!(plan.stage, PlanStage::E2EPlanned, "strictly-greater stage must advance");
+
+        advance_plan_stage(&mut plan, StageKind::FinalReview);
+        assert_eq!(plan.stage, PlanStage::Completed);
     }
 }
