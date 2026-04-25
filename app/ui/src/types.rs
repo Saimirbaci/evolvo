@@ -9,7 +9,8 @@ pub enum AgentKind {
     ClaudeCode,
     CodexCli,
     GeminiCli,
-    OpenCode,
+    #[serde(alias = "open_code")]
+    Forge,
 }
 
 impl AgentKind {
@@ -18,7 +19,7 @@ impl AgentKind {
             Self::ClaudeCode,
             Self::CodexCli,
             Self::GeminiCli,
-            Self::OpenCode,
+            Self::Forge,
         ]
     }
 
@@ -27,7 +28,7 @@ impl AgentKind {
             Self::ClaudeCode => "Claude Code",
             Self::CodexCli => "Codex",
             Self::GeminiCli => "Gemini",
-            Self::OpenCode => "OpenCode",
+            Self::Forge => "Forge",
         }
     }
 
@@ -36,7 +37,7 @@ impl AgentKind {
             Self::ClaudeCode => "claude",
             Self::CodexCli => "codex",
             Self::GeminiCli => "gemini",
-            Self::OpenCode => "opencode",
+            Self::Forge => "forge",
         }
     }
 }

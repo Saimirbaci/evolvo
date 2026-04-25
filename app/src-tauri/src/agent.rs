@@ -1,7 +1,7 @@
 //! Per-CLI coding-agent backends.
 //!
 //! This module isolates every piece of knowledge that differs between the
-//! supported agent CLIs (Claude Code, Codex, Gemini, OpenCode) so the rest
+//! supported agent CLIs (Claude Code, Codex, Gemini, Forge) so the rest
 //! of the runner can stay agent-agnostic.
 //!
 //! The selected agent lives on the `LineageJobRecord` so Retry / Resume
@@ -53,7 +53,7 @@ pub fn backend_for(kind: AgentKind) -> Box<dyn AgentBackend> {
         AgentKind::ClaudeCode => Box::new(ClaudeBackend),
         AgentKind::CodexCli => Box::new(CodexBackend),
         AgentKind::GeminiCli => Box::new(GeminiBackend),
-        AgentKind::OpenCode => Box::new(OpenCodeBackend),
+        AgentKind::Forge => Box::new(ForgeBackend),
     }
 }
 
@@ -67,7 +67,7 @@ fn enriched_path() -> String {
         parts.push(format!("{home}/.cargo/bin"));
         parts.push(format!("{home}/.local/bin"));
         parts.push(format!("{home}/.bun/bin"));
-        parts.push(format!("{home}/.opencode/bin"));
+        parts.push(format!("{home}/.forge/bin"));
         parts.push(format!("{home}/.volta/bin"));
         parts.push(format!("{home}/.nvm/versions/node/current/bin"));
         parts.push(format!("{home}/.npm-global/bin"));
@@ -194,28 +194,32 @@ impl AgentBackend for GeminiBackend {
     }
 }
 
-/// OpenCode CLI (sst.dev). `opencode run <prompt>` runs a single
-/// non-interactive turn; provider/model selection lives in `opencode.json`
-/// at the worktree root or via `--model <provider/model>`.
-pub struct OpenCodeBackend;
+/// ForgeCode (forgecode.dev). `forge -p <prompt>` runs a single
+/// non-interactive turn ("One-Shot CLI Mode" in the upstream README).
+/// Provider / model selection lives in `forge.yaml` at the worktree root
+/// or via `forge provider login` once per host. Forge picks up `AGENTS.md`
+/// as its project guide, the same convention Codex uses, so the runner's
+/// existing `AGENTS.md → CLAUDE.md` symlink continues to wire up the right
+/// context for free.
+pub struct ForgeBackend;
 
-impl AgentBackend for OpenCodeBackend {
+impl AgentBackend for ForgeBackend {
     fn id(&self) -> AgentKind {
-        AgentKind::OpenCode
+        AgentKind::Forge
     }
     fn binary(&self) -> &'static str {
-        "opencode"
+        "forge"
     }
     fn log_filename(&self) -> &'static str {
-        "opencode.log"
+        "forge.log"
     }
     fn context_files(&self) -> &'static [&'static str] {
-        &["AGENTS.md", "opencode.json"]
+        &["AGENTS.md", "forge.yaml"]
     }
 
     fn build_command(&self, prompt: &str, worktree: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
-        cmd.arg("run")
+        cmd.arg("-p")
             .arg(prompt)
             .current_dir(worktree)
             .env("PATH", enriched_path())
@@ -338,14 +342,14 @@ mod tests {
     }
 
     #[test]
-    fn opencode_backend_uses_run_subcommand() {
-        let cmd = OpenCodeBackend.build_command("hi", Path::new("/tmp/w"));
-        assert_eq!(cmd.get_program(), "opencode");
+    fn forge_backend_uses_prompt_flag() {
+        let cmd = ForgeBackend.build_command("hi", Path::new("/tmp/w"));
+        assert_eq!(cmd.get_program(), "forge");
         let args: Vec<&str> = cmd
             .get_args()
             .map(|s| s.to_str().unwrap_or(""))
             .collect();
-        assert_eq!(args, vec!["run", "hi"]);
+        assert_eq!(args, vec!["-p", "hi"]);
     }
 
     #[test]

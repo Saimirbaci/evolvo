@@ -20,7 +20,13 @@ pub enum AgentKind {
     ClaudeCode,
     CodexCli,
     GeminiCli,
-    OpenCode,
+    /// ForgeCode (forgecode.dev) — `forge -p <prompt>` runs a single
+    /// non-interactive turn. The `open_code` alias keeps lineage jobs
+    /// persisted by older builds (which ran the OpenCode CLI under the
+    /// same slot) deserialisable; those records render as Forge in the
+    /// UI even though they were originally executed by `opencode`.
+    #[serde(alias = "open_code")]
+    Forge,
 }
 
 impl AgentKind {
@@ -29,7 +35,7 @@ impl AgentKind {
             Self::ClaudeCode,
             Self::CodexCli,
             Self::GeminiCli,
-            Self::OpenCode,
+            Self::Forge,
         ]
     }
 
@@ -39,7 +45,7 @@ impl AgentKind {
             Self::ClaudeCode => "Claude Code",
             Self::CodexCli => "Codex",
             Self::GeminiCli => "Gemini",
-            Self::OpenCode => "OpenCode",
+            Self::Forge => "Forge",
         }
     }
 
@@ -50,7 +56,7 @@ impl AgentKind {
             Self::ClaudeCode => "claude",
             Self::CodexCli => "codex",
             Self::GeminiCli => "gemini",
-            Self::OpenCode => "opencode",
+            Self::Forge => "forge",
         }
     }
 }
@@ -471,8 +477,13 @@ mod tests {
         assert_eq!(back, AgentKind::CodexCli);
         let back: AgentKind = serde_json::from_str("\"gemini_cli\"").unwrap();
         assert_eq!(back, AgentKind::GeminiCli);
-        let back: AgentKind = serde_json::from_str("\"open_code\"").unwrap();
-        assert_eq!(back, AgentKind::OpenCode);
+        let back: AgentKind = serde_json::from_str("\"forge\"").unwrap();
+        assert_eq!(back, AgentKind::Forge);
+        // Legacy lineage jobs persisted by builds that called the slot
+        // OpenCode must still load — the alias points the old slug at the
+        // new variant rather than failing the deserialise.
+        let legacy: AgentKind = serde_json::from_str("\"open_code\"").unwrap();
+        assert_eq!(legacy, AgentKind::Forge);
     }
 
     #[test]

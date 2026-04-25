@@ -214,11 +214,11 @@ A lineage job persists its selected agent as `agent` on the `LineageJobRecord` (
 - **Claude Code** (`AgentKind::ClaudeCode`) — binary `claude`, transcript `claude.log` (stream-json / JSONL).
 - **Codex CLI** (`AgentKind::CodexCli`) — binary `codex`, transcript `codex.log` (`codex exec --json` JSONL with its own event schema).
 - **Gemini CLI** (`AgentKind::GeminiCli`) — binary `gemini`, transcript `gemini.log` (free-form text, no stable JSONL).
-- **OpenCode CLI** (`AgentKind::OpenCode`) — binary `opencode`, transcript `opencode.log`.
+- **Forge** (`AgentKind::Forge`) — binary `forge` (forgecode.dev / tailcallhq), transcript `forge.log`. One-shot mode: `forge -p <prompt>`. Provider/model selection lives in `forge.yaml` at the worktree root or via `forge provider login` once per host. The wire-type variant carries `#[serde(alias = "open_code")]`, so lineage jobs persisted by older builds (which previously slotted OpenCode here) deserialise into the Forge variant — those records render as Forge in the UI even though they were originally executed by `opencode`.
 
 Project-guide discovery differs per CLI; the runner materialises symlinks at the worktree root so all four agents pick up `CLAUDE.md`:
 - Claude Code reads `CLAUDE.md` and `.claude/agents/*` natively.
-- Codex / OpenCode see `AGENTS.md` (symlink to `CLAUDE.md`).
+- Codex / Forge see `AGENTS.md` (symlink to `CLAUDE.md`).
 - Gemini sees `GEMINI.md` (symlink to `CLAUDE.md`).
 
 The multi-stage NewApp pipeline works for every backend because it drives off `plan.json`, not the agent log (see `app/src-tauri/src/stages.rs`). Retry/Resume reuse the job's persisted `agent`, so a failed Codex run retries as Codex, not Claude.
@@ -254,7 +254,7 @@ If `claude.log` is empty or missing tool_use events for the staged attachments, 
 
 `gemini.log` has no standard JSONL — fall back to `grep -n 'tool:'` and `grep -n 'error'` for a quick triage.
 
-`opencode.log` shape depends on the provider OpenCode is configured with; start by tailing the file and adapting the Claude/Codex recipes as needed.
+`forge.log` shape depends on the provider Forge is configured with; start by tailing the file and adapting the Claude/Codex recipes as needed.
 
 ## Lineage iteration port convention
 

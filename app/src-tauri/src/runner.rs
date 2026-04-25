@@ -129,7 +129,7 @@ pub fn log_path(workspace_root: &Path, job_id: &str) -> PathBuf {
 }
 
 /// Per-backend log path. The filename comes from the backend itself
-/// (`claude.log`, `codex.log`, `gemini.log`, `opencode.log`) so a single
+/// (`claude.log`, `codex.log`, `gemini.log`, `forge.log`) so a single
 /// lineage workspace can host retries across different agents without
 /// clobbering the transcript.
 pub fn agent_log_path(workspace_root: &Path, job_id: &str, agent: AgentKind) -> PathBuf {
@@ -138,7 +138,7 @@ pub fn agent_log_path(workspace_root: &Path, job_id: &str, agent: AgentKind) -> 
 }
 
 /// Materialise the worktree-root project guide files an agent expects
-/// (`AGENTS.md` for Codex/OpenCode, `GEMINI.md` for Gemini, etc.) by
+/// (`AGENTS.md` for Codex/Forge, `GEMINI.md` for Gemini, etc.) by
 /// symlinking them to the repo's existing `CLAUDE.md`. Best-effort: if a
 /// file with the same name already exists we leave it alone, and if the
 /// symlink syscall isn't available we fall back to `fs::copy`.
@@ -597,7 +597,7 @@ pub fn build_implementation_prompt(
 
 /// Agent-aware prompt builder. Substitutes `{agent_label}` and
 /// `{agent_context_files}` so the same template nudges Codex / Gemini /
-/// OpenCode to read `AGENTS.md` / `GEMINI.md` while keeping Claude on
+/// Forge to read `AGENTS.md` / `GEMINI.md` while keeping Claude on
 /// `CLAUDE.md`.
 pub fn build_implementation_prompt_for(
     feedback: &FeedbackRecord,
@@ -731,7 +731,7 @@ pub fn prepare_run(
     let attachments = stage_attachments(store, feedback, &inputs_dir)?;
 
     // Drop agent-appropriate context aliases (e.g. `AGENTS.md` → CLAUDE.md
-    // for Codex/OpenCode, `GEMINI.md` for Gemini) so each CLI picks up the
+    // for Codex/Forge, `GEMINI.md` for Gemini) so each CLI picks up the
     // same project guide under the name it expects. Best-effort; failures
     // are swallowed because the worktree is already usable without them.
     let backend = backend_for(agent);
@@ -1741,8 +1741,8 @@ mod tests {
             .ends_with("lineage_workspaces/job-1/codex.log"));
         assert!(agent_log_path(&root, "job-1", AgentKind::GeminiCli)
             .ends_with("lineage_workspaces/job-1/gemini.log"));
-        assert!(agent_log_path(&root, "job-1", AgentKind::OpenCode)
-            .ends_with("lineage_workspaces/job-1/opencode.log"));
+        assert!(agent_log_path(&root, "job-1", AgentKind::Forge)
+            .ends_with("lineage_workspaces/job-1/forge.log"));
     }
 
     #[test]
