@@ -1085,6 +1085,234 @@ button {
     justify-content: flex-end;
 }
 
+/* ---- Lineage overflow (kebab) menu ---- */
+
+.lineage-overflow {
+    position: relative;
+    display: inline-flex;
+}
+
+.lineage-overflow-trigger {
+    padding: 8px 12px;
+    font-size: 16px;
+    line-height: 1;
+}
+
+.lineage-overflow-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    right: 0;
+    min-width: 240px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--panel-shadow);
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 65;
+}
+
+.lineage-overflow-item {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 8px 10px;
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    text-align: left;
+    cursor: pointer;
+    color: var(--fg);
+}
+
+.lineage-overflow-item:hover:not(:disabled) {
+    background: rgba(15, 23, 42, 0.05);
+}
+
+.lineage-overflow-item:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.lineage-overflow-item .overflow-item-label {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.lineage-overflow-item .overflow-item-hint {
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.lineage-overflow-item-danger .overflow-item-label {
+    color: var(--danger);
+}
+
+.lineage-evolve-btn {
+    font-weight: 700;
+}
+
+/* ---- Evolve confirmation modal (dry-run preview) ---- */
+
+.evolve-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.45);
+    z-index: 70;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+
+.evolve-modal {
+    background: var(--bg);
+    border-radius: 16px;
+    box-shadow: 0 30px 60px rgba(15, 23, 42, 0.25);
+    max-width: 640px;
+    width: 100%;
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.evolve-modal-head {
+    padding: 20px 24px 12px;
+    border-bottom: 1px solid var(--border);
+}
+
+.evolve-modal-title {
+    margin: 0 0 4px;
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--fg);
+}
+
+.evolve-modal-subtitle {
+    margin: 0;
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.4;
+}
+
+.evolve-modal-body {
+    padding: 16px 24px;
+    overflow-y: auto;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.evolve-modal-skeleton {
+    padding: 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.evolve-modal-error {
+    padding: 12px;
+    background: rgba(220, 38, 38, 0.08);
+    border: 1px solid rgba(220, 38, 38, 0.25);
+    border-radius: 10px;
+    color: var(--danger);
+    font-size: 13px;
+}
+
+.evolve-modal-error-hint {
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.evolve-modal-meta {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 16px;
+    margin: 0;
+    font-size: 12px;
+}
+
+.evolve-modal-meta > div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.evolve-modal-meta dt {
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 10px;
+    font-weight: 600;
+}
+
+.evolve-modal-meta dd {
+    margin: 0;
+    color: var(--fg);
+    font-weight: 600;
+    font-size: 13px;
+}
+
+.evolve-modal-section h3 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.evolve-modal-summary {
+    margin: 0;
+    padding: 10px 12px;
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 12px;
+    color: var(--fg);
+    white-space: pre-wrap;
+    font-family: inherit;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.evolve-modal-files,
+.evolve-modal-notes {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 12px;
+    color: var(--fg);
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.evolve-modal-empty {
+    padding: 8px 10px;
+    background: #f8fafc;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.evolve-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    padding: 12px 24px 18px;
+    border-top: 1px solid var(--border);
+}
+
+.evolve-modal-confirm {
+    min-width: 160px;
+}
+
 /* ---- Floating feedback button ---- */
 
 .fab {

@@ -6,7 +6,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
 use crate::types::{
-    AgentAvailability, AppHealth, FeedbackRecord, LineageJobRecord, StageState,
+    AgentAvailability, AppHealth, FeedbackRecord, LineageJobRecord, PreviewSummary, StageState,
     SubmitFeedbackPayload,
 };
 
@@ -168,4 +168,14 @@ pub async fn resume_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
 /// installed. Cached server-side so repeated polls are cheap.
 pub async fn list_available_agents() -> Result<Vec<AgentAvailability>, String> {
     invoke_command("list_available_agents").await
+}
+
+/// Read-only dry-run preview of what an `Evolve` click on `id` will
+/// dispatch. Surfaced in the EvolveConfirmation modal before we
+/// actually call `approve_lineage_job` so the reviewer can confirm
+/// the planned scope. The host command never mutates state, so this
+/// can be called freely (e.g. on every modal open) without side
+/// effects.
+pub async fn preview_lineage_evolution(id: &str) -> Result<PreviewSummary, String> {
+    invoke_command_with_args("preview_lineage_evolution", &IdArg { id }).await
 }

@@ -15,6 +15,6 @@ pub use state::AppState;
 pub use store::{default_workspace_root, Store, StoreError, WorkspaceLayout};
 pub use types::{
     current_time_unix_ms, AgentAvailability, AgentKind, AppHealth, EntityIdPayload,
-    FeedbackRecord, FeedbackStatus, FeedbackType, LineageJobRecord, LineageJobStatus, StageKind,
-    StageState, StageStatus, SubmitFeedbackPayload,
+    FeedbackRecord, FeedbackStatus, FeedbackType, LineageJobRecord, LineageJobStatus,
+    PreviewSummary, StageKind, StageState, StageStatus, SubmitFeedbackPayload,
 };
