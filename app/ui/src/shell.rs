@@ -173,21 +173,81 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
     }
 }
 
+// FAB glyph approach — composite cluster (Option A from the plan).
+//
+// The single trigger (I-P3b) opens BOTH the Canvas overlay and the Feedback
+// panel, so the icon must announce all three intake modalities — draw, voice,
+// paste — not just "draw". A pencil alone reads as "annotate", which is half
+// the truth and the original feedback complaint.
+//
+// We render a small inline-SVG cluster: a primary pencil glyph (the most
+// frequent intake path), with a microphone and clipboard tucked into the
+// corners. Inline SVG keeps us off the Trunk asset pipeline and lets the
+// glyphs inherit `currentColor` from the FAB's foreground.
+//
+// On the first hover per session the FAB widens into a pill that reads
+// "Feedback" for ~2.5s before collapsing back to a circle. Subsequent hovers
+// stay collapsed so the affordance does not nag once the user has seen the
+// label. State is local to the component (per-process) — re-showing after an
+// app restart is acceptable and matches "first hover per session".
 #[component]
 fn FeedbackFab(controller: CanvasController, is_open: RwSignal<bool>) -> impl IntoView {
+    let pill_seen: RwSignal<bool> = RwSignal::new(false);
+    let pill_expanded: RwSignal<bool> = RwSignal::new(false);
+
+    let on_mouseenter = move |_ev: web_sys::MouseEvent| {
+        if pill_seen.get_untracked() || pill_expanded.get_untracked() {
+            return;
+        }
+        pill_expanded.set(true);
+        let Some(win) = web_sys::window() else { return };
+        let cb = Closure::once_into_js(move || {
+            pill_expanded.set(false);
+            pill_seen.set(true);
+        });
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.unchecked_ref(),
+            2500,
+        );
+    };
+
     view! {
         <button
             class="fab"
             class:fab-active=move || is_open.get()
-            title="Send feedback"
-            aria-label="Send feedback"
+            class:fab-pill-expand=move || pill_expanded.get() && !is_open.get()
+            title=move || {
+                if is_open.get() {
+                    "Close canvas + feedback panel"
+                } else {
+                    "Open canvas + send feedback"
+                }
+            }
+            aria-label=move || {
+                if is_open.get() {
+                    "Close canvas + feedback panel"
+                } else {
+                    "Open canvas + send feedback"
+                }
+            }
+            aria-expanded=move || if is_open.get() { "true" } else { "false" }
+            aria-controls="feedback-panel"
+            on:mouseenter=on_mouseenter
             on:click=move |_| is_open.update(|v| *v = !*v)
         >
             {move || {
                 if is_open.get() {
-                    "×"
+                    view! { <span class="fab-glyph fab-glyph-close" aria-hidden="true">"×"</span> }
+                        .into_any()
                 } else {
-                    "✎"
+                    view! { <FeedbackFabGlyphs /> }.into_any()
+                }
+            }}
+            {move || {
+                if pill_expanded.get() && !is_open.get() {
+                    view! { <span class="fab-label">"Feedback"</span> }.into_any()
+                } else {
+                    view! { <span></span> }.into_any()
                 }
             }}
             {move || {
@@ -201,6 +261,44 @@ fn FeedbackFab(controller: CanvasController, is_open: RwSignal<bool>) -> impl In
         </button>
     }
 }
+
+/// Composite SVG cluster: pencil (primary intake), microphone (voice), and
+/// clipboard (paste). Sized and positioned so the pencil reads as the focal
+/// glyph and the smaller chips signal "this also does mic + paste". All three
+/// inherit `currentColor` from `.fab` so the active/inactive backgrounds work
+/// without per-glyph styling.
+#[component]
+fn FeedbackFabGlyphs() -> impl IntoView {
+    view! {
+        <span class="fab-glyph-cluster" aria-hidden="true">
+            // Primary pencil (24x24 viewBox, scaled via CSS).
+            <svg
+                class="fab-glyph fab-glyph-pencil"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+            >
+                <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0L15.13 5.12l3.75 3.75 1.83-1.83z"/>
+            </svg>
+            // Microphone chip (top-right).
+            <svg
+                class="fab-glyph fab-glyph-mic"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+            >
+                <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/>
+            </svg>
+            // Clipboard / paste chip (bottom-left).
+            <svg
+                class="fab-glyph fab-glyph-paste"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+            >
+                <path d="M19 4h-3.18A3 3 0 0 0 13 2h-2a3 3 0 0 0-2.82 2H5a2 2 0 0 0-2 2v15a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm-7-.5a1 1 0 1 1-1 1 1 1 0 0 1 1-1zM19 21H5V6h2v2h10V6h2z"/>
+            </svg>
+        </span>
+    }
+}
+
 
 #[component]
 fn LineagePage() -> impl IntoView {

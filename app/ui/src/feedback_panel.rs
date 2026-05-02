@@ -241,6 +241,7 @@ pub fn FeedbackPanel(
 
     view! {
         <aside
+            id="feedback-panel"
             class="panel"
             aria-label="Feedback"
             style:transform=move || {
