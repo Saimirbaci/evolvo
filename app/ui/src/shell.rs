@@ -300,6 +300,44 @@ fn FeedbackFabGlyphs() -> impl IntoView {
 }
 
 
+#[derive(Copy, Clone)]
+pub struct LineageDetailState {
+    pub fix_open: RwSignal<bool>,
+    pub fix_text: RwSignal<String>,
+    pub fix_submitting: RwSignal<bool>,
+    pub overflow_open: RwSignal<bool>,
+    pub evolve_modal_open: RwSignal<bool>,
+    pub preview_loading: RwSignal<bool>,
+    pub preview_data: RwSignal<Option<PreviewSummary>>,
+    pub preview_error: RwSignal<Option<String>>,
+    pub evolve_submitting: RwSignal<bool>,
+}
+
+impl LineageDetailState {
+    pub fn new() -> Self {
+        Self {
+            fix_open: RwSignal::new(false),
+            fix_text: RwSignal::new(String::new()),
+            fix_submitting: RwSignal::new(false),
+            overflow_open: RwSignal::new(false),
+            evolve_modal_open: RwSignal::new(false),
+            preview_loading: RwSignal::new(false),
+            preview_data: RwSignal::new(None),
+            preview_error: RwSignal::new(None),
+            evolve_submitting: RwSignal::new(false),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.fix_open.set(false);
+        self.fix_text.set(String::new());
+        self.overflow_open.set(false);
+        self.evolve_modal_open.set(false);
+        self.preview_data.set(None);
+        self.preview_error.set(None);
+    }
+}
+
 #[component]
 fn LineagePage() -> impl IntoView {
     let items: RwSignal<Option<Result<Vec<LineageJobRecord>, String>>> = RwSignal::new(None);
@@ -313,6 +351,8 @@ fn LineagePage() -> impl IntoView {
     // is torn down + rebuilt, the error message persists long enough for the
     // user to read it.
     let action_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let action_success: RwSignal<Option<String>> = RwSignal::new(None);
+    let detail_state = LineageDetailState::new();
     Effect::new(move |_: Option<()>| {
         let _ = reload.get();
         spawn_local(async move {
@@ -351,16 +391,64 @@ fn LineagePage() -> impl IntoView {
         if let Some(p) = prev.as_ref() {
             if p != &now {
                 action_error.set(None);
+                action_success.set(None);
+                detail_state.reset();
             }
         }
         now
     });
+
+    let import_click = move |_| {
+        let Some(win) = web_sys::window() else { return };
+        let Ok(Some(bundle_path)) = win.prompt_with_message(
+            "Path to .evolvo-bundle file:",
+        ) else {
+            return;
+        };
+        if bundle_path.trim().is_empty() {
+            return;
+        }
+        let Ok(Some(target_root)) = win.prompt_with_message(
+            "Target workspace root for the new app (must be empty):",
+        ) else {
+            return;
+        };
+        if target_root.trim().is_empty() {
+            return;
+        }
+        action_error.set(None);
+        action_success.set(None);
+        spawn_local(async move {
+            match interop::import_lineage_bundle(bundle_path.trim(), target_root.trim()).await {
+                Ok(s) => {
+                    let msg = format!(
+                        "Imported lineage {} into {} ({} feedback, {} attachments). \
+                         Launch the new app with EVOLVO_WORKSPACE_ROOT={}",
+                        s.primary_job_id,
+                        s.workspace_root,
+                        s.feedback_count,
+                        s.attachment_count,
+                        s.workspace_root,
+                    );
+                    action_success.set(Some(msg));
+                }
+                Err(e) => action_error.set(Some(format!("Import failed: {e}"))),
+            }
+        });
+    };
 
     view! {
         <div class="lineage-page">
             <aside class="lineage-sidebar">
                 <div class="lineage-sidebar-head">
                     <h2 class="lineage-sidebar-title">"Lineage"</h2>
+                    <button
+                        class="lineage-sort-toggle"
+                        title="Open a .evolvo-bundle into a fresh workspace (I-P4)"
+                        on:click=import_click
+                    >
+                        "Open bundle…"
+                    </button>
                     <button
                         class="lineage-sort-toggle"
                         title="Toggle sort order by creation time"
@@ -418,6 +506,24 @@ fn LineagePage() -> impl IntoView {
                 }}
             </aside>
             <section class="lineage-detail">
+                {move || match action_error.get() {
+                    Some(e) => view! {
+                        <div class="lineage-action-error" role="alert" style="margin: 24px 24px 0;">
+                            <strong>"Action failed: "</strong>{e}
+                        </div>
+                    }.into_any(),
+                    None => view! { <span></span> }.into_any(),
+                }}
+
+                {move || match action_success.get() {
+                    Some(msg) => view! {
+                        <div class="lineage-action-success" role="status" style="margin: 24px 24px 0; padding: 12px; border-radius: 8px; background: rgba(22, 163, 74, 0.1); color: var(--success); border: 1px solid rgba(22, 163, 74, 0.2);">
+                            {msg}
+                        </div>
+                    }.into_any(),
+                    None => view! { <span></span> }.into_any(),
+                }}
+
                 {move || {
                     let Some(Ok(records)) = items.get() else {
                         return view! { <div class="empty-state">"Loading…"</div> }.into_any();
@@ -430,7 +536,7 @@ fn LineagePage() -> impl IntoView {
                     let Some(record) = records.into_iter().find(|r| r.id == id) else {
                         return view! { <div class="empty-state">"No selection."</div> }.into_any();
                     };
-                    view! { <LineageDetail record=record reload=reload action_error=action_error /> }.into_any()
+                    view! { <LineageDetail record=record reload=reload action_error=action_error action_success=action_success detail_state=detail_state /> }.into_any()
                 }}
             </section>
         </div>
@@ -445,6 +551,8 @@ fn LineageDetail(
     // `LineagePage` so the message outlives this component's reconstruction
     // when `items` reloads right after an action fires.
     action_error: RwSignal<Option<String>>,
+    action_success: RwSignal<Option<String>>,
+    detail_state: LineageDetailState,
 ) -> impl IntoView {
     let can_approve = record.status.can_approve();
     let can_retry = record.status.can_retry();
@@ -465,29 +573,19 @@ fn LineageDetail(
     let retry_id = record.id.clone();
     let run_id = record.id.clone();
     let resume_id = record.id.clone();
+    let fork_id = record.id.clone();
 
-    // Inline "Fix" clarification editor state.
-    let fix_open: RwSignal<bool> = RwSignal::new(false);
-    let fix_text: RwSignal<String> = RwSignal::new(String::new());
-    let fix_submitting: RwSignal<bool> = RwSignal::new(false);
+    let fix_open = detail_state.fix_open;
+    let fix_text = detail_state.fix_text;
+    let fix_submitting = detail_state.fix_submitting;
 
-    // Overflow (kebab) menu visibility. Click-toggle, not hover, so the
-    // menu is keyboard-accessible (a hover-only menu fails leptos.md a11y
-    // rule and traps users on touch devices).
-    let overflow_open: RwSignal<bool> = RwSignal::new(false);
+    let overflow_open = detail_state.overflow_open;
 
-    // EvolveConfirmation modal state. The dry-run preview is loaded
-    // lazily on Evolve click; while pending we show a skeleton. The
-    // architect doc's I3 (bounded blast radius / dry-run default) is
-    // implemented at this UI layer — the underlying state machine in
-    // lineage.rs is unchanged. If the preview command errors we still
-    // let the reviewer proceed via "Proceed without preview" so a broken
-    // preview never bricks the lineage pipeline (I-P1 invariant).
-    let evolve_modal_open: RwSignal<bool> = RwSignal::new(false);
-    let preview_loading: RwSignal<bool> = RwSignal::new(false);
-    let preview_data: RwSignal<Option<PreviewSummary>> = RwSignal::new(None);
-    let preview_error: RwSignal<Option<String>> = RwSignal::new(None);
-    let evolve_submitting: RwSignal<bool> = RwSignal::new(false);
+    let evolve_modal_open = detail_state.evolve_modal_open;
+    let preview_loading = detail_state.preview_loading;
+    let preview_data = detail_state.preview_data;
+    let preview_error = detail_state.preview_error;
+    let evolve_submitting = detail_state.evolve_submitting;
 
     let approve_id_for_modal = approve_id.clone();
     let open_evolve_modal = move || {
@@ -553,6 +651,44 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
         schedule_reloads(reload, &[1500, 4000, 10_000]);
+    };
+    let do_fork = move || {
+        // Operationalises product invariant I-P4 — bundle this lineage and
+        // surface the resulting `.evolvo-bundle` path so the user can carry
+        // it to a fresh workspace. We prompt for the destination dir so the
+        // user can route bundles wherever they keep their forks; an empty
+        // response defaults to `<workspace>/exports/`.
+        let id = fork_id.clone();
+        let win = web_sys::window();
+        let dest = win
+            .as_ref()
+            .and_then(|w| {
+                w.prompt_with_message_and_default(
+                    "Destination directory for the .evolvo-bundle (blank = workspace exports/):",
+                    "",
+                )
+                .ok()
+                .flatten()
+            })
+            .unwrap_or_default();
+        let dest_opt = if dest.trim().is_empty() {
+            None
+        } else {
+            Some(dest.trim().to_string())
+        };
+        action_error.set(None);
+        action_success.set(None);
+        spawn_local(async move {
+            match interop::export_lineage(&id, dest_opt.as_deref()).await {
+                Ok(r) => action_success.set(Some(format!(
+                    "Forked → {}. To launch as its own app: \
+                     EVOLVO_WORKSPACE_ROOT=<new_dir> cargo tauri dev (after \
+                     importing the bundle there).",
+                    r.bundle_path
+                ))),
+                Err(e) => action_error.set(Some(format!("Fork failed: {e}"))),
+            }
+        });
     };
     let do_resume = move || {
         let id = resume_id.clone();
@@ -736,15 +872,6 @@ fn LineageDetail(
                 }.into_any()
             }}
 
-            {move || match action_error.get() {
-                Some(e) => view! {
-                    <div class="lineage-action-error" role="alert">
-                        <strong>"Action failed: "</strong>{e}
-                    </div>
-                }.into_any(),
-                None => view! { <span></span> }.into_any(),
-            }}
-
             <div class="lineage-detail-actions">
                 // Secondary: Run — preview the current iteration's app.
                 <button
@@ -767,7 +894,7 @@ fn LineageDetail(
                         aria-haspopup="menu"
                         aria-expanded=move || if overflow_open.get() { "true" } else { "false" }
                         aria-label="More iteration actions"
-                        title="More actions: Reset, Resume, Reject"
+                        title="More actions: Fork, Reset, Resume, Reject"
                         on:click=move |_| overflow_open.update(|v| *v = !*v)
                     >
                         "⋯"
@@ -776,10 +903,23 @@ fn LineageDetail(
                         if !overflow_open.get() {
                             return view! { <span></span> }.into_any();
                         }
+                        let do_fork = do_fork.clone();
                         let do_reject = do_reject.clone();
                         let do_resume = do_resume.clone();
                         view! {
                             <div class="lineage-overflow-menu" role="menu">
+                                <button
+                                    class="lineage-overflow-item"
+                                    role="menuitem"
+                                    title="Fork — bundle this lineage into a portable .evolvo-bundle (I-P4)"
+                                    on:click=move |_| {
+                                        overflow_open.set(false);
+                                        do_fork();
+                                    }
+                                >
+                                    <span class="overflow-item-label">"Fork…"</span>
+                                    <span class="overflow-item-hint">"bundle into a portable fork"</span>
+                                </button>
                                 <button
                                     class="lineage-overflow-item"
                                     role="menuitem"

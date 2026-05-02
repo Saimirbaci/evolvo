@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tauri::State;
 
 use crate::agent;
+use crate::bundle::{self, ImportSummary};
 use crate::lineage::{LineageEngine, Transition};
 use crate::runner;
 use crate::state::AppState;
@@ -674,6 +675,73 @@ pub fn capture_window_png(window: tauri::WebviewWindow) -> Result<String, String
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
     Ok(STANDARD.encode(&buf))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportLineagePayload {
+    pub id: String,
+    /// Optional override for where the `.evolvo-bundle` file is written. When
+    /// absent, exports land in `{workspace_root}/exports/`. Path is taken as
+    /// given (no shell expansion) — the UI is responsible for resolving `~`.
+    #[serde(default)]
+    pub destination_dir: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportLineageResult {
+    pub bundle_path: String,
+}
+
+/// Operationalises product invariant I-P4 — write a portable `.evolvo-bundle`
+/// archive for a given lineage job. The bundle contains the job, the feedback
+/// row that fed it, and every attachment, with all host-specific paths
+/// stripped. See `bundle.rs` for the file layout and the round-trip test.
+#[tauri::command]
+pub fn export_lineage(
+    state: State<'_, AppState>,
+    payload: ExportLineagePayload,
+) -> Result<ExportLineageResult, String> {
+    let store = state.store();
+    let dest = match payload.destination_dir.as_deref() {
+        Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
+        _ => store.layout().root().join("exports"),
+    };
+    let path = bundle::export_lineage_to_dir(
+        &store,
+        &payload.id,
+        &dest,
+        APP_NAME,
+        APP_VERSION,
+    )
+    .map_err(store_error)?;
+    Ok(ExportLineageResult {
+        bundle_path: path.display().to_string(),
+    })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportLineagePayload {
+    pub bundle_path: String,
+    /// Workspace root for the new app. Must be either non-existent or empty
+    /// of lineage data — see `bundle::import_lineage_bundle`.
+    pub target_workspace_root: String,
+}
+
+/// Inverse of `export_lineage` — read a `.evolvo-bundle` and seed a fresh
+/// workspace. Does **not** mutate the host's currently-mounted workspace.
+/// The UI is expected to spawn (or instruct the user to spawn) a new Evolvo
+/// process with `EVOLVO_WORKSPACE_ROOT=<target>` set, since the running
+/// instance is locked to its own root.
+#[tauri::command]
+pub fn import_lineage_bundle(
+    payload: ImportLineagePayload,
+) -> Result<ImportSummary, String> {
+    let bundle_path = std::path::PathBuf::from(&payload.bundle_path);
+    let target_root = std::path::PathBuf::from(&payload.target_workspace_root);
+    bundle::import_lineage_bundle(&bundle_path, &target_root).map_err(store_error)
 }
 
 #[derive(serde::Deserialize)]
