@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod bundle;
 pub mod commands;
 pub mod lineage;
 pub mod plan;

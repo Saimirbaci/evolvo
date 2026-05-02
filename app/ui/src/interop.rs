@@ -169,3 +169,64 @@ pub async fn resume_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
 pub async fn list_available_agents() -> Result<Vec<AgentAvailability>, String> {
     invoke_command("list_available_agents").await
 }
+
+#[derive(Serialize)]
+struct ExportLineageArgs<'a> {
+    id: &'a str,
+    #[serde(rename = "destinationDir", skip_serializing_if = "Option::is_none")]
+    destination_dir: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportLineageResult {
+    pub bundle_path: String,
+}
+
+/// Operationalises product invariant I-P4: write a portable `.evolvo-bundle`
+/// for the given lineage job. Pass `destination_dir = None` to land in the
+/// workspace's `exports/` directory.
+pub async fn export_lineage(
+    id: &str,
+    destination_dir: Option<&str>,
+) -> Result<ExportLineageResult, String> {
+    invoke_command_with_args(
+        "export_lineage",
+        &ExportLineageArgs {
+            id,
+            destination_dir,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+struct ImportLineageArgs<'a> {
+    #[serde(rename = "bundlePath")]
+    bundle_path: &'a str,
+    #[serde(rename = "targetWorkspaceRoot")]
+    target_workspace_root: &'a str,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSummary {
+    pub workspace_root: String,
+    pub primary_job_id: String,
+    pub feedback_count: u32,
+    pub attachment_count: u32,
+}
+
+pub async fn import_lineage_bundle(
+    bundle_path: &str,
+    target_workspace_root: &str,
+) -> Result<ImportSummary, String> {
+    invoke_command_with_args(
+        "import_lineage_bundle",
+        &ImportLineageArgs {
+            bundle_path,
+            target_workspace_root,
+        },
+    )
+    .await
+}
