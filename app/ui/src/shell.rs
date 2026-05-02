@@ -258,11 +258,56 @@ fn LineagePage() -> impl IntoView {
         now
     });
 
+    let import_click = move |_| {
+        let Some(win) = web_sys::window() else { return };
+        let Ok(Some(bundle_path)) = win.prompt_with_message(
+            "Path to .evolvo-bundle file:",
+        ) else {
+            return;
+        };
+        if bundle_path.trim().is_empty() {
+            return;
+        }
+        let Ok(Some(target_root)) = win.prompt_with_message(
+            "Target workspace root for the new app (must be empty):",
+        ) else {
+            return;
+        };
+        if target_root.trim().is_empty() {
+            return;
+        }
+        action_error.set(None);
+        spawn_local(async move {
+            match interop::import_lineage_bundle(bundle_path.trim(), target_root.trim()).await {
+                Ok(s) => {
+                    let msg = format!(
+                        "Imported lineage {} into {} ({} feedback, {} attachments). \
+                         Launch the new app with EVOLVO_WORKSPACE_ROOT={}",
+                        s.primary_job_id,
+                        s.workspace_root,
+                        s.feedback_count,
+                        s.attachment_count,
+                        s.workspace_root,
+                    );
+                    action_error.set(Some(msg));
+                }
+                Err(e) => action_error.set(Some(format!("Import failed: {e}"))),
+            }
+        });
+    };
+
     view! {
         <div class="lineage-page">
             <aside class="lineage-sidebar">
                 <div class="lineage-sidebar-head">
                     <h2 class="lineage-sidebar-title">"Lineage"</h2>
+                    <button
+                        class="lineage-sort-toggle"
+                        title="Open a .evolvo-bundle into a fresh workspace (I-P4)"
+                        on:click=import_click
+                    >
+                        "Open bundle…"
+                    </button>
                     <button
                         class="lineage-sort-toggle"
                         title="Toggle sort order by creation time"
@@ -367,6 +412,7 @@ fn LineageDetail(
     let retry_id = record.id.clone();
     let run_id = record.id.clone();
     let resume_id = record.id.clone();
+    let fork_id = record.id.clone();
 
     // Inline "Fix" clarification editor state.
     let fix_open: RwSignal<bool> = RwSignal::new(false);
@@ -403,6 +449,43 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
         schedule_reloads(reload, &[1500, 4000, 10_000]);
+    };
+    let fork_click = move |_| {
+        // Operationalises product invariant I-P4 — bundle this lineage and
+        // surface the resulting `.evolvo-bundle` path so the user can carry
+        // it to a fresh workspace. We prompt for the destination dir so the
+        // user can route bundles wherever they keep their forks; an empty
+        // response defaults to `<workspace>/exports/`.
+        let id = fork_id.clone();
+        let win = web_sys::window();
+        let dest = win
+            .as_ref()
+            .and_then(|w| {
+                w.prompt_with_message_and_default(
+                    "Destination directory for the .evolvo-bundle (blank = workspace exports/):",
+                    "",
+                )
+                .ok()
+                .flatten()
+            })
+            .unwrap_or_default();
+        let dest_opt = if dest.trim().is_empty() {
+            None
+        } else {
+            Some(dest.trim().to_string())
+        };
+        action_error.set(None);
+        spawn_local(async move {
+            match interop::export_lineage(&id, dest_opt.as_deref()).await {
+                Ok(r) => action_error.set(Some(format!(
+                    "Forked → {}. To launch as its own app: \
+                     EVOLVO_WORKSPACE_ROOT=<new_dir> cargo tauri dev (after \
+                     importing the bundle there).",
+                    r.bundle_path
+                ))),
+                Err(e) => action_error.set(Some(format!("Fork failed: {e}"))),
+            }
+        });
     };
     let resume_click = move |_| {
         let id = resume_id.clone();
@@ -592,6 +675,13 @@ fn LineageDetail(
             }}
 
             <div class="lineage-detail-actions">
+                <button
+                    class="secondary-btn"
+                    on:click=fork_click
+                    title="Bundle this lineage into a portable .evolvo-bundle (I-P4: fork into a new app)"
+                >
+                    "Fork…"
+                </button>
                 <button class="secondary-btn" on:click=reject_click>"Reject"</button>
                 <button
                     class="secondary-btn"

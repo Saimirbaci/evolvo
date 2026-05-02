@@ -26,6 +26,7 @@ sha2 = "0.10"
 tauri = { version = "2", features = [] }
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3.14"
