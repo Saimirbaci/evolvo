@@ -8,7 +8,7 @@ use crate::state::AppState;
 use crate::store::StoreError;
 use crate::types::{
     current_time_unix_ms, AgentAvailability, AppHealth, EntityIdPayload, FeedbackRecord,
-    FeedbackStatus, LineageJobRecord, LineageJobStatus, SubmitFeedbackPayload,
+    FeedbackStatus, LineageJobRecord, LineageJobStatus, PreviewSummary, SubmitFeedbackPayload,
 };
 #[cfg(test)]
 use crate::types::AgentKind;
@@ -463,6 +463,167 @@ pub fn run_lineage_job(
         .ok_or_else(|| format!("lineage job disappeared after run: {}", payload.id))
 }
 
+/// Read-only dry-run preview of what an `Evolve` click will dispatch. The
+/// UI calls this when the reviewer presses Evolve so they can confirm the
+/// upcoming iteration's planned scope *before* the state machine actually
+/// transitions. Per architect doc I3 (bounded blast radius / dry-run
+/// default) this command MUST NOT mutate state — it only reads
+/// `plan.json` + the persisted job record. If `plan.json` is absent
+/// (e.g. classic single-stage feedback that hasn't planned yet, or an
+/// older job that pre-dates the multi-stage pipeline) the summary
+/// returns a `PreviewSummary` with empty `plannedFiles` and an
+/// informational `note`, rather than erroring — that way the reviewer
+/// can still proceed "agent unguided" without the dry-run blocking
+/// I-P1 (lineage always works).
+#[tauri::command]
+pub fn preview_lineage_evolution(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<PreviewSummary, String> {
+    preview_lineage_evolution_impl(state.store(), &payload.id)
+}
+
+/// Testable body of `preview_lineage_evolution`. Lives separately so unit
+/// tests can drive it against a `tempdir`-backed `Store` without going
+/// through the `#[tauri::command]` shim's `State<'_, AppState>` plumbing.
+pub fn preview_lineage_evolution_impl(
+    store: crate::store::Store,
+    job_id: &str,
+) -> Result<PreviewSummary, String> {
+    let job = store
+        .load_lineage_job(job_id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+
+    let target_iteration = job.iteration;
+    let source_iteration = target_iteration.saturating_sub(1);
+    let target_port = runner::iteration_port(target_iteration);
+
+    let workspace_root = store.layout().root().to_path_buf();
+    let job_dir = runner::job_workspace_dir(&workspace_root, &job.id);
+
+    let mut notes: Vec<String> = Vec::new();
+    let (plan_summary, planned_files) = match crate::plan::load_plan(&job_dir) {
+        Ok(Some(plan)) => synthesize_preview(&plan, &mut notes),
+        Ok(None) => {
+            notes.push(
+                "No plan recorded yet — proceeding will run the agent without a recorded plan."
+                    .to_string(),
+            );
+            (default_plan_summary(&job), Vec::new())
+        }
+        Err(e) => {
+            notes.push(format!("plan.json could not be read: {e}"));
+            (default_plan_summary(&job), Vec::new())
+        }
+    };
+
+    Ok(PreviewSummary {
+        job_id: job.id,
+        agent: job.agent,
+        source_iteration,
+        target_iteration,
+        target_port,
+        plan_summary,
+        planned_files,
+        notes,
+        captured_at_unix_ms: current_time_unix_ms(),
+    })
+}
+
+const PLAN_SUMMARY_BUDGET: usize = 4096;
+const MAX_PLANNED_FILES: usize = 64;
+
+fn default_plan_summary(job: &LineageJobRecord) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if !job.title.is_empty() {
+        lines.push(job.title.clone());
+    }
+    if !job.summary.is_empty() {
+        lines.push(job.summary.clone());
+    }
+    if lines.is_empty() {
+        lines.push(format!(
+            "Lineage job {} — agent {} will run from the staged feedback.",
+            job.id,
+            job.agent.label()
+        ));
+    }
+    truncate(&lines.join("\n"), PLAN_SUMMARY_BUDGET)
+}
+
+fn synthesize_preview(
+    plan: &crate::plan::IterationPlan,
+    notes: &mut Vec<String>,
+) -> (String, Vec<String>) {
+    let mut summary_lines: Vec<String> = Vec::new();
+    if !plan.app.name.is_empty() {
+        summary_lines.push(format!("App: {}", plan.app.name));
+    }
+    if !plan.app.one_liner.is_empty() {
+        summary_lines.push(format!("Goal: {}", plan.app.one_liner));
+    }
+    summary_lines.push(format!("Stage: {}", plan.stage.label()));
+
+    let entity_count = plan.backend.entities.len();
+    let command_count = plan.backend.commands.len();
+    let route_count = plan.frontend.routes.len();
+    let component_count = plan.frontend.components.len();
+    let scenario_count = plan.e2e.scenarios.len();
+    summary_lines.push(format!(
+        "Backend: {entity_count} entities · {command_count} commands · {} tests",
+        plan.backend.tests.len()
+    ));
+    summary_lines.push(format!(
+        "Frontend: {route_count} routes · {component_count} components"
+    ));
+    summary_lines.push(format!("E2E: {scenario_count} scenarios"));
+
+    let mut files: Vec<String> = Vec::new();
+    for e in &plan.backend.entities {
+        files.push(format!("entity: {}", e.name));
+    }
+    for c in &plan.backend.commands {
+        files.push(format!("command: {} → {}", c.name, c.output));
+    }
+    for r in &plan.frontend.routes {
+        files.push(format!("route: {} ({})", r.path, r.component));
+    }
+    for c in &plan.frontend.components {
+        files.push(format!("component: {}", c.name));
+    }
+    for s in &plan.e2e.scenarios {
+        files.push(format!("e2e: {}", s.title));
+    }
+    if files.len() > MAX_PLANNED_FILES {
+        let dropped = files.len() - MAX_PLANNED_FILES;
+        files.truncate(MAX_PLANNED_FILES);
+        notes.push(format!("planned items truncated for display ({dropped} more)"));
+    }
+
+    if files.is_empty() && plan.history.is_empty() {
+        notes.push(
+            "plan.json present but no concrete artefacts planned yet — agent will plan as it runs."
+                .to_string(),
+        );
+    }
+
+    (truncate(&summary_lines.join("\n"), PLAN_SUMMARY_BUDGET), files)
+}
+
+fn truncate(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n…(truncated)");
+    out
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotePayload {
@@ -676,5 +837,133 @@ mod tests {
         for kind in AgentKind::all() {
             assert!(all.iter().any(|a| a.kind == kind));
         }
+    }
+
+    fn seed_pending_job(store: &crate::store::Store) -> LineageJobRecord {
+        let mut rec = FeedbackRecord {
+            id: "fb-preview".into(),
+            feedback_type: FeedbackType::FeatureRequest,
+            status: FeedbackStatus::New,
+            page_route: "/".into(),
+            feedback_text: "add a budget tracker".into(),
+            annotations: vec![],
+            pasted_images: vec![],
+            screenshot_filename: None,
+            voice_filename: None,
+            voice_transcript: None,
+            window_width: 800,
+            window_height: 600,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            lineage_job_id: None,
+        };
+        store.save_feedback(&rec).unwrap();
+        let engine = LineageEngine::new(store);
+        engine
+            .enqueue_job_for_feedback(&mut rec, AgentKind::ClaudeCode)
+            .unwrap()
+    }
+
+    #[test]
+    fn preview_returns_summary_with_no_plan_recorded_when_plan_json_absent() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+        let job = seed_pending_job(&store);
+
+        let preview = preview_lineage_evolution_impl(store.clone(), &job.id).unwrap();
+        assert_eq!(preview.job_id, job.id);
+        assert_eq!(preview.agent, AgentKind::ClaudeCode);
+        assert!(preview.planned_files.is_empty());
+        assert!(
+            preview
+                .notes
+                .iter()
+                .any(|n| n.contains("No plan recorded")),
+            "expected a 'no plan recorded' note, got: {:?}",
+            preview.notes
+        );
+        assert!(preview.captured_at_unix_ms > 0);
+    }
+
+    #[test]
+    fn preview_summarises_plan_json_when_present() {
+        use crate::plan::{
+            save_plan, AppIdentity, CommandPlan, ComponentPlan, IterationPlan, PlanStage,
+            PLAN_SCHEMA_VERSION,
+        };
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+        let job = seed_pending_job(&store);
+
+        let workspace_root = store.layout().root().to_path_buf();
+        let job_dir = runner::job_workspace_dir(&workspace_root, &job.id);
+        let mut plan = IterationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            app: AppIdentity {
+                name: "Budgeter".into(),
+                one_liner: "Track monthly spend".into(),
+                job_id: job.id.clone(),
+                iteration: job.iteration,
+                ..Default::default()
+            },
+            stage: PlanStage::BackendPlanned,
+            ..Default::default()
+        };
+        plan.backend.commands.push(CommandPlan {
+            name: "create_budget".into(),
+            input: "CreateBudgetPayload".into(),
+            output: "Budget".into(),
+            motivated_by_regions: vec!["R1".into()],
+            summary: "Create a budget".into(),
+        });
+        plan.frontend.components.push(ComponentPlan {
+            name: "BudgetForm".into(),
+            module: "budget_form.rs".into(),
+            uses_commands: vec!["create_budget".into()],
+            summary: "Budget create form".into(),
+            motivated_by_regions: vec!["R1".into()],
+        });
+        save_plan(&job_dir, &plan).unwrap();
+
+        let preview = preview_lineage_evolution_impl(store, &job.id).unwrap();
+        assert!(preview.plan_summary.contains("Budgeter"));
+        assert!(preview
+            .planned_files
+            .iter()
+            .any(|f| f.contains("create_budget")));
+        assert!(preview
+            .planned_files
+            .iter()
+            .any(|f| f.contains("BudgetForm")));
+    }
+
+    #[test]
+    fn preview_errors_for_unknown_job_id() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+        let err = preview_lineage_evolution_impl(store, "nonexistent-job").unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn preview_summary_tolerates_extra_fields() {
+        // Forward-compat: the UI should keep working if a future host adds
+        // fields to PreviewSummary.
+        let raw = r#"{
+            "jobId": "job-x",
+            "agent": "claude_code",
+            "sourceIteration": 0,
+            "targetIteration": 1,
+            "targetPort": 1531,
+            "planSummary": "hello",
+            "plannedFiles": ["command: foo"],
+            "notes": [],
+            "capturedAtUnixMs": 1,
+            "futureField": 42
+        }"#;
+        let p: PreviewSummary = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.job_id, "job-x");
+        assert_eq!(p.target_port, 1531);
+        assert_eq!(p.planned_files.len(), 1);
     }
 }

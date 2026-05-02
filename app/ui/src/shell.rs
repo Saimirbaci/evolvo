@@ -28,7 +28,7 @@ use crate::canvas::{CanvasController, CanvasSurface};
 use crate::feedback_panel::FeedbackPanel;
 use crate::interop;
 use crate::toolbar::Toolbar;
-use crate::types::{AppHealth, LineageJobRecord};
+use crate::types::{AppHealth, LineageJobRecord, PreviewSummary};
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
 /// moves. Kept as a constant rather than a build-time env var so the binary
@@ -373,17 +373,69 @@ fn LineageDetail(
     let fix_text: RwSignal<String> = RwSignal::new(String::new());
     let fix_submitting: RwSignal<bool> = RwSignal::new(false);
 
-    let approve_click = move |_| {
-        let id = approve_id.clone();
+    // Overflow (kebab) menu visibility. Click-toggle, not hover, so the
+    // menu is keyboard-accessible (a hover-only menu fails leptos.md a11y
+    // rule and traps users on touch devices).
+    let overflow_open: RwSignal<bool> = RwSignal::new(false);
+
+    // EvolveConfirmation modal state. The dry-run preview is loaded
+    // lazily on Evolve click; while pending we show a skeleton. The
+    // architect doc's I3 (bounded blast radius / dry-run default) is
+    // implemented at this UI layer — the underlying state machine in
+    // lineage.rs is unchanged. If the preview command errors we still
+    // let the reviewer proceed via "Proceed without preview" so a broken
+    // preview never bricks the lineage pipeline (I-P1 invariant).
+    let evolve_modal_open: RwSignal<bool> = RwSignal::new(false);
+    let preview_loading: RwSignal<bool> = RwSignal::new(false);
+    let preview_data: RwSignal<Option<PreviewSummary>> = RwSignal::new(None);
+    let preview_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let evolve_submitting: RwSignal<bool> = RwSignal::new(false);
+
+    let approve_id_for_modal = approve_id.clone();
+    let open_evolve_modal = move || {
+        // Reset state every time the modal opens — stale preview from a
+        // previous session would mislead the reviewer.
+        preview_data.set(None);
+        preview_error.set(None);
+        evolve_submitting.set(false);
+        evolve_modal_open.set(true);
+        preview_loading.set(true);
+        let id = approve_id_for_modal.clone();
+        spawn_local(async move {
+            match interop::preview_lineage_evolution(&id).await {
+                Ok(summary) => preview_data.set(Some(summary)),
+                Err(e) => preview_error.set(Some(e)),
+            }
+            preview_loading.set(false);
+        });
+    };
+
+    let approve_id_for_confirm = approve_id.clone();
+    let confirm_evolve = move || {
+        if evolve_submitting.get_untracked() {
+            return;
+        }
+        evolve_submitting.set(true);
+        let id = approve_id_for_confirm.clone();
         action_error.set(None);
         spawn_local(async move {
             if let Err(e) = interop::approve_lineage_job(&id).await {
                 action_error.set(Some(e));
             }
+            evolve_submitting.set(false);
+            evolve_modal_open.set(false);
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
-    let reject_click = move |_| {
+
+    let do_approve = move || {
+        if !can_approve {
+            return;
+        }
+        action_error.set(None);
+        open_evolve_modal();
+    };
+    let do_reject = move || {
         let id = reject_id.clone();
         action_error.set(None);
         spawn_local(async move {
@@ -393,7 +445,7 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
-    let run_click = move |_| {
+    let do_run = move || {
         let id = run_id.clone();
         action_error.set(None);
         spawn_local(async move {
@@ -404,7 +456,7 @@ fn LineageDetail(
         });
         schedule_reloads(reload, &[1500, 4000, 10_000]);
     };
-    let resume_click = move |_| {
+    let do_resume = move || {
         let id = resume_id.clone();
         action_error.set(None);
         spawn_local(async move {
@@ -596,39 +648,271 @@ fn LineageDetail(
             }}
 
             <div class="lineage-detail-actions">
-                <button class="secondary-btn" on:click=reject_click>"Reject"</button>
-                <button
-                    class="secondary-btn"
-                    prop:disabled=!can_retry
-                    on:click=move |_| fix_open.update(|v| *v = !*v)
-                    title="Reset this iteration — tear down the worktree and re-run from scratch (optional clarification note)"
-                >
-                    "Reset"
-                </button>
-                <button
-                    class="secondary-btn"
-                    prop:disabled=!can_resume
-                    on:click=resume_click
-                    title="Pick up the multi-stage pipeline from the first non-green stage, reusing the existing worktree and plan.json"
-                >
-                    "Resume"
-                </button>
+                // Secondary: Run — preview the current iteration's app.
                 <button
                     class="secondary-btn"
                     prop:disabled=!can_run
-                    on:click=run_click
+                    on:click=move |_| do_run()
+                    aria-label="Run the iteration's app"
                     title="Launch the app built in this iteration's worktree"
                 >
                     "Run"
                 </button>
+
+                // Overflow (kebab) — destructive / non-Evolve actions live
+                // here so they don't compete visually with Evolve. Each
+                // tooltip names the safety property so the reviewer knows
+                // what the verb actually does (Reject is terminal etc.).
+                <div class="lineage-overflow">
+                    <button
+                        class="secondary-btn lineage-overflow-trigger"
+                        aria-haspopup="menu"
+                        aria-expanded=move || if overflow_open.get() { "true" } else { "false" }
+                        aria-label="More iteration actions"
+                        title="More actions: Reset, Resume, Reject"
+                        on:click=move |_| overflow_open.update(|v| *v = !*v)
+                    >
+                        "⋯"
+                    </button>
+                    {move || {
+                        if !overflow_open.get() {
+                            return view! { <span></span> }.into_any();
+                        }
+                        let do_reject = do_reject.clone();
+                        let do_resume = do_resume.clone();
+                        view! {
+                            <div class="lineage-overflow-menu" role="menu">
+                                <button
+                                    class="lineage-overflow-item"
+                                    role="menuitem"
+                                    prop:disabled=!can_retry
+                                    title="Reset — discards iteration worktree state and re-runs the agent from a fresh fork"
+                                    on:click=move |_| {
+                                        overflow_open.set(false);
+                                        fix_open.update(|v| *v = !*v);
+                                    }
+                                >
+                                    <span class="overflow-item-label">"Reset"</span>
+                                    <span class="overflow-item-hint">"discards worktree state"</span>
+                                </button>
+                                <button
+                                    class="lineage-overflow-item"
+                                    role="menuitem"
+                                    prop:disabled=!can_resume
+                                    title="Resume — re-runs the agent against the existing worktree, picking up at the first non-green stage"
+                                    on:click=move |_| {
+                                        overflow_open.set(false);
+                                        do_resume();
+                                    }
+                                >
+                                    <span class="overflow-item-label">"Resume"</span>
+                                    <span class="overflow-item-hint">"re-runs against existing worktree"</span>
+                                </button>
+                                <button
+                                    class="lineage-overflow-item lineage-overflow-item-danger"
+                                    role="menuitem"
+                                    title="Reject — terminal, cannot be undone. Marks the lineage job as rejected for good."
+                                    on:click=move |_| {
+                                        overflow_open.set(false);
+                                        do_reject();
+                                    }
+                                >
+                                    <span class="overflow-item-label">"Reject"</span>
+                                    <span class="overflow-item-hint">"terminal, cannot be undone"</span>
+                                </button>
+                            </div>
+                        }.into_any()
+                    }}
+                </div>
+
+                // Primary: Evolve — gated behind the dry-run modal so the
+                // reviewer sees what's about to happen before committing.
                 <button
-                    class="primary-btn"
+                    class="primary-btn lineage-evolve-btn"
                     prop:disabled=!can_approve
-                    on:click=approve_click
-                    title="Plan then implement the next iteration from this feedback"
+                    on:click=move |_| do_approve()
+                    aria-label="Evolve — plan and implement the next iteration"
+                    title="Preview, then plan & implement the next iteration from this feedback"
                 >
                     "Evolve"
                 </button>
+            </div>
+
+            {move || {
+                if !evolve_modal_open.get() {
+                    return view! { <span></span> }.into_any();
+                }
+                let confirm = confirm_evolve.clone();
+                view! {
+                    <EvolveConfirmation
+                        is_open=evolve_modal_open
+                        loading=preview_loading
+                        preview=preview_data
+                        error=preview_error
+                        submitting=evolve_submitting
+                        on_confirm=Box::new(move || confirm())
+                    />
+                }.into_any()
+            }}
+        </div>
+    }
+}
+
+#[component]
+fn EvolveConfirmation(
+    is_open: RwSignal<bool>,
+    loading: RwSignal<bool>,
+    preview: RwSignal<Option<PreviewSummary>>,
+    error: RwSignal<Option<String>>,
+    submitting: RwSignal<bool>,
+    on_confirm: Box<dyn Fn() + 'static>,
+) -> impl IntoView {
+    let close = move || {
+        if !submitting.get_untracked() {
+            is_open.set(false);
+        }
+    };
+    let close_for_overlay = close.clone();
+    let close_for_cancel = close.clone();
+    let close_for_kbd = close.clone();
+
+    // Escape-to-cancel. Listen on the document so the modal works even
+    // when focus is somewhere unexpected — e.g. the reviewer just
+    // clicked the disabled Confirm button while it was loading.
+    Effect::new(move |prev: Option<()>| {
+        if prev.is_some() {
+            return;
+        }
+        let close_kbd = close_for_kbd.clone();
+        let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+            move |ev: web_sys::KeyboardEvent| {
+                if !is_open.get_untracked() {
+                    return;
+                }
+                if ev.key() == "Escape" {
+                    close_kbd();
+                }
+            },
+        );
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            let _ = doc
+                .add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+        }
+        cb.forget();
+    });
+
+    view! {
+        <div
+            class="evolve-modal-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="evolve-modal-title"
+            on:click=move |_| close_for_overlay()
+        >
+            <div
+                class="evolve-modal"
+                on:click=move |ev| ev.stop_propagation()
+            >
+                <header class="evolve-modal-head">
+                    <h2 id="evolve-modal-title" class="evolve-modal-title">"Confirm Evolve — dry-run preview"</h2>
+                    <p class="evolve-modal-subtitle">
+                        "Review the planned scope below. Clicking Confirm will plan + implement the next iteration. Cancel keeps the lineage job exactly where it is."
+                    </p>
+                </header>
+
+                <section class="evolve-modal-body">
+                    {move || {
+                        if loading.get() {
+                            return view! {
+                                <div class="evolve-modal-skeleton">"Loading preview…"</div>
+                            }.into_any();
+                        }
+                        if let Some(err) = error.get() {
+                            return view! {
+                                <div class="evolve-modal-error" role="alert">
+                                    <strong>"Preview unavailable: "</strong>{err}
+                                    <p class="evolve-modal-error-hint">
+                                        "You can still proceed without a preview. The state machine and any can_approve() gate still apply on the host."
+                                    </p>
+                                </div>
+                            }.into_any();
+                        }
+                        let Some(p) = preview.get() else {
+                            return view! { <span></span> }.into_any();
+                        };
+                        view! {
+                            <dl class="evolve-modal-meta">
+                                <div><dt>"Agent"</dt><dd>{p.agent.label()}</dd></div>
+                                <div><dt>"From iteration"</dt><dd>{p.source_iteration}</dd></div>
+                                <div><dt>"Next iteration"</dt><dd>{p.target_iteration}</dd></div>
+                                <div><dt>"Dev port"</dt><dd>{p.target_port}</dd></div>
+                            </dl>
+                            <div class="evolve-modal-section">
+                                <h3>"Plan summary"</h3>
+                                <pre class="evolve-modal-summary">{p.plan_summary.clone()}</pre>
+                            </div>
+                            {if p.planned_files.is_empty() {
+                                view! {
+                                    <div class="evolve-modal-section">
+                                        <h3>"Planned scope"</h3>
+                                        <div class="evolve-modal-empty">
+                                            "No concrete plan items recorded yet — proceeding will run the agent without a recorded plan."
+                                        </div>
+                                    </div>
+                                }.into_any()
+                            } else {
+                                let items = p.planned_files.clone();
+                                view! {
+                                    <div class="evolve-modal-section">
+                                        <h3>{format!("Planned scope ({} items)", items.len())}</h3>
+                                        <ul class="evolve-modal-files">
+                                            {items.into_iter().map(|f| view! { <li>{f}</li> }).collect_view()}
+                                        </ul>
+                                    </div>
+                                }.into_any()
+                            }}
+                            {if p.notes.is_empty() {
+                                view! { <span></span> }.into_any()
+                            } else {
+                                let notes = p.notes.clone();
+                                view! {
+                                    <div class="evolve-modal-section">
+                                        <h3>"Notes"</h3>
+                                        <ul class="evolve-modal-notes">
+                                            {notes.into_iter().map(|n| view! { <li>{n}</li> }).collect_view()}
+                                        </ul>
+                                    </div>
+                                }.into_any()
+                            }}
+                        }.into_any()
+                    }}
+                </section>
+
+                <footer class="evolve-modal-actions">
+                    <button
+                        class="secondary-btn"
+                        autofocus
+                        prop:disabled=move || submitting.get()
+                        on:click=move |_| close_for_cancel()
+                    >
+                        "Cancel"
+                    </button>
+                    <button
+                        class="primary-btn evolve-modal-confirm"
+                        prop:disabled=move || submitting.get() || loading.get()
+                        on:click=move |_| on_confirm()
+                    >
+                        {move || {
+                            if submitting.get() {
+                                "Evolving…"
+                            } else if error.get().is_some() {
+                                "Proceed without preview"
+                            } else {
+                                "Confirm Evolve"
+                            }
+                        }}
+                    </button>
+                </footer>
             </div>
         </div>
     }

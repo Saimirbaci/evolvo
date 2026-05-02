@@ -297,6 +297,28 @@ pub struct StageState {
     pub report: Option<serde_json::Value>,
 }
 
+/// Mirror of `evolvo_desktop::types::PreviewSummary`. Returned by the
+/// `preview_lineage_evolution` command and rendered in the dry-run modal
+/// the user sees before confirming `Evolve`. Forward-compatible: unknown
+/// fields decode-tolerantly so a host that adds new preview fields
+/// doesn't brick older UI builds.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSummary {
+    pub job_id: String,
+    pub agent: AgentKind,
+    pub source_iteration: u32,
+    pub target_iteration: u32,
+    pub target_port: u16,
+    #[serde(default)]
+    pub plan_summary: String,
+    #[serde(default)]
+    pub planned_files: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    pub captured_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitFeedbackPayload {

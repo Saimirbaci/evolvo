@@ -380,6 +380,49 @@ pub struct EntityIdPayload {
     pub id: String,
 }
 
+/// Read-only dry-run summary surfaced to the reviewer before they confirm
+/// `Evolve`. Synthesised by `preview_lineage_evolution` from the job's
+/// persisted artefacts (`plan.json` + `LineageJobRecord`) — the command
+/// itself never mutates state, so showing the modal cannot accidentally
+/// advance a job. When `plan.json` is absent the summary still
+/// round-trips with empty `plannedFiles` and a `note` explaining there is
+/// no plan recorded yet, so the reviewer can decide whether to proceed
+/// "agent unguided" without the dry-run blocking I-P1 (lineage always
+/// works).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSummary {
+    pub job_id: String,
+    pub agent: AgentKind,
+    pub source_iteration: u32,
+    pub target_iteration: u32,
+    /// Dev-server port the upcoming iteration will bind to. Computed from
+    /// `runner::BASE_DEV_PORT + target_iteration` so the reviewer can spot
+    /// port collisions before approving.
+    pub target_port: u16,
+    /// Best-effort prose summary describing what the next run intends to
+    /// do. Either derived from `plan.json` (when present) or a stock
+    /// "no plan recorded" message. Truncated to a few KB so the IPC
+    /// payload stays small.
+    #[serde(default)]
+    pub plan_summary: String,
+    /// Best-effort list of logical artefacts the next iteration will
+    /// create or touch (e.g. "command: create_project",
+    /// "component: ProjectForm"). Empty is valid — older jobs, or jobs
+    /// whose plan.json hasn't been generated yet, render with an empty
+    /// list and a note.
+    #[serde(default)]
+    pub planned_files: Vec<String>,
+    /// Free-form caveats / informational notes. Examples: "no plan
+    /// recorded — proceeding will run the agent without a plan",
+    /// "plan.json truncated for display".
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// Unix-ms timestamp the preview was synthesised. Lets the UI show
+    /// the reviewer how fresh the preview is.
+    pub captured_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppHealth {
