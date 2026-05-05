@@ -450,6 +450,7 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             lineage_job_id: None,
+            local_delegate: None,
         }
     }
 
@@ -460,8 +461,7 @@ mod tests {
         store.init_workspace().unwrap();
         let feedback = mk_feedback();
         let job_dir = tmp.path().join("job-1");
-        let plan =
-            seed_plan_from_feedback(&store, &feedback, "job-1", &job_dir, 1).unwrap();
+        let plan = seed_plan_from_feedback(&store, &feedback, "job-1", &job_dir, 1).unwrap();
         assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION);
         assert_eq!(plan.app.feedback_id, "fb-1");
         assert_eq!(plan.canvas.regions.len(), 1);
@@ -484,7 +484,10 @@ mod tests {
     #[test]
     fn derive_app_name_caps_at_48_and_strips_punct() {
         assert_eq!(derive_app_name(""), "NewApp");
-        assert_eq!(derive_app_name("Budget Tracker. With transactions."), "Budget Tracker");
+        assert_eq!(
+            derive_app_name("Budget Tracker. With transactions."),
+            "Budget Tracker"
+        );
         let long = "x".repeat(100);
         assert_eq!(derive_app_name(&long).chars().count(), 48);
     }
@@ -510,8 +513,19 @@ mod tests {
         assert!(!stage_already_done(FrontendImplemented, E2EPlan));
         assert!(!stage_already_done(FrontendImplemented, FinalReview));
         // Completed: every stage is done.
-        for s in [BackendPlan, BackendImpl, FrontendPlan, FrontendImpl, E2EPlan, E2EImpl, FinalReview] {
-            assert!(stage_already_done(Completed, s), "stage {s:?} should be done when plan Completed");
+        for s in [
+            BackendPlan,
+            BackendImpl,
+            FrontendPlan,
+            FrontendImpl,
+            E2EPlan,
+            E2EImpl,
+            FinalReview,
+        ] {
+            assert!(
+                stage_already_done(Completed, s),
+                "stage {s:?} should be done when plan Completed"
+            );
         }
     }
 
@@ -526,13 +540,25 @@ mod tests {
         plan.stage = PlanStage::FrontendImplemented;
 
         advance_plan_stage(&mut plan, StageKind::BackendPlan);
-        assert_eq!(plan.stage, PlanStage::FrontendImplemented, "BackendPlan must not regress");
+        assert_eq!(
+            plan.stage,
+            PlanStage::FrontendImplemented,
+            "BackendPlan must not regress"
+        );
 
         advance_plan_stage(&mut plan, StageKind::FrontendImpl);
-        assert_eq!(plan.stage, PlanStage::FrontendImplemented, "same-ordinal must not bump");
+        assert_eq!(
+            plan.stage,
+            PlanStage::FrontendImplemented,
+            "same-ordinal must not bump"
+        );
 
         advance_plan_stage(&mut plan, StageKind::E2EPlan);
-        assert_eq!(plan.stage, PlanStage::E2EPlanned, "strictly-greater stage must advance");
+        assert_eq!(
+            plan.stage,
+            PlanStage::E2EPlanned,
+            "strictly-greater stage must advance"
+        );
 
         advance_plan_stage(&mut plan, StageKind::FinalReview);
         assert_eq!(plan.stage, PlanStage::Completed);

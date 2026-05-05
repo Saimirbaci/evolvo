@@ -33,9 +33,9 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::store::{Store, StoreError};
-use crate::types::{current_time_unix_ms, FeedbackRecord, LineageJobRecord};
 #[cfg(test)]
 use crate::types::AgentKind;
+use crate::types::{current_time_unix_ms, FeedbackRecord, LineageJobRecord};
 
 pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 pub const BUNDLE_EXTENSION: &str = "evolvo-bundle";
@@ -269,8 +269,8 @@ pub fn import_lineage_bundle_bytes(
         // Unknown top-level entries are ignored — forward compatibility.
     }
 
-    let manifest = manifest
-        .ok_or_else(|| StoreError::Other("bundle is missing manifest.json".to_string()))?;
+    let manifest =
+        manifest.ok_or_else(|| StoreError::Other("bundle is missing manifest.json".to_string()))?;
 
     Ok(ImportSummary {
         workspace_root: target_root.display().to_string(),
@@ -314,6 +314,7 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             lineage_job_id: Some("job-1".into()),
+            local_delegate: None,
         };
         store.save_feedback(&fb).unwrap();
         store

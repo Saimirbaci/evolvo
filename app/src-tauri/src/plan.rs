@@ -548,12 +548,13 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
             }
         }
         if count > 0 {
-            let bbox = [min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0)];
-            return Some(RawAnnotation {
-                bbox,
-                color,
-                label,
-            });
+            let bbox = [
+                min_x,
+                min_y,
+                (max_x - min_x).max(1.0),
+                (max_y - min_y).max(1.0),
+            ];
+            return Some(RawAnnotation { bbox, color, label });
         }
     }
     // Shape D: text note with just x/y.
@@ -688,7 +689,12 @@ fn cluster_bbox(members: &[usize], raws: &[RawAnnotation]) -> [f32; 4] {
         max_x = max_x.max(b[0] + b[2]);
         max_y = max_y.max(b[1] + b[3]);
     }
-    [min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0)]
+    [
+        min_x,
+        min_y,
+        (max_x - min_x).max(1.0),
+        (max_y - min_y).max(1.0),
+    ]
 }
 
 fn dominant_color(members: &[usize], raws: &[RawAnnotation]) -> Option<String> {

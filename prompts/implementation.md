@@ -1,5 +1,7 @@
 You are running inside a Lineaged git worktree of the Evolvo project a MetaApp which can be used to generate additional versions
-of itself using visual,text and voice feedback. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Evolve" on the resulting lineage job. Your job: implement the change.
+of itself using visual,text and voice feedback. A user submitted feedback through the in-app feedback panel and a reviewer pressed "Evolve" on the resulting lineage job. 
+
+Your job: implement the change.
 
 {guidance}{new_app_banner}
 
@@ -20,7 +22,7 @@ of itself using visual,text and voice feedback. A user submitted feedback throug
 
 1. Read the project guide(s) expected by your CLI ({agent_context_files}) and skim the relevant files under `app/` to orient yourself. Also skim `.claude/rules/` and `.claude/agents/` so you know what docs you will be expected to update — on non-Claude agents these files are symlinked from the worktree root under `AGENTS.md` / `GEMINI.md` so the same canonical guide applies.
 2. Read every file listed under Attachments above — the screenshot is often the clearest statement of intent of the app the user is building.
-3. When the work calls for a specialist, delegate via the Agent tool to one of the project agents defined in `.claude/agents/` (use whichever agents exist in this iteration of the repo — names may have changed).
+3. When the work calls for a specialist, delegate via the Agent tool, to one of the project agents defined in `.claude/agents/` (use whichever agents exist in this iteration of the repo — names may have changed).
 {work_step_4}
 5. If the app's architecture, stack, domain model, or command surface changed materially: update `CLAUDE.md`, the relevant files under `.claude/rules/`, and the affected `.claude/agents/*.md` (and `.claude/skills/*` if present) so the next iteration's agent starts with accurate context. Stale docs are treated as a bug.
 6. Run the appropriate checks before finishing. The exact commands depend on the current stack — read `CLAUDE.md` for the build contract. For today's Rust + Leptos + Tauri shell the defaults are:

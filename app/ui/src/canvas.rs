@@ -9,9 +9,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    window, CanvasRenderingContext2d, ClipboardEvent, DomRect, DragEvent, Event,
-    HtmlCanvasElement, HtmlImageElement, HtmlInputElement, KeyboardEvent, MouseEvent,
-    ResizeObserver,
+    window, CanvasRenderingContext2d, ClipboardEvent, DomRect, DragEvent, Event, HtmlCanvasElement,
+    HtmlImageElement, HtmlInputElement, KeyboardEvent, MouseEvent, ResizeObserver,
 };
 
 // ---------------------------------------------------------------------------
@@ -152,36 +151,70 @@ pub enum Shape {
 impl Shape {
     pub fn to_json(&self) -> serde_json::Value {
         match self {
-            Self::Path { points, color, width } => json!({
+            Self::Path {
+                points,
+                color,
+                width,
+            } => json!({
                 "type": "path",
                 "points": points.iter().map(|(x, y)| json!([x, y])).collect::<Vec<_>>(),
                 "color": color,
                 "width": width,
             }),
-            Self::Line { from, to, color, width } => json!({
+            Self::Line {
+                from,
+                to,
+                color,
+                width,
+            } => json!({
                 "type": "line",
                 "from": [from.0, from.1],
                 "to": [to.0, to.1],
                 "color": color,
                 "width": width,
             }),
-            Self::Arrow { from, to, color, width } => json!({
+            Self::Arrow {
+                from,
+                to,
+                color,
+                width,
+            } => json!({
                 "type": "arrow",
                 "from": [from.0, from.1],
                 "to": [to.0, to.1],
                 "color": color,
                 "width": width,
             }),
-            Self::Ellipse { x, y, w, h, color, width } => json!({
+            Self::Ellipse {
+                x,
+                y,
+                w,
+                h,
+                color,
+                width,
+            } => json!({
                 "type": "ellipse", "x": x, "y": y, "w": w, "h": h, "color": color, "width": width,
             }),
-            Self::Rect { x, y, w, h, color, width } => json!({
+            Self::Rect {
+                x,
+                y,
+                w,
+                h,
+                color,
+                width,
+            } => json!({
                 "type": "rect", "x": x, "y": y, "w": w, "h": h, "color": color, "width": width,
             }),
             Self::Highlight { x, y, w, h, color } => json!({
                 "type": "highlight", "x": x, "y": y, "w": w, "h": h, "color": color,
             }),
-            Self::Text { x, y, text, color, font_size } => json!({
+            Self::Text {
+                x,
+                y,
+                text,
+                color,
+                font_size,
+            } => json!({
                 "type": "text", "x": x, "y": y, "text": text, "color": color, "fontSize": font_size,
             }),
             Self::Image { x, y, w, h, .. } => json!({
@@ -277,8 +310,7 @@ impl CanvasController {
     }
 
     pub fn poke_redraw(&self) {
-        self.redraw_trigger
-            .update(|v| *v = v.wrapping_add(1));
+        self.redraw_trigger.update(|v| *v = v.wrapping_add(1));
     }
 
     pub fn redraw_token(&self) -> RwSignal<u64> {
@@ -290,8 +322,10 @@ impl CanvasController {
     /// for its current pixel data, which *does* include drawn strokes because
     /// the canvas was the live render target.
     pub fn to_png_data_url(&self) -> Option<String> {
-        self.canvas_node
-            .with_value(|c| c.as_ref().and_then(|c| c.to_data_url_with_type("image/png").ok()))
+        self.canvas_node.with_value(|c| {
+            c.as_ref()
+                .and_then(|c| c.to_data_url_with_type("image/png").ok())
+        })
     }
 
     pub fn annotations_json(&self) -> Vec<serde_json::Value> {
@@ -314,7 +348,9 @@ impl CanvasController {
     }
 
     pub fn delete_selected(&self) {
-        let Some(idx) = self.selected_idx.get_untracked() else { return };
+        let Some(idx) = self.selected_idx.get_untracked() else {
+            return;
+        };
         let prev = self.shapes.get_untracked();
         if idx >= prev.len() {
             self.selected_idx.set(None);
@@ -431,8 +467,7 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                     fit_canvas_to_viewport(&canvas);
                     render_all(&canvas, &ctrl);
                 }) as Box<dyn FnMut(Event)>);
-                let _ = win
-                    .add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+                let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
                 cb.forget();
             }
         });
@@ -677,8 +712,12 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                     state.preview = None;
                     state.crop_target = None;
                 });
-                if let (Some(idx), Some(Shape::Rect { x, y, w: rw, h: rh, .. })) =
-                    (target, preview)
+                if let (
+                    Some(idx),
+                    Some(Shape::Rect {
+                        x, y, w: rw, h: rh, ..
+                    }),
+                ) = (target, preview)
                 {
                     if rw > 0.01 && rh > 0.01 {
                         let ctrl2 = ctrl.clone();
@@ -782,7 +821,9 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
         let ctrl = controller.clone();
         let value = text_input_value;
         move || {
-            let Some(state) = ctrl.text_input.get_untracked() else { return };
+            let Some(state) = ctrl.text_input.get_untracked() else {
+                return;
+            };
             let text = value.get_untracked().trim().to_string();
             ctrl.text_input.set(None);
             if text.is_empty() {
@@ -845,7 +886,8 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                                     ingest_image_data_url(&ctrl, data_url);
                                 }
                             }
-                        }) as Box<dyn FnMut(Event)>);
+                        })
+                            as Box<dyn FnMut(Event)>);
                         reader.set_onload(Some(onload.as_ref().unchecked_ref()));
                         let _ = reader.read_as_data_url(&file);
                         onload.forget();
@@ -970,10 +1012,12 @@ fn schedule_rerender_next_frame(canvas: HtmlCanvasElement, ctrl: CanvasControlle
 /// sub-rectangle of the visible element.
 fn install_resize_observer(canvas: HtmlCanvasElement, ctrl: CanvasController) {
     let canvas_for_cb = canvas.clone();
-    let cb = Closure::wrap(Box::new(move |_entries: js_sys::Array, _obs: ResizeObserver| {
-        fit_canvas_to_viewport(&canvas_for_cb);
-        render_all(&canvas_for_cb, &ctrl);
-    }) as Box<dyn FnMut(js_sys::Array, ResizeObserver)>);
+    let cb = Closure::wrap(
+        Box::new(move |_entries: js_sys::Array, _obs: ResizeObserver| {
+            fit_canvas_to_viewport(&canvas_for_cb);
+            render_all(&canvas_for_cb, &ctrl);
+        }) as Box<dyn FnMut(js_sys::Array, ResizeObserver)>,
+    );
     if let Ok(observer) = ResizeObserver::new(cb.as_ref().unchecked_ref()) {
         observer.observe(&canvas);
         // Observer must outlive this scope — it tracks this canvas for its
@@ -996,7 +1040,9 @@ fn render_all_with_preview(
     // size hasn't drifted, but protects against cases where the ResizeObserver
     // hasn't caught up yet (first frame after mount, window resize mid-drag).
     fit_canvas_to_viewport(canvas);
-    let Some(ctx) = canvas_context(canvas) else { return };
+    let Some(ctx) = canvas_context(canvas) else {
+        return;
+    };
     let w = canvas.width() as f64;
     let h = canvas.height() as f64;
 
@@ -1043,7 +1089,11 @@ fn canvas_context(canvas: &HtmlCanvasElement) -> Option<CanvasRenderingContext2d
 fn render_shape(ctx: &CanvasRenderingContext2d, shape: &Shape, w: f64, h: f64) {
     ctx.save();
     match shape {
-        Shape::Path { points, color, width } => {
+        Shape::Path {
+            points,
+            color,
+            width,
+        } => {
             if points.len() > 1 {
                 ctx.set_stroke_style_str(color);
                 ctx.set_line_width(*width);
@@ -1058,7 +1108,12 @@ fn render_shape(ctx: &CanvasRenderingContext2d, shape: &Shape, w: f64, h: f64) {
                 ctx.stroke();
             }
         }
-        Shape::Line { from, to, color, width } => {
+        Shape::Line {
+            from,
+            to,
+            color,
+            width,
+        } => {
             ctx.set_stroke_style_str(color);
             ctx.set_line_width(*width);
             ctx.set_line_cap("round");
@@ -1067,7 +1122,14 @@ fn render_shape(ctx: &CanvasRenderingContext2d, shape: &Shape, w: f64, h: f64) {
             ctx.line_to(to.0 * w, to.1 * h);
             ctx.stroke();
         }
-        Shape::Ellipse { x, y, w: rw, h: rh, color, width } => {
+        Shape::Ellipse {
+            x,
+            y,
+            w: rw,
+            h: rh,
+            color,
+            width,
+        } => {
             ctx.set_stroke_style_str(color);
             ctx.set_line_width(*width);
             let cx = (x + rw / 2.0) * w;
@@ -1086,7 +1148,12 @@ fn render_shape(ctx: &CanvasRenderingContext2d, shape: &Shape, w: f64, h: f64) {
             );
             ctx.stroke();
         }
-        Shape::Arrow { from, to, color, width } => {
+        Shape::Arrow {
+            from,
+            to,
+            color,
+            width,
+        } => {
             ctx.set_stroke_style_str(color);
             ctx.set_line_width(*width);
             ctx.set_line_cap("round");
@@ -1113,23 +1180,48 @@ fn render_shape(ctx: &CanvasRenderingContext2d, shape: &Shape, w: f64, h: f64) {
             );
             ctx.stroke();
         }
-        Shape::Rect { x, y, w: rw, h: rh, color, width } => {
+        Shape::Rect {
+            x,
+            y,
+            w: rw,
+            h: rh,
+            color,
+            width,
+        } => {
             ctx.set_stroke_style_str(color);
             ctx.set_line_width(*width);
             ctx.stroke_rect(x * w, y * h, rw * w, rh * h);
         }
-        Shape::Highlight { x, y, w: rw, h: rh, color } => {
+        Shape::Highlight {
+            x,
+            y,
+            w: rw,
+            h: rh,
+            color,
+        } => {
             ctx.set_global_alpha(0.35);
             ctx.set_fill_style_str(color);
             ctx.fill_rect(x * w, y * h, rw * w, rh * h);
         }
-        Shape::Text { x, y, text, color, font_size } => {
+        Shape::Text {
+            x,
+            y,
+            text,
+            color,
+            font_size,
+        } => {
             ctx.set_fill_style_str(color);
             ctx.set_font(&format!("{font_size}px -apple-system, sans-serif"));
             ctx.set_text_baseline("top");
             let _ = ctx.fill_text(text, x * w, y * h);
         }
-        Shape::Image { x, y, w: iw, h: ih, data_url } => {
+        Shape::Image {
+            x,
+            y,
+            w: iw,
+            h: ih,
+            data_url,
+        } => {
             if let Ok(img) = HtmlImageElement::new() {
                 img.set_src(data_url);
                 // If the image is already decoded, draw now; otherwise hook onload.
@@ -1254,24 +1346,45 @@ fn pick_shape_at(shapes: &[Shape], rx: f64, ry: f64) -> Option<usize> {
 fn translate_shape(shape: &Shape, dx: f64, dy: f64) -> Shape {
     let t = |(a, b): (f64, f64)| (a + dx, b + dy);
     match shape {
-        Shape::Path { points, color, width } => Shape::Path {
+        Shape::Path {
+            points,
+            color,
+            width,
+        } => Shape::Path {
             points: points.iter().map(|p| t(*p)).collect(),
             color: color.clone(),
             width: *width,
         },
-        Shape::Line { from, to, color, width } => Shape::Line {
+        Shape::Line {
+            from,
+            to,
+            color,
+            width,
+        } => Shape::Line {
             from: t(*from),
             to: t(*to),
             color: color.clone(),
             width: *width,
         },
-        Shape::Arrow { from, to, color, width } => Shape::Arrow {
+        Shape::Arrow {
+            from,
+            to,
+            color,
+            width,
+        } => Shape::Arrow {
             from: t(*from),
             to: t(*to),
             color: color.clone(),
             width: *width,
         },
-        Shape::Rect { x, y, w, h, color, width } => Shape::Rect {
+        Shape::Rect {
+            x,
+            y,
+            w,
+            h,
+            color,
+            width,
+        } => Shape::Rect {
             x: x + dx,
             y: y + dy,
             w: *w,
@@ -1279,7 +1392,14 @@ fn translate_shape(shape: &Shape, dx: f64, dy: f64) -> Shape {
             color: color.clone(),
             width: *width,
         },
-        Shape::Ellipse { x, y, w, h, color, width } => Shape::Ellipse {
+        Shape::Ellipse {
+            x,
+            y,
+            w,
+            h,
+            color,
+            width,
+        } => Shape::Ellipse {
             x: x + dx,
             y: y + dy,
             w: *w,
@@ -1294,14 +1414,26 @@ fn translate_shape(shape: &Shape, dx: f64, dy: f64) -> Shape {
             h: *h,
             color: color.clone(),
         },
-        Shape::Text { x, y, text, color, font_size } => Shape::Text {
+        Shape::Text {
+            x,
+            y,
+            text,
+            color,
+            font_size,
+        } => Shape::Text {
             x: x + dx,
             y: y + dy,
             text: text.clone(),
             color: color.clone(),
             font_size: *font_size,
         },
-        Shape::Image { x, y, w, h, data_url } => Shape::Image {
+        Shape::Image {
+            x,
+            y,
+            w,
+            h,
+            data_url,
+        } => Shape::Image {
             x: x + dx,
             y: y + dy,
             w: *w,
@@ -1314,16 +1446,15 @@ fn translate_shape(shape: &Shape, dx: f64, dy: f64) -> Shape {
 /// Crop the Image at `idx` to the canvas-ratio rect (cx, cy, cw, ch),
 /// clamped to the image's own bounds. Produces a new data URL via an
 /// offscreen canvas and replaces the shape in place, recording an undo entry.
-async fn perform_crop(
-    ctrl: &CanvasController,
-    idx: usize,
-    cx: f64,
-    cy: f64,
-    cw: f64,
-    ch: f64,
-) {
+async fn perform_crop(ctrl: &CanvasController, idx: usize, cx: f64, cy: f64, cw: f64, ch: f64) {
     let shapes = ctrl.shapes.get_untracked();
-    let Some(Shape::Image { x: ix, y: iy, w: iw, h: ih, data_url }) = shapes.get(idx).cloned()
+    let Some(Shape::Image {
+        x: ix,
+        y: iy,
+        w: iw,
+        h: ih,
+        data_url,
+    }) = shapes.get(idx).cloned()
     else {
         return;
     };
@@ -1357,7 +1488,9 @@ async fn perform_crop(
     let sw = fw * nw;
     let sh = fh * nh;
 
-    let Some(doc) = window().and_then(|w| w.document()) else { return };
+    let Some(doc) = window().and_then(|w| w.document()) else {
+        return;
+    };
     let off: HtmlCanvasElement = match doc.create_element("canvas").and_then(|e| {
         e.dyn_into::<HtmlCanvasElement>()
             .map_err(|_| wasm_bindgen::JsValue::NULL.into())
@@ -1367,24 +1500,20 @@ async fn perform_crop(
     };
     off.set_width(sw.max(1.0) as u32);
     off.set_height(sh.max(1.0) as u32);
-    let Some(ctx) = canvas_context(&off) else { return };
+    let Some(ctx) = canvas_context(&off) else {
+        return;
+    };
     if ctx
         .draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-            &img,
-            sx,
-            sy,
-            sw,
-            sh,
-            0.0,
-            0.0,
-            sw,
-            sh,
+            &img, sx, sy, sw, sh, 0.0, 0.0, sw, sh,
         )
         .is_err()
     {
         return;
     }
-    let Ok(new_url) = off.to_data_url_with_type("image/png") else { return };
+    let Ok(new_url) = off.to_data_url_with_type("image/png") else {
+        return;
+    };
 
     let new_shape = Shape::Image {
         x: rx0,
@@ -1421,7 +1550,11 @@ pub fn ingest_image_data_url(ctrl: &CanvasController, data_url: String) {
             Some((w, h)) if w > 0 && h > 0 => (w as f64, h as f64),
             _ => {
                 ctrl2.add_shape(Shape::Image {
-                    x: 0.3, y: 0.3, w: 0.4, h: 0.4, data_url: data_for_resolve,
+                    x: 0.3,
+                    y: 0.3,
+                    w: 0.4,
+                    h: 0.4,
+                    data_url: data_for_resolve,
                 });
                 return;
             }
@@ -1433,11 +1566,19 @@ pub fn ingest_image_data_url(ctrl: &CanvasController, data_url: String) {
             let x = 0.5 - iw / 2.0;
             let y = 0.5 - ih / 2.0;
             ctrl2.add_shape(Shape::Image {
-                x, y, w: iw, h: ih, data_url: data_for_resolve,
+                x,
+                y,
+                w: iw,
+                h: ih,
+                data_url: data_for_resolve,
             });
         } else {
             ctrl2.add_shape(Shape::Image {
-                x: 0.3, y: 0.3, w: 0.4, h: 0.4, data_url: data_for_resolve,
+                x: 0.3,
+                y: 0.3,
+                w: 0.4,
+                h: 0.4,
+                data_url: data_for_resolve,
             });
         }
     });
@@ -1468,9 +1609,17 @@ fn install_paste_listener(ctrl: CanvasController) {
         let Some(win) = window() else { return };
         let ctrl = Rc::new(RefCell::new(ctrl.clone()));
         let cb = Closure::wrap(Box::new(move |ev: Event| {
-            let Some(ev) = ev.dyn_ref::<ClipboardEvent>() else { return };
-            let Some(data) = ev.clipboard_data() else { return };
-            let Some(items) = data.items().dyn_ref::<web_sys::DataTransferItemList>().cloned() else {
+            let Some(ev) = ev.dyn_ref::<ClipboardEvent>() else {
+                return;
+            };
+            let Some(data) = ev.clipboard_data() else {
+                return;
+            };
+            let Some(items) = data
+                .items()
+                .dyn_ref::<web_sys::DataTransferItemList>()
+                .cloned()
+            else {
                 return;
             };
             let mut handled = false;
@@ -1491,7 +1640,8 @@ fn install_paste_listener(ctrl: CanvasController) {
                                     ingest_image_data_url(&ctrl.borrow(), data_url);
                                 }
                             }
-                        }) as Box<dyn FnMut(Event)>);
+                        })
+                            as Box<dyn FnMut(Event)>);
                         reader.set_onload(Some(onload.as_ref().unchecked_ref()));
                         let _ = reader.read_as_data_url(&blob);
                         onload.forget();
@@ -1515,7 +1665,9 @@ fn install_keyboard_shortcuts(ctrl: CanvasController) {
         let Some(win) = window() else { return };
         let ctrl = ctrl.clone();
         let cb = Closure::wrap(Box::new(move |ev: Event| {
-            let Some(kev) = ev.dyn_ref::<KeyboardEvent>() else { return };
+            let Some(kev) = ev.dyn_ref::<KeyboardEvent>() else {
+                return;
+            };
             let cmd_or_ctrl = kev.meta_key() || kev.ctrl_key();
             if cmd_or_ctrl && kev.key() == "z" && !kev.shift_key() {
                 ctrl.undo();
@@ -1578,8 +1730,12 @@ fn install_keyboard_shortcuts(ctrl: CanvasController) {
 }
 
 fn is_editable_target(ev: &KeyboardEvent) -> bool {
-    let Some(target) = ev.target() else { return false };
-    let Some(el) = target.dyn_ref::<web_sys::Element>() else { return false };
+    let Some(target) = ev.target() else {
+        return false;
+    };
+    let Some(el) = target.dyn_ref::<web_sys::Element>() else {
+        return false;
+    };
     let tag = el.tag_name().to_lowercase();
     if tag == "input" || tag == "textarea" {
         return true;

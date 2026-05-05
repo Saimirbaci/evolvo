@@ -7,12 +7,13 @@ use crate::lineage::{LineageEngine, Transition};
 use crate::runner;
 use crate::state::AppState;
 use crate::store::StoreError;
-use crate::types::{
-    current_time_unix_ms, AgentAvailability, AppHealth, EntityIdPayload, FeedbackRecord,
-    FeedbackStatus, LineageJobRecord, LineageJobStatus, PreviewSummary, SubmitFeedbackPayload,
-};
 #[cfg(test)]
 use crate::types::AgentKind;
+use crate::types::{
+    current_time_unix_ms, AgentAvailability, AppHealth, DelegationSummary, EntityIdPayload,
+    FeedbackRecord, FeedbackStatus, LineageJobRecord, LineageJobStatus, LocalDelegateAvailability,
+    PreviewSummary, SubmitFeedbackPayload,
+};
 
 const APP_NAME: &str = "Evolvo";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -118,6 +119,7 @@ pub fn submit_feedback(
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         lineage_job_id: None,
+        local_delegate: payload.local_delegate.clone(),
     };
 
     store.save_feedback(&record).map_err(store_error)?;
@@ -150,6 +152,32 @@ pub fn submit_feedback(
 #[tauri::command]
 pub fn list_available_agents() -> Result<Vec<AgentAvailability>, String> {
     Ok(agent::availability())
+}
+
+/// Whether the local-model delegation worker (`pi` + Ollama) is wireable
+/// on this host. The UI uses this to gate the "Local worker" chip in the
+/// feedback panel; a `pi_installed: false` or `ollama_reachable: false`
+/// result greys the chip with a tooltip telling the user which piece to
+/// install. Cached per-process — same restart-to-rescan convention as
+/// `list_available_agents`.
+#[tauri::command]
+pub fn list_local_delegate_availability() -> Result<LocalDelegateAvailability, String> {
+    Ok(agent::local_delegate_availability())
+}
+
+/// Aggregate the per-job pi-events.jsonl stream into a `DelegationSummary`
+/// the UI can render in the Lineage detail panel. Returns `Ok(None)` when
+/// the events file is absent (the steady state for jobs that didn't opt
+/// into delegation), so the UI hides the "Local worker" section
+/// completely instead of rendering a row of zeros.
+#[tauri::command]
+pub fn read_delegation_summary(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<Option<DelegationSummary>, String> {
+    let root = state.store().layout().root().to_path_buf();
+    let job_dir = runner::job_workspace_dir(&root, &payload.id);
+    crate::delegation::read_summary(&job_dir).map_err(|e| format!("read pi-events: {e}"))
 }
 
 #[tauri::command]
@@ -599,7 +627,9 @@ fn synthesize_preview(
     if files.len() > MAX_PLANNED_FILES {
         let dropped = files.len() - MAX_PLANNED_FILES;
         files.truncate(MAX_PLANNED_FILES);
-        notes.push(format!("planned items truncated for display ({dropped} more)"));
+        notes.push(format!(
+            "planned items truncated for display ({dropped} more)"
+        ));
     }
 
     if files.is_empty() && plan.history.is_empty() {
@@ -609,7 +639,10 @@ fn synthesize_preview(
         );
     }
 
-    (truncate(&summary_lines.join("\n"), PLAN_SUMMARY_BUDGET), files)
+    (
+        truncate(&summary_lines.join("\n"), PLAN_SUMMARY_BUDGET),
+        files,
+    )
 }
 
 fn truncate(s: &str, max_bytes: usize) -> String {
@@ -708,14 +741,8 @@ pub fn export_lineage(
         Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
         _ => store.layout().root().join("exports"),
     };
-    let path = bundle::export_lineage_to_dir(
-        &store,
-        &payload.id,
-        &dest,
-        APP_NAME,
-        APP_VERSION,
-    )
-    .map_err(store_error)?;
+    let path = bundle::export_lineage_to_dir(&store, &payload.id, &dest, APP_NAME, APP_VERSION)
+        .map_err(store_error)?;
     Ok(ExportLineageResult {
         bundle_path: path.display().to_string(),
     })
@@ -736,9 +763,7 @@ pub struct ImportLineagePayload {
 /// process with `EVOLVO_WORKSPACE_ROOT=<target>` set, since the running
 /// instance is locked to its own root.
 #[tauri::command]
-pub fn import_lineage_bundle(
-    payload: ImportLineagePayload,
-) -> Result<ImportSummary, String> {
+pub fn import_lineage_bundle(payload: ImportLineagePayload) -> Result<ImportSummary, String> {
     let bundle_path = std::path::PathBuf::from(&payload.bundle_path);
     let target_root = std::path::PathBuf::from(&payload.target_workspace_root);
     bundle::import_lineage_bundle(&bundle_path, &target_root).map_err(store_error)
@@ -804,6 +829,7 @@ mod tests {
             window_height: 768,
             agent: None,
             auto_evolve: false,
+            local_delegate: None,
         }
     }
 
@@ -841,6 +867,7 @@ mod tests {
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
                 lineage_job_id: None,
+                local_delegate: None,
             };
             store.save_feedback(&rec).unwrap();
             let engine = LineageEngine::new(&store);
@@ -887,6 +914,7 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             lineage_job_id: None,
+            local_delegate: None,
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(&store);
@@ -924,6 +952,7 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             lineage_job_id: None,
+            local_delegate: None,
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(store);
@@ -943,10 +972,7 @@ mod tests {
         assert_eq!(preview.agent, AgentKind::ClaudeCode);
         assert!(preview.planned_files.is_empty());
         assert!(
-            preview
-                .notes
-                .iter()
-                .any(|n| n.contains("No plan recorded")),
+            preview.notes.iter().any(|n| n.contains("No plan recorded")),
             "expected a 'no plan recorded' note, got: {:?}",
             preview.notes
         );

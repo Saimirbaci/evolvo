@@ -25,9 +25,9 @@
 //! 3. Walk up from the process CWD using the same check.
 
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -397,8 +397,7 @@ const EMBEDDED_IMPLEMENTATION: &str = include_str!("../../../prompts/implementat
 const EMBEDDED_NEW_APP_BANNER: &str = include_str!("../../../prompts/new_app_banner.md");
 const EMBEDDED_PHASE_BOOTSTRAP: &str = include_str!("../../../prompts/phases/bootstrap.md");
 const EMBEDDED_PHASE_SHAPING: &str = include_str!("../../../prompts/phases/shaping.md");
-const EMBEDDED_PHASE_CONSOLIDATION: &str =
-    include_str!("../../../prompts/phases/consolidation.md");
+const EMBEDDED_PHASE_CONSOLIDATION: &str = include_str!("../../../prompts/phases/consolidation.md");
 const EMBEDDED_PHASE_MATURATION: &str = include_str!("../../../prompts/phases/maturation.md");
 const EMBEDDED_STEP_NEW_APP: &str = include_str!("../../../prompts/work_steps/new_app.md");
 const EMBEDDED_STEP_BOOTSTRAP: &str = include_str!("../../../prompts/work_steps/bootstrap.md");
@@ -411,6 +410,9 @@ const EMBEDDED_STAGE_FRONTEND_IMPL: &str = include_str!("../../../prompts/stages
 const EMBEDDED_STAGE_E2E_PLAN: &str = include_str!("../../../prompts/stages/e2e_plan.md");
 const EMBEDDED_STAGE_E2E_IMPL: &str = include_str!("../../../prompts/stages/e2e_impl.md");
 const EMBEDDED_STAGE_FINAL_REVIEW: &str = include_str!("../../../prompts/stages/final_review.md");
+/// Local-model delegation rules. Appended to the supervisor prompt when
+/// the user opted into pi+Ollama delegation on the feedback record.
+const EMBEDDED_DELEGATE_RULES: &str = include_str!("../../../prompts/pi.md");
 
 fn prompts_override_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("EVOLVO_PROMPTS_DIR") {
@@ -462,14 +464,22 @@ pub fn iteration_guidance(iteration: u32) -> String {
     let n = iteration.max(1);
     let port = iteration_port(n);
     let (phase, rel, embedded) = match n {
-        1..=5 => ("Bootstrap phase", "phases/bootstrap.md", EMBEDDED_PHASE_BOOTSTRAP),
+        1..=5 => (
+            "Bootstrap phase",
+            "phases/bootstrap.md",
+            EMBEDDED_PHASE_BOOTSTRAP,
+        ),
         6..=9 => ("Shaping phase", "phases/shaping.md", EMBEDDED_PHASE_SHAPING),
         10..=12 => (
             "Consolidation phase",
             "phases/consolidation.md",
             EMBEDDED_PHASE_CONSOLIDATION,
         ),
-        _ => ("Maturation phase", "phases/maturation.md", EMBEDDED_PHASE_MATURATION),
+        _ => (
+            "Maturation phase",
+            "phases/maturation.md",
+            EMBEDDED_PHASE_MATURATION,
+        ),
     };
     let latitude = trim_trailing_newline(load_prompt(rel, embedded));
 
@@ -586,19 +596,15 @@ pub fn build_implementation_prompt(
     // Keep the historical signature green; callers that don't care about the
     // agent get ClaudeCode phrasing, which is still a valid instruction for
     // any CLI (they all recognise "read the project guide" regardless).
-    build_implementation_prompt_for(
-        feedback,
-        job,
-        attachments,
-        log_file,
-        AgentKind::ClaudeCode,
-    )
+    build_implementation_prompt_for(feedback, job, attachments, log_file, AgentKind::ClaudeCode)
 }
 
 /// Agent-aware prompt builder. Substitutes `{agent_label}` and
 /// `{agent_context_files}` so the same template nudges Codex / Gemini /
 /// Forge to read `AGENTS.md` / `GEMINI.md` while keeping Claude on
-/// `CLAUDE.md`.
+/// `CLAUDE.md`. When `feedback.local_delegate` is set, appends the
+/// delegation rules block (`prompts/pi.md`) so the supervisor knows it
+/// can call `$EVOLVO_DELEGATE_BIN` for boilerplate sub-implementations.
 pub fn build_implementation_prompt_for(
     feedback: &FeedbackRecord,
     job: &LineageJobRecord,
@@ -655,7 +661,7 @@ pub fn build_implementation_prompt_for(
     let template = load_prompt("implementation.md", EMBEDDED_IMPLEMENTATION);
     let backend = backend_for(agent);
     let context_files = backend.context_files().to_vec().join(", ");
-    template
+    let mut prompt = template
         .replace("{guidance}", &guidance)
         .replace("{new_app_banner}", &new_app_banner)
         .replace("{job_id}", &job.id)
@@ -670,7 +676,23 @@ pub fn build_implementation_prompt_for(
         .replace("{work_step_4}", &work_step_4)
         .replace("{log_file}", &log_file.display().to_string())
         .replace("{agent_label}", agent.label())
-        .replace("{agent_context_files}", &context_files)
+        .replace("{agent_context_files}", &context_files);
+
+    // Opt-in local-model delegation. We append the rules verbatim so the
+    // supervisor sees the contract (when to delegate, when not, spec
+    // format, hard limits) inline. Off by default — older feedback
+    // records and any record where the user didn't tick the chip
+    // deserialise as `local_delegate: None` and skip this block entirely.
+    if let Some(cfg) = feedback.local_delegate.as_ref() {
+        prompt.push_str("\n\n---\n\n");
+        prompt.push_str(&load_prompt("pi.md", EMBEDDED_DELEGATE_RULES));
+        prompt.push_str(&format!(
+            "\n\n_Active delegation provider:_ `{}` _model:_ `{}`. \
+             The wrapper path is in `$EVOLVO_DELEGATE_BIN`.\n",
+            cfg.provider, cfg.model,
+        ));
+    }
+    prompt
 }
 
 /// Returned synchronously from `prepare_run` so the caller can persist the
@@ -684,7 +706,63 @@ pub struct PreparedRun {
     pub branch: String,
     pub source_repo: PathBuf,
     pub prompt: String,
+    /// Resolved local-delegate spawn-time wiring. `Some` only when the
+    /// user opted into delegation on the feedback record AND the wrapper
+    /// script was found at `<source_repo>/scripts/evolvo-delegate.sh`.
+    /// Read by `launch_agent_session` to set `EVOLVO_DELEGATE_*` env
+    /// vars on the supervisor command.
+    pub local_delegate: Option<PreparedDelegate>,
 }
+
+/// Resolved spawn-time wiring for local-model delegation: the absolute
+/// path to the wrapper script, the per-job pi log path, the events
+/// JSONL path, and the provider/model the user chose. `prepare_run`
+/// resolves these once so single-session and multi-stage spawn sites
+/// can plumb them into the command env without re-reading the source.
+#[derive(Debug, Clone)]
+pub struct PreparedDelegate {
+    pub wrapper: PathBuf,
+    pub log_file: PathBuf,
+    /// Per-job JSONL stream the wrapper appends one event to per
+    /// invocation. Read by `read_delegation_summary` so the Lineage UI
+    /// can show counts / runtime / failure rate without re-parsing the
+    /// freeform `pi.log`.
+    pub events_log: PathBuf,
+    pub provider: String,
+    pub model: String,
+}
+
+/// Best-effort resolver. Returns `Some` only when (a) the user opted
+/// into delegation on the feedback record AND (b) the wrapper script is
+/// present at `<source_repo>/scripts/evolvo-delegate.sh`. Returning
+/// `None` is the silent-skip path — older Evolvo clones without
+/// `scripts/` continue to run without delegation rather than failing.
+/// Used by `prepare_run` for fresh runs and by `resume_pipeline` so
+/// resumed jobs honour the same opt-in.
+pub fn resolve_delegate(
+    feedback: &FeedbackRecord,
+    source_repo: &Path,
+    job_dir: &Path,
+) -> Option<PreparedDelegate> {
+    let cfg = feedback.local_delegate.as_ref()?;
+    let wrapper = source_repo.join("scripts").join("evolvo-delegate.sh");
+    if !wrapper.is_file() {
+        return None;
+    }
+    Some(PreparedDelegate {
+        wrapper,
+        log_file: job_dir.join("pi.log"),
+        events_log: job_dir.join("pi-events.jsonl"),
+        provider: cfg.provider.clone(),
+        model: cfg.model.clone(),
+    })
+}
+
+/// Stable filename for the per-job JSONL events stream. Re-used by
+/// `commands::read_delegation_summary` so the host can locate the file
+/// from a job id alone (without relying on whatever the wrapper saw via
+/// env vars at runtime).
+pub const PI_EVENTS_FILENAME: &str = "pi-events.jsonl";
 
 /// Build the worktree, stage attachments, and write the prompt + metadata
 /// files. Does NOT launch the agent — that happens in
@@ -746,6 +824,8 @@ pub fn prepare_run(
     let prompt = build_implementation_prompt_for(feedback, job, &attachments, &log_file, agent);
     fs::write(&prompt_file, &prompt)?;
 
+    let local_delegate = resolve_delegate(feedback, &source, &job_dir);
+
     let metadata = serde_json::json!({
         "job_id": job.id,
         "feedback_id": feedback.id,
@@ -777,6 +857,7 @@ pub fn prepare_run(
         branch,
         source_repo: source,
         prompt,
+        local_delegate,
     })
 }
 
@@ -785,12 +866,7 @@ pub fn prepare_run(
 /// immediately; all I/O happens on a dedicated OS thread. The `agent`
 /// argument picks the binary, the flag set, and the env scrub list — see
 /// [`crate::agent`].
-pub fn launch_agent_session(
-    store: Store,
-    job_id: String,
-    prepared: PreparedRun,
-    agent: AgentKind,
-) {
+pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun, agent: AgentKind) {
     std::thread::spawn(move || {
         let engine = LineageEngine::new(&store);
         let backend = backend_for(agent);
@@ -826,8 +902,33 @@ pub fn launch_agent_session(
             ),
         );
 
-        let status = backend
-            .build_command(&prepared.prompt, &prepared.worktree)
+        if let Some(d) = prepared.local_delegate.as_ref() {
+            let _ = engine.append_note(
+                &job_id,
+                &format!(
+                    "local delegation enabled — provider={} model={} wrapper={} pi_log={}",
+                    d.provider,
+                    d.model,
+                    d.wrapper.display(),
+                    d.log_file.display(),
+                ),
+            );
+        }
+
+        let mut command = backend.build_command(&prepared.prompt, &prepared.worktree);
+        if let Some(d) = prepared.local_delegate.as_ref() {
+            command
+                .env("EVOLVO_DELEGATE_BIN", &d.wrapper)
+                .env("EVOLVO_DELEGATE_PROVIDER", &d.provider)
+                .env("EVOLVO_DELEGATE_MODEL", &d.model)
+                .env("EVOLVO_DELEGATE_LOG", &d.log_file)
+                .env("EVOLVO_DELEGATE_EVENTS_LOG", &d.events_log)
+                // Single-session runs aren't broken into stages, so we
+                // tag every delegation under the stable slug "main"
+                // for the by-stage breakdown and the per-stage cap.
+                .env("EVOLVO_DELEGATE_STAGE_SLUG", "main");
+        }
+        let status = command
             .stdout(Stdio::from(log_handle))
             .stderr(Stdio::from(log_for_err))
             .status();
@@ -869,7 +970,9 @@ pub fn launch_agent_session(
 /// Backward-compatible shim so old callers (and any external code the
 /// workspace still references) keep compiling. Forwards to
 /// [`launch_agent_session`] with the Claude backend.
-#[deprecated(note = "use launch_agent_session(..., AgentKind) so the runner can honour the selected agent")]
+#[deprecated(
+    note = "use launch_agent_session(..., AgentKind) so the runner can honour the selected agent"
+)]
 pub fn launch_claude(store: Store, job_id: String, prepared: PreparedRun) {
     launch_agent_session(store, job_id, prepared, AgentKind::ClaudeCode);
 }
@@ -1174,13 +1277,33 @@ fn render_stage_prompt(
 /// Concrete `StageDispatcher` that spawns the selected agent CLI per
 /// stage and streams its output to `<job_dir>/logs/<slug>.log`. Blocks the
 /// calling thread until the agent exits.
+///
+/// When `delegate` is `Some`, the dispatcher injects the local-model
+/// delegation rules and `EVOLVO_DELEGATE_*` env vars **only on
+/// implementation stages** (`StageKind::is_impl()`). Plan stages and
+/// the final review stage never see delegation: planning is
+/// supervisor-only by design (see `prompts/pi.md` "When NOT to
+/// delegate"), and the final review's job is to read the whole change
+/// — which is the *opposite* of "delegate boilerplate".
 pub struct AgentStageDispatcher {
     pub agent: AgentKind,
+    pub delegate: Option<PreparedDelegate>,
 }
 
 impl AgentStageDispatcher {
     pub fn new(agent: AgentKind) -> Self {
-        Self { agent }
+        Self {
+            agent,
+            delegate: None,
+        }
+    }
+
+    /// Constructor for runs where the user opted into local-model
+    /// delegation. The `PreparedDelegate` is the resolved wrapper +
+    /// pi.log paths from `resolve_delegate`. Pass `None` here to get
+    /// the same behaviour as `new`.
+    pub fn with_delegate(agent: AgentKind, delegate: Option<PreparedDelegate>) -> Self {
+        Self { agent, delegate }
     }
 }
 
@@ -1200,11 +1323,36 @@ impl crate::stages::StageDispatcher for AgentStageDispatcher {
             .map_err(|e| format!("clone log handle: {e}"))?;
 
         let template = stage_prompt_template(ctx.stage);
-        let prompt = render_stage_prompt(&template, &plan, ctx.worktree, &ctx.plan_path, ctx.job_id);
+        let mut prompt =
+            render_stage_prompt(&template, &plan, ctx.worktree, &ctx.plan_path, ctx.job_id);
+
+        // Per-stage delegation policy: only `*_impl` stages get the
+        // delegation rules + env vars. `*_plan` and `final_review`
+        // stages run with the supervisor's own reasoning untouched —
+        // delegating planning would defeat the whole point.
+        let stage_delegate = self.delegate.as_ref().filter(|_| ctx.stage.is_impl());
+        if let Some(d) = stage_delegate {
+            prompt.push_str("\n\n---\n\n");
+            prompt.push_str(&load_prompt("pi.md", EMBEDDED_DELEGATE_RULES));
+            prompt.push_str(&format!(
+                "\n\n_Active delegation provider:_ `{}` _model:_ `{}`. \
+                 The wrapper path is in `$EVOLVO_DELEGATE_BIN`.\n",
+                d.provider, d.model,
+            ));
+        }
 
         let backend = backend_for(self.agent);
-        let status = backend
-            .build_command(&prompt, ctx.worktree)
+        let mut command = backend.build_command(&prompt, ctx.worktree);
+        if let Some(d) = stage_delegate {
+            command
+                .env("EVOLVO_DELEGATE_BIN", &d.wrapper)
+                .env("EVOLVO_DELEGATE_PROVIDER", &d.provider)
+                .env("EVOLVO_DELEGATE_MODEL", &d.model)
+                .env("EVOLVO_DELEGATE_LOG", &d.log_file)
+                .env("EVOLVO_DELEGATE_EVENTS_LOG", &d.events_log)
+                .env("EVOLVO_DELEGATE_STAGE_SLUG", ctx.stage.slug());
+        }
+        let status = command
             .stdout(Stdio::from(log_handle))
             .stderr(Stdio::from(log_err))
             .status()
@@ -1251,9 +1399,13 @@ pub fn launch_pipeline(
             }
         };
 
-        if let Err(e) =
-            crate::stages::seed_plan_from_feedback(&store, &feedback, &job_id, &job_dir, job.iteration)
-        {
+        if let Err(e) = crate::stages::seed_plan_from_feedback(
+            &store,
+            &feedback,
+            &job_id,
+            &job_dir,
+            job.iteration,
+        ) {
             let _ = engine.append_note(&job_id, &format!("pipeline: seed plan failed — {e}"));
             let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
             return;
@@ -1280,7 +1432,8 @@ pub fn launch_pipeline(
             ),
         );
 
-        let dispatcher = AgentStageDispatcher::new(agent);
+        let dispatcher =
+            AgentStageDispatcher::with_delegate(agent, prepared.local_delegate.clone());
         match crate::stages::run_pipeline(
             &store,
             &engine,
@@ -1350,7 +1503,9 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
         .worktree_path
         .as_ref()
         .map(PathBuf::from)
-        .ok_or_else(|| "job has no worktree_path — cannot resume; retry the job instead".to_string())?;
+        .ok_or_else(|| {
+            "job has no worktree_path — cannot resume; retry the job instead".to_string()
+        })?;
 
     if !worktree.exists() {
         return Err(format!(
@@ -1385,9 +1540,13 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
         );
 
         // Seed is idempotent: returns the existing plan when one is on disk.
-        if let Err(e) =
-            crate::stages::seed_plan_from_feedback(&store, &feedback, &job_id, &job_dir, job.iteration)
-        {
+        if let Err(e) = crate::stages::seed_plan_from_feedback(
+            &store,
+            &feedback,
+            &job_id,
+            &job_dir,
+            job.iteration,
+        ) {
             let _ = engine.append_note(&job_id, &format!("resume: seed plan failed — {e}"));
             let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
             return;
@@ -1403,7 +1562,14 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
             );
         }
 
-        let dispatcher = AgentStageDispatcher::new(job.agent);
+        // Resume honours the same delegation opt-in the user set on the
+        // original feedback record. We re-resolve the wrapper path here
+        // because the source repo may have moved between the original
+        // run and the resume (e.g. user re-cloned Evolvo).
+        let resume_delegate = resolve_source_repo()
+            .as_deref()
+            .and_then(|repo| resolve_delegate(&feedback, repo, &job_dir));
+        let dispatcher = AgentStageDispatcher::with_delegate(job.agent, resume_delegate);
         match crate::stages::run_pipeline(
             &store,
             &engine,
@@ -1420,8 +1586,8 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
                     )
                 });
                 if all_green {
-                    let _ =
-                        engine.append_note(&job_id, "resume: all stages green — marking build ready");
+                    let _ = engine
+                        .append_note(&job_id, "resume: all stages green — marking build ready");
                     let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
                 } else {
                     let first_red = stages
@@ -1467,6 +1633,7 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             lineage_job_id: Some("job-42".into()),
+            local_delegate: None,
         }
     }
 

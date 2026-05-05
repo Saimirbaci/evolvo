@@ -27,6 +27,8 @@ fn main() {
             commands::tail_stage_log,
             commands::resume_lineage_job,
             commands::list_available_agents,
+            commands::list_local_delegate_availability,
+            commands::read_delegation_summary,
             commands::preview_lineage_evolution,
             commands::export_lineage,
             commands::import_lineage_bundle,

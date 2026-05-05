@@ -302,6 +302,7 @@ mod tests {
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10,
             lineage_job_id: None,
+            local_delegate: None,
         }
     }
 

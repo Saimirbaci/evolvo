@@ -277,6 +277,7 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             lineage_job_id: None,
+            local_delegate: None,
         }
     }
 
@@ -287,7 +288,9 @@ mod tests {
         store.init_workspace().unwrap();
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
 
         let pipeline = [
             crate::types::StageKind::BackendPlan,
@@ -295,7 +298,10 @@ mod tests {
         ];
         let seeded = engine.seed_stages(&job.id, &pipeline).unwrap();
         assert_eq!(seeded.stages.len(), 2);
-        assert!(seeded.stages.iter().all(|s| matches!(s.status, crate::types::StageStatus::Pending)));
+        assert!(seeded
+            .stages
+            .iter()
+            .all(|s| matches!(s.status, crate::types::StageStatus::Pending)));
 
         let updated = engine
             .update_stage(&job.id, crate::types::StageKind::BackendPlan, |s| {
@@ -343,7 +349,9 @@ mod tests {
 
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
 
         assert_eq!(fb.lineage_job_id.as_deref(), Some(job.id.as_str()));
         assert_eq!(fb.status, FeedbackStatus::InLineage);
@@ -360,7 +368,9 @@ mod tests {
 
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
 
         // Pending -> Triaging ok
         let j2 = engine.transition(&job.id, Transition::Triage).unwrap();
@@ -393,7 +403,9 @@ mod tests {
 
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
         let out = engine.transition(&job.id, Transition::Reject).unwrap();
         assert_eq!(out.status, LineageJobStatus::Rejected);
     }
@@ -406,7 +418,9 @@ mod tests {
 
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
         let j2 = engine.append_note(&job.id, "needs more detail").unwrap();
         assert_eq!(j2.notes, vec!["needs more detail"]);
         let j3 = engine.append_note(&job.id, "   ").unwrap();

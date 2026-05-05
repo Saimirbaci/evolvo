@@ -269,7 +269,10 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
         );
         let has_registration = invoke_body.contains(&format!("commands::{}", cmd.name));
         r.push(
-            &format!("backend command `{}` registered in invoke_handler", cmd.name),
+            &format!(
+                "backend command `{}` registered in invoke_handler",
+                cmd.name
+            ),
             has_registration,
             "search lib.rs + main.rs",
         );
@@ -308,7 +311,11 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
     }
     match run_cargo(worktree, &["test", "-p", "evolvo_desktop", "--lib"]) {
         Ok(true) => r.push("cargo test -p evolvo_desktop --lib", true, "ok"),
-        Ok(false) => r.push("cargo test -p evolvo_desktop --lib", false, "exited non-zero"),
+        Ok(false) => r.push(
+            "cargo test -p evolvo_desktop --lib",
+            false,
+            "exited non-zero",
+        ),
         Err(e) => r.push("cargo test -p evolvo_desktop --lib", false, e),
     }
     r.finalize()
@@ -399,14 +406,16 @@ pub fn validate_frontend_impl(
 
     match run_cargo(
         worktree,
-        &["check", "-p", "evolvo_ui", "--target", "wasm32-unknown-unknown"],
+        &[
+            "check",
+            "-p",
+            "evolvo_ui",
+            "--target",
+            "wasm32-unknown-unknown",
+        ],
     ) {
         Ok(true) => r.push("cargo check -p evolvo_ui (wasm)", true, "ok"),
-        Ok(false) => r.push(
-            "cargo check -p evolvo_ui (wasm)",
-            false,
-            "exited non-zero",
-        ),
+        Ok(false) => r.push("cargo check -p evolvo_ui (wasm)", false, "exited non-zero"),
         Err(e) => r.push("cargo check -p evolvo_ui (wasm)", false, e),
     }
     r.finalize()
@@ -417,8 +426,7 @@ pub fn validate_e2e_impl(plan: &IterationPlan, worktree: &Path) -> StageReport {
     let scripts = worktree.join("scripts");
     r.push(
         "scripts/run-iteration.sh exists OR default stack intact",
-        scripts.join("run-iteration.sh").exists()
-            || worktree.join("app/src-tauri").exists(),
+        scripts.join("run-iteration.sh").exists() || worktree.join("app/src-tauri").exists(),
         scripts.display().to_string(),
     );
     if let Some(smoke) = &plan.e2e.persistence_smoke {
@@ -639,10 +647,10 @@ mod tests {
         }
         let report = validate_backend_plan(&plan);
         assert!(!report.passed);
-        assert!(report
-            .checks
-            .iter()
-            .any(|c| c.name.contains("canvas region has at least one backend owner") && !c.passed));
+        assert!(report.checks.iter().any(|c| c
+            .name
+            .contains("canvas region has at least one backend owner")
+            && !c.passed));
     }
 
     #[test]
