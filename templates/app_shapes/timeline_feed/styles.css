@@ -1,0 +1,146 @@
+/* timeline_feed — append to app/ui/styles.css. ~80 lines. */
+
+.feed-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 56px);
+  background: var(--bg, #ffffff);
+  color: var(--fg, #111827);
+}
+
+.feed-toolbar,
+.feed-record {
+  display: flex;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+
+.feed-input {
+  padding: 6px 10px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  font-size: 13px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+}
+
+.feed-record-summary {
+  flex: 1;
+}
+
+.feed-kind-filter {
+  min-width: 130px;
+}
+
+.feed-error {
+  padding: 8px 16px;
+  background: rgba(220, 38, 38, 0.08);
+  color: #dc2626;
+  border-bottom: 1px solid rgba(220, 38, 38, 0.2);
+  font-size: 13px;
+}
+
+.feed-list {
+  flex: 1;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.feed-day-divider {
+  padding: 8px 16px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted, #6b7280);
+  background: var(--bg-subtle, #fafafa);
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  position: sticky;
+  top: 0;
+}
+
+.feed-row {
+  display: grid;
+  grid-template-columns: 60px 80px 1fr auto auto;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  align-items: baseline;
+  font-size: 13px;
+}
+
+.feed-row-time {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--muted, #6b7280);
+}
+
+.feed-row-kind {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  color: var(--muted, #6b7280);
+}
+
+.feed-row-error .feed-row-kind {
+  color: #dc2626;
+}
+
+.feed-row-warn .feed-row-kind {
+  color: #d97706;
+}
+
+.feed-row-deploy .feed-row-kind,
+.feed-row-alert .feed-row-kind {
+  color: #2563eb;
+}
+
+.feed-row-summary {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.feed-row-payload {
+  font-size: 11px;
+  color: var(--muted, #6b7280);
+}
+
+.feed-row-payload pre {
+  margin: 4px 0 0 0;
+  padding: 8px;
+  background: var(--bg-subtle, #fafafa);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.feed-row-delete {
+  background: transparent;
+  border: 0;
+  color: var(--muted, #6b7280);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 4px;
+  visibility: hidden;
+}
+
+.feed-row:hover .feed-row-delete {
+  visibility: visible;
+}
+
+.feed-row-delete:hover {
+  color: #dc2626;
+  background: rgba(220, 38, 38, 0.08);
+}

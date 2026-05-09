@@ -80,11 +80,16 @@ hold by construction).
 
 ## Available scaffolds
 
-| Name                | Tags                                        | One-liner                                                                                                       |
-|---------------------|---------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
-| `markdown_editor`   | `text-editing`, `single-document`, `writing` | Two-pane markdown editor: document list, source pane, rendered preview. Pluggable `DocumentStore`.              |
-| `kanban_board`      | `task-tracking`, `board`, `drag-and-drop`   | Three-column kanban (Todo / Doing / Done) with draggable cards. Pluggable `BoardStore`.                          |
-| `data_grid`         | `tabular`, `crud`, `filterable`             | Sortable, filterable rows-and-columns grid with inline editing. Pluggable `RowStore`, schemaless rows.          |
+| Name                | Tags                                                     | One-liner                                                                                                  | Headline integration pairing |
+|---------------------|----------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|------------------------------|
+| `markdown_editor`   | `text-editing`, `single-document`, `writing`              | Two-pane markdown editor: document list, source pane, rendered preview. Pluggable `DocumentStore`.          | `sqlite` (relational notes)  |
+| `kanban_board`      | `task-tracking`, `board`, `drag-and-drop`                 | Three-column kanban (Todo / Doing / Done) with draggable cards. Pluggable `BoardStore`.                      | `sqlite` (cards table)       |
+| `data_grid`         | `tabular`, `crud`, `filterable`                           | Sortable, filterable rows-and-columns grid with inline editing. Pluggable `RowStore`, schemaless rows.       | `file_picker` (CSV import)   |
+| `chat_app`          | `chat`, `conversation`, `messaging`, `llm`                | Multi-conversation chat UI: thread sidebar + message stream + composer. Pluggable `ChatStore`.               | `openrouter` (LLM replies)   |
+| `survey_form`       | `form`, `survey`, `questionnaire`, `data-collection`      | Multi-field form (text / textarea / radio / checkbox / number / date) with response storage.                  | `sqlite` / `webhook_ingest`  |
+| `dashboard`         | `dashboard`, `metrics`, `kpi`, `monitoring`, `overview`   | Grid of widget tiles (number / text / mini-chart) that refresh on a schedule.                                 | `http_json` (remote sources) |
+| `timeline_feed`     | `timeline`, `events`, `feed`, `log`, `audit`              | Chronological event feed with kind / date / text filters.                                                     | `webhook_ingest` (incoming)  |
+| `calendar`          | `calendar`, `scheduling`, `events`, `time-management`     | Month-grid calendar with events (title, start/end, all-day, notes).                                           | `google_oauth` (Cal sync)    |
 
 ## Authoring a new app-shape
 

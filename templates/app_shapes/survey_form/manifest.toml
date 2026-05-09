@@ -1,0 +1,47 @@
+# See ../SCHEMA.md for the full schema.
+[template]
+name = "survey_form"
+description = "Multi-field form (text / textarea / radio / checkbox / number / date) with response storage."
+tags = ["form", "survey", "questionnaire", "data-collection"]
+
+[layout]
+host_module = "app/src-tauri/src/app_shapes/survey_form.rs"
+register_in = "app/src-tauri/src/lib.rs"
+ui_app      = "app/ui/src/app_shape_survey_form.rs"
+ui_modules  = []
+styles_file = "app/ui/styles.css"
+
+[data_interface]
+default      = "json_store"
+storage_path = "survey_form/responses"
+
+  [data_interface.entity]
+  name   = "Response"
+  # Schemaless `values` keyed by field id. The form's field schema is
+  # declared in code at `// FILL: form schema`.
+  fields = [
+    { name = "id",          ty = "String",            required = true },
+    { name = "values",      ty = "serde_json::Value", required = true },
+    { name = "submittedAt", ty = "u64",               required = true },
+  ]
+
+  [data_interface.commands]
+  list   = "list_responses"
+  load   = "load_response"
+  save   = "save_response"
+  delete = "delete_response"
+
+[backend_seams]
+sqlite          = "Replace JsonResponseStore with sqlite-backed `responses(id TEXT PRIMARY KEY, values_json TEXT NOT NULL, submitted_at INTEGER NOT NULL)`. Useful for analytical queries across many responses (counts, averages by date)."
+http_json       = "POST every save_response payload to a configured remote endpoint AS WELL AS the local store, so the form doubles as an ingestion pipe to a remote service."
+webhook_ingest  = "Receive externally-triggered submissions: a remote service POSTs to the loopback server, the seam translates it into a local save_response. Inverts the http_json relationship."
+
+[fill_markers]
+required = [
+  "FILL: form schema",
+]
+optional = [
+  "FILL: validation rules",
+  "FILL: thank-you copy",
+  "FILL: keyboard shortcuts",
+]

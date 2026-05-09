@@ -1,0 +1,8 @@
+# dashboard scaffold — Cargo dependencies to merge.
+# Default no-op refresh uses only crates already in the workspace.
+# When `http_json` seam is bound, that integration's deps.toml supplies
+# reqwest. When `sqlite` seam is bound for time-series storage, that
+# integration's deps.toml supplies rusqlite.
+
+[workspace.dependencies]
+# (none required)

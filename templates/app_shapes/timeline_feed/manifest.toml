@@ -1,0 +1,48 @@
+# See ../SCHEMA.md for the full schema.
+[template]
+name = "timeline_feed"
+description = "Chronological event feed with kind / date / text filters."
+tags = ["timeline", "events", "feed", "log", "chronological", "audit"]
+
+[layout]
+host_module = "app/src-tauri/src/app_shapes/timeline_feed.rs"
+register_in = "app/src-tauri/src/lib.rs"
+ui_app      = "app/ui/src/app_shape_timeline_feed.rs"
+ui_modules  = []
+styles_file = "app/ui/styles.css"
+
+[data_interface]
+default      = "json_store"
+storage_path = "timeline_feed/events"
+
+  [data_interface.entity]
+  name   = "Event"
+  fields = [
+    { name = "id",         ty = "String",            required = true },
+    { name = "kind",       ty = "String",            required = true },
+    { name = "summary",    ty = "String",            required = true },
+    { name = "payload",    ty = "serde_json::Value", required = false },
+    { name = "occurredAt", ty = "u64",               required = true },
+    { name = "ingestedAt", ty = "u64",               required = true },
+  ]
+
+  [data_interface.commands]
+  list   = "list_events"
+  load   = "load_event"
+  save   = "record_event"
+  delete = "delete_event"
+
+[backend_seams]
+webhook_ingest = "Mount the webhook_ingest integration's loopback server and route incoming POSTs to record_event. The seam translates the HTTP body (JSON or raw text) into an Event with kind = the inbound URL path's last segment, summary = a short string the seam derives, and payload = the full JSON body. The headline pairing for this scaffold."
+sqlite         = "Replace JsonEventStore with sqlite-backed `events(id TEXT PRIMARY KEY, kind TEXT NOT NULL, summary TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at INTEGER NOT NULL, ingested_at INTEGER NOT NULL)` + `CREATE INDEX events_by_occurred ON events(occurred_at DESC)`. Required once the feed grows past ~10k events."
+http_json      = "On a schedule, GET a remote events endpoint and bulk-record any new entries. Useful for following an external system's audit log without writing a webhook server."
+
+[fill_markers]
+required = [
+  "FILL: event kind palette",
+]
+optional = [
+  "FILL: live tail polling",
+  "FILL: per-kind icon",
+  "FILL: payload preview rendering",
+]
