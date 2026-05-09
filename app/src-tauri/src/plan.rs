@@ -19,6 +19,7 @@
 //! before the first planner session starts and mutated by each subsequent
 //! stage.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -186,6 +187,27 @@ pub struct TemplatesSection {
     /// silently skipping integrations the shape match implies.
     #[serde(default)]
     pub declined: Vec<DeclinedTemplate>,
+    /// Optional name of an app-shape scaffold from
+    /// `templates/app_shapes/<name>/`. The planner picks at most one when
+    /// the user's request matches a recognisable shape (an editor, a
+    /// kanban board, a tabular grid, …). `None` means "build the NewApp
+    /// content area from scratch", which is still the default. The
+    /// implementer copies the scaffold's files into the worktree per
+    /// `templates/app_shapes/<name>/SKILL.md`. Forward-compatible: older
+    /// plans without this field deserialise as `None`.
+    #[serde(default)]
+    pub use_app_shape: Option<String>,
+    /// Map of `<app-shape> → <integration>` recording which integration
+    /// template should replace an app-shape scaffold's default backend
+    /// (its `*Store` trait's default JSON impl). Empty = every chosen
+    /// app-shape uses its default backend. Read alongside
+    /// `use_app_shape` and `use_templates` — a binding only takes effect
+    /// when both the app-shape and the integration are also listed.
+    /// `BTreeMap` so JSON output has deterministic key order for diff
+    /// stability. Forward-compatible: older plans without this field
+    /// deserialise as an empty map.
+    #[serde(default)]
+    pub backend_bindings: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -910,6 +932,58 @@ mod tests {
         assert_eq!(plan.history.len(), 1);
         assert_eq!(plan.history[0].message, "7 entities, 18 commands planned");
         assert_eq!(plan.history[0].kind, HistoryKind::Note);
+    }
+
+    #[test]
+    fn templates_section_app_shape_round_trips() {
+        // New TemplatesSection fields (use_app_shape, backend_bindings)
+        // serialize and deserialize symmetrically, and survive a save +
+        // reload through the on-disk plan format.
+        let dir = tempdir().unwrap();
+        let mut plan = IterationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            app: AppIdentity {
+                name: "Demo".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        plan.templates.use_templates = vec!["sqlite".into()];
+        plan.templates.use_app_shape = Some("markdown_editor".into());
+        plan.templates
+            .backend_bindings
+            .insert("markdown_editor".into(), "sqlite".into());
+
+        save_plan(dir.path(), &plan).unwrap();
+        let back = load_plan(dir.path()).unwrap().unwrap();
+        assert_eq!(back.templates.use_app_shape.as_deref(), Some("markdown_editor"));
+        assert_eq!(
+            back.templates.backend_bindings.get("markdown_editor"),
+            Some(&"sqlite".to_string())
+        );
+        assert_eq!(back.templates.use_templates, vec!["sqlite".to_string()]);
+    }
+
+    #[test]
+    fn templates_section_tolerates_missing_app_shape_fields() {
+        // Older plans (written before use_app_shape / backend_bindings
+        // existed) decode cleanly: missing fields fall back to None /
+        // empty map, the rest of the section is preserved.
+        let raw = r#"{
+            "schemaVersion": 1,
+            "app": {"name": "Older"},
+            "stage": "backend_planned",
+            "canvas": {"route": "/"},
+            "templates": {
+                "useTemplates": ["openrouter"],
+                "declined": [{"name": "sqlite", "reason": "no relational data"}]
+            }
+        }"#;
+        let plan: IterationPlan = serde_json::from_str(raw).unwrap();
+        assert!(plan.templates.use_app_shape.is_none());
+        assert!(plan.templates.backend_bindings.is_empty());
+        assert_eq!(plan.templates.use_templates, vec!["openrouter".to_string()]);
+        assert_eq!(plan.templates.declined.len(), 1);
     }
 
     #[test]

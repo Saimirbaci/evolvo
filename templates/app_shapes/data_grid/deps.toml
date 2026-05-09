@@ -1,0 +1,7 @@
+# data_grid scaffold — Cargo dependencies to merge.
+# Default JSON backend uses only crates already in the workspace
+# (serde, serde_json). If a backend seam is bound, merge that
+# integration's deps.toml.
+
+[workspace.dependencies]
+# (none required)

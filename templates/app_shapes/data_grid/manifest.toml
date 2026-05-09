@@ -1,0 +1,48 @@
+# See ../SCHEMA.md for the full schema.
+[template]
+name = "data_grid"
+description = "Sortable, filterable rows-and-columns grid with inline editing. Schemaless rows."
+tags = ["tabular", "crud", "filterable", "spreadsheet"]
+
+[layout]
+host_module = "app/src-tauri/src/app_shapes/data_grid.rs"
+register_in = "app/src-tauri/src/lib.rs"
+ui_app      = "app/ui/src/app_shape_data_grid.rs"
+ui_modules  = []
+styles_file = "app/ui/styles.css"
+
+[data_interface]
+default      = "json_store"
+storage_path = "data_grid/rows"
+
+  [data_interface.entity]
+  name   = "Row"
+  # Rows are schemaless — `cells` is a JSON object so the user can add
+  # arbitrary columns without changing types. The `columns` setting on the
+  # GridConfig record drives ordering / display.
+  fields = [
+    { name = "id",        ty = "String",                  required = true },
+    { name = "cells",     ty = "serde_json::Value",       required = true },
+    { name = "updatedAt", ty = "u64",                     required = true },
+  ]
+
+  [data_interface.commands]
+  list   = "list_rows"
+  load   = "load_row"
+  save   = "save_row"
+  delete = "delete_row"
+
+[backend_seams]
+sqlite       = "Replace JsonRowStore with a sqlite-backed `rows(id TEXT PRIMARY KEY, cells_json TEXT NOT NULL, updated_at INTEGER NOT NULL)` table; great when the user has thousands of rows. Filtering / sorting becomes a SQL responsibility."
+http_json    = "Proxy CRUD to a remote REST API; useful when the grid backs a shared dataset."
+file_picker  = "Bind the file_picker integration to import CSV/XLSX into the grid (uses calamine). The seam wraps the import in a single batched save."
+
+[fill_markers]
+required = [
+  "FILL: column schema",
+  "FILL: cell editor for non-string columns",
+]
+optional = [
+  "FILL: keyboard shortcuts",
+  "FILL: bulk actions",
+]

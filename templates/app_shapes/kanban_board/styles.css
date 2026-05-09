@@ -1,0 +1,141 @@
+/* kanban_board — append to app/ui/styles.css. ~70 lines. */
+
+.kanban-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 56px);
+  background: var(--bg, #ffffff);
+  color: var(--fg, #111827);
+}
+
+.kanban-toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+
+.kanban-new-title {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  font-size: 14px;
+  background: transparent;
+  color: inherit;
+}
+
+.kanban-new-column {
+  padding: 6px 10px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+}
+
+.kanban-error {
+  padding: 8px 16px;
+  background: rgba(220, 38, 38, 0.08);
+  color: #dc2626;
+  border-bottom: 1px solid rgba(220, 38, 38, 0.2);
+  font-size: 13px;
+}
+
+.kanban-columns {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  padding: 16px;
+  overflow-x: auto;
+}
+
+.kanban-column {
+  background: var(--bg-subtle, #fafafa);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  min-height: 200px;
+}
+
+.kanban-column-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+
+.kanban-column-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted, #6b7280);
+}
+
+.kanban-column-count {
+  font-size: 11px;
+  background: var(--bg, #ffffff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 999px;
+  padding: 1px 8px;
+  color: var(--muted, #6b7280);
+}
+
+.kanban-card-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+
+.kanban-card {
+  position: relative;
+  background: var(--bg, #ffffff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  padding: 10px 12px;
+  cursor: grab;
+  user-select: none;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
+}
+
+.kanban-card:active {
+  cursor: grabbing;
+}
+
+.kanban-card-title {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.kanban-card-body {
+  font-size: 12px;
+  color: var(--muted, #6b7280);
+  margin-top: 4px;
+}
+
+.kanban-card-delete {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: transparent;
+  border: 0;
+  color: var(--muted, #6b7280);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.kanban-card-delete:hover {
+  background: rgba(220, 38, 38, 0.08);
+  color: #dc2626;
+}

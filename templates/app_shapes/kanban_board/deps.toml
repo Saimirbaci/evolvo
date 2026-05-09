@@ -1,0 +1,6 @@
+# kanban_board scaffold — Cargo dependencies to merge.
+# The default JSON backend uses only crates already in the workspace.
+# If a backend seam is bound, merge that integration template's deps.toml.
+
+[workspace.dependencies]
+# (none required)

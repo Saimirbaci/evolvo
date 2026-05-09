@@ -34,10 +34,34 @@ at `{{WORKTREE}}`.
 - **Registration**: add every new command to the `invoke_handler!` list in
   `app/src-tauri/src/lib.rs` (and/or `main.rs`). This is the single most
   common regression — grep for the new names after you add them.
-- **Templates**: for every name in `templates.useTemplates`, follow
-  `templates/integrations/<name>/README.md` — copy `host.rs` / `ui.rs` into
-  place, merge `deps.toml`, and register the commands. Do not hand-roll
-  what a template already ships.
+- **Integration templates**: for every name in `templates.useTemplates`,
+  follow `templates/integrations/<name>/README.md` — copy `host.rs` /
+  `ui.rs` into place, merge `deps.toml`, and register the commands. Do
+  not hand-roll what a template already ships.
+- **App-shape template** (when `templates.useAppShape` is set): follow
+  `templates/app_shapes/<name>/SKILL.md` end-to-end. In short:
+  1. Copy `host.rs` to the path declared in the manifest's
+     `[layout].host_module` (typically
+     `app/src-tauri/src/app_shapes/<name>.rs`). Add
+     `pub mod app_shapes;` and `pub mod <name>;` to the appropriate
+     `mod.rs` files (create `app_shapes/mod.rs` if it doesn't exist).
+  2. Register every `#[tauri::command]` from the scaffold's `host.rs` in
+     `invoke_handler!` (lib.rs). Grep for the command names afterwards
+     to confirm.
+  3. Merge `deps.toml` if any optional renderer / dependency is used.
+  4. Walk every `// FILL: …` marker in the copied files and replace it
+     with iteration-specific code based on the user's request and the
+     plan's `entities` list. The validator (planned) refuses any `// FILL:`
+     surviving in the final diff.
+  5. If `templates.backendBindings.<name>` is set AND the integration's
+     `seam_<name>.rs` adapter exists, replace the scaffold's default
+     `*Store` impl factory (`build_store`) with the seam's adapter. If
+     the seam isn't shipped yet, fall back to the default JSON impl and
+     append a `history` entry on `plan.json` recording the missing seam
+     — never silently bake in a half-implemented adapter.
+  6. Tests: reuse the scaffold's existing `#[cfg(test)] mod tests`
+     verbatim. The plan's `tests[]` should already name those test
+     functions; if it doesn't, add them.
 - **Tests**: add each planned test by its exact name as a `#[test] fn
   <name>` in the module the plan names. Use `tempfile::tempdir()`;
   `EVOLVO_WORKSPACE_ROOT` must not leak into real disk.
@@ -49,6 +73,12 @@ The validator will grep your diff for `TODO`, `unimplemented!`, and
 implement something inside the iteration budget, shrink the plan (edit
 `{{PLAN_PATH}}` to remove the command), then implement the reduced set
 fully.
+
+`// FILL: …` markers from app-shape scaffolds count as stub smells once
+the scaffold has been copied in: every `FILL` you do not legitimately
+delete (because it doesn't apply to this iteration) you MUST replace
+with real code. Leaving a `// FILL: …` comment in the diff fails the
+stage the same way `TODO` does.
 
 ## Validation this stage will face
 

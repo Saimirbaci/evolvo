@@ -1,0 +1,21 @@
+# markdown_editor scaffold — Cargo dependencies to merge.
+#
+# The default JSON backend uses only crates already in the workspace
+# (serde, serde_json, tempfile for tests). If a backend seam is bound
+# (templates.backendBindings.markdown_editor), merge that integration
+# template's deps.toml as well.
+#
+# Adopt one of these blocks if you take the higher-fidelity preview path
+# (see ui_modules/preview.rs):
+#
+# [optional.host_renderer]
+# # Add to app/src-tauri/Cargo.toml [dependencies]:
+# pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+#
+# [optional.wasm_renderer]
+# # Add to app/ui/Cargo.toml [dependencies]. Bundle size grows ~50 KB
+# # after wasm-opt — measure before shipping.
+# pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+[workspace.dependencies]
+# (none required — defaults compose with existing workspace deps)

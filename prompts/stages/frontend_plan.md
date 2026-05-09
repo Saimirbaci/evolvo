@@ -29,6 +29,18 @@ Mutate `{{PLAN_PATH}}` to fill `frontend`:
 - `budget`: keep `{minRoutes: 1, minComponents: 2}` unless the plan
   deliberately wants more.
 
+### When `templates.useAppShape` is set
+
+Read `templates/app_shapes/<name>/SKILL.md` first. Its "What you get"
+list pre-populates much of `components[]` — the scaffold names the
+top-level page (e.g. `MarkdownEditorPage`) and any sub-components
+(e.g. `DocList`, `MarkdownPreview`). Plan the route as
+`{ path: "/", component: "<TopLevelPage>" }` and list every component the
+scaffold ships under `components[]` so the validator's `fn <name>` grep
+finds them. You may add iteration-specific components on top of these
+when the user's request implies UI affordances the scaffold doesn't
+already provide.
+
 ## The hard constraint
 
 Every string in any `usesCommands[]` MUST already appear in

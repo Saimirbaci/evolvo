@@ -23,6 +23,17 @@ Build the UI described in `plan.frontend` inside the worktree at
 - Additional `app/ui/src/*.rs` modules as needed — one file per component
   cluster. Declare them in `app/ui/src/main.rs` or `app.rs` (whichever
   already hosts the module tree).
+- **App-shape scaffold UI** (when `templates.useAppShape` is set): copy
+  the scaffold's `ui_app.rs` to the path the manifest's
+  `[layout].ui_app` declares (typically
+  `app/ui/src/app_shape_<name>.rs`); copy every file in
+  `ui_modules/` to its corresponding `[layout].ui_modules[*]` path;
+  declare every new module in `app/ui/src/main.rs`. Then rewrite
+  `app/ui/src/app.rs` so `App` mounts the scaffold's top-level component
+  inside `<Shell>`. Append `styles.css` to `app/ui/styles.css` (do not
+  replace it — the shell's existing styles must keep working). Walk
+  every `// FILL: …` marker in the copied files and replace it with the
+  iteration's code; `// FILL:` left in the diff fails this stage.
 - `app/ui/src/types.rs` — UI mirrors of any new wire types from the host.
 - **`app/ui/styles.css`** — Trunk bundles this single stylesheet. Every new
   route/component you introduce MUST have matching CSS here: layout,
