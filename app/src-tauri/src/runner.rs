@@ -34,7 +34,7 @@ use std::process::{Command, Stdio};
 use crate::agent::{backend_for, AgentBackend};
 use crate::lineage::LineageEngine;
 use crate::store::{Store, StoreError};
-use crate::types::{AgentKind, FeedbackRecord, LineageJobRecord, LineageJobStatus};
+use crate::types::{AgentKind, FeedbackRecord, FreedomLevel, LineageJobRecord, LineageJobStatus};
 
 const SANDBOX_WORKSPACES_DIR: &str = "lineage_workspaces";
 const WORKTREE_DIR: &str = "worktree";
@@ -413,6 +413,11 @@ const EMBEDDED_STAGE_FINAL_REVIEW: &str = include_str!("../../../prompts/stages/
 /// Local-model delegation rules. Appended to the supervisor prompt when
 /// the user opted into pi+Ollama delegation on the feedback record.
 const EMBEDDED_DELEGATE_RULES: &str = include_str!("../../../prompts/pi.md");
+/// Shared operating contract injected into every stage prompt and the
+/// legacy implementation prompt. Defines reply sentinel, fail-fast
+/// contract, prompt-injection defense, and blast-radius rules so each
+/// prompt body can focus on stage-specific logic.
+const EMBEDDED_CONTRACT: &str = include_str!("../../../prompts/_contract.md");
 
 fn prompts_override_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("EVOLVO_PROMPTS_DIR") {
@@ -451,42 +456,38 @@ fn trim_trailing_newline(s: String) -> String {
 
 /// Construct the prompt handed to Claude Code. Kept public so tests (and
 /// future tooling) can assert it contains the right invariants.
-/// Returns the tailored guidance block for a given iteration number. The
-/// meta-app starts empty: iteration 1 is the user describing the app they
-/// actually want (via canvas + text + voice), and the agent has wide latitude
-/// to rearchitect the codebase. As the iteration number grows, the agent's
-/// freedom narrows — by ~iteration 10 the default is minor, surgical fixes
-/// unless the user explicitly asks for a structural change.
+/// Returns the tailored guidance block for a given iteration + freedom
+/// level. Freedom selects the latitude prose (bootstrap → maturation, or
+/// NewApp); iteration only feeds the dev-server port. The agent never
+/// sees the iteration number directly — it sees `{phase}` + `{port}`.
 ///
-/// Regardless of iteration, the four product invariants (Feedback Overlay,
+/// Regardless of freedom, the four product invariants (Feedback Overlay,
 /// Canvas / drawing board, Inbox, Lineage pipeline) MUST survive every pass.
-pub fn iteration_guidance(iteration: u32) -> String {
-    let n = iteration.max(1);
-    let port = iteration_port(n);
-    let (phase, rel, embedded) = match n {
-        1..=5 => (
-            "Bootstrap phase",
-            "phases/bootstrap.md",
-            EMBEDDED_PHASE_BOOTSTRAP,
-        ),
-        6..=9 => ("Shaping phase", "phases/shaping.md", EMBEDDED_PHASE_SHAPING),
-        10..=12 => (
-            "Consolidation phase",
-            "phases/consolidation.md",
-            EMBEDDED_PHASE_CONSOLIDATION,
-        ),
-        _ => (
-            "Maturation phase",
-            "phases/maturation.md",
-            EMBEDDED_PHASE_MATURATION,
-        ),
+pub fn iteration_guidance(iteration: u32, freedom: FreedomLevel) -> String {
+    let port = iteration_port(iteration.max(1));
+    let (rel, embedded) = match freedom {
+        // NewApp and Bootstrap share the "rewrite freely" latitude prose;
+        // the NewApp banner is appended separately by the caller.
+        FreedomLevel::NewApp | FreedomLevel::Bootstrap => {
+            ("phases/bootstrap.md", EMBEDDED_PHASE_BOOTSTRAP)
+        }
+        FreedomLevel::Shaping => ("phases/shaping.md", EMBEDDED_PHASE_SHAPING),
+        FreedomLevel::Consolidation => {
+            ("phases/consolidation.md", EMBEDDED_PHASE_CONSOLIDATION)
+        }
+        FreedomLevel::Maturation => ("phases/maturation.md", EMBEDDED_PHASE_MATURATION),
+        FreedomLevel::Auto => {
+            // Should never reach prompt build with an unresolved freedom; if
+            // it does, fall back to the most conservative latitude rather
+            // than silently picking Bootstrap.
+            ("phases/maturation.md", EMBEDDED_PHASE_MATURATION)
+        }
     };
     let latitude = trim_trailing_newline(load_prompt(rel, embedded));
 
     let template = load_prompt("iteration_guidance.md", EMBEDDED_ITERATION_GUIDANCE);
     template
-        .replace("{n}", &n.to_string())
-        .replace("{phase}", phase)
+        .replace("{phase}", freedom.phase_label())
         .replace("{latitude}", &latitude)
         .replace("{port}", &port.to_string())
 }
@@ -613,22 +614,24 @@ pub fn build_implementation_prompt_for(
     agent: AgentKind,
 ) -> String {
     let iteration = if job.iteration == 0 { 1 } else { job.iteration };
-    let is_new_app = matches!(feedback.feedback_type, crate::types::FeedbackType::NewApp);
-    let guidance = iteration_guidance(iteration);
-    // A `NewApp` feedback is an explicit "start over" signal from the user —
-    // it overrides the iteration-number-based latitude and forces the agent
-    // back into bootstrap mode no matter how many iterations have happened.
-    let (step_rel, step_embed) = if is_new_app {
-        ("work_steps/new_app.md", EMBEDDED_STEP_NEW_APP)
-    } else if iteration <= 5 {
-        ("work_steps/bootstrap.md", EMBEDDED_STEP_BOOTSTRAP)
-    } else if iteration <= 10 {
-        ("work_steps/shaping.md", EMBEDDED_STEP_SHAPING)
-    } else {
-        ("work_steps/maturation.md", EMBEDDED_STEP_MATURATION)
+    // The persisted `freedom` may be `Auto` for jobs that haven't been
+    // resolved yet (prepare_run normally pins it on first allocation);
+    // resolve defensively so this function works for tests and for any
+    // caller that bypasses prepare_run.
+    let freedom = job.freedom.resolve(iteration, feedback.feedback_type);
+    let guidance = iteration_guidance(iteration, freedom);
+    let (step_rel, step_embed) = match freedom {
+        FreedomLevel::NewApp => ("work_steps/new_app.md", EMBEDDED_STEP_NEW_APP),
+        FreedomLevel::Bootstrap => ("work_steps/bootstrap.md", EMBEDDED_STEP_BOOTSTRAP),
+        FreedomLevel::Shaping | FreedomLevel::Consolidation => {
+            ("work_steps/shaping.md", EMBEDDED_STEP_SHAPING)
+        }
+        FreedomLevel::Maturation | FreedomLevel::Auto => {
+            ("work_steps/maturation.md", EMBEDDED_STEP_MATURATION)
+        }
     };
     let work_step_4 = trim_trailing_newline(load_prompt(step_rel, step_embed));
-    let new_app_banner = if is_new_app {
+    let new_app_banner = if matches!(freedom, FreedomLevel::NewApp) {
         load_prompt("new_app_banner.md", EMBEDDED_NEW_APP_BANNER)
     } else {
         String::new()
@@ -661,12 +664,14 @@ pub fn build_implementation_prompt_for(
     let template = load_prompt("implementation.md", EMBEDDED_IMPLEMENTATION);
     let backend = backend_for(agent);
     let context_files = backend.context_files().to_vec().join(", ");
+    let contract = trim_trailing_newline(load_prompt("_contract.md", EMBEDDED_CONTRACT));
     let mut prompt = template
+        .replace("{contract}", &contract)
         .replace("{guidance}", &guidance)
         .replace("{new_app_banner}", &new_app_banner)
         .replace("{job_id}", &job.id)
         .replace("{branch}", &branch_name(&job.id))
-        .replace("{iteration}", &iteration.to_string())
+        .replace("{phase}", freedom.phase_label())
         .replace("{title}", &job.title)
         .replace("{feedback_type}", &feedback_type)
         .replace("{route}", &route)
@@ -781,9 +786,21 @@ pub fn prepare_run(
     // allocated iteration is persisted back onto the stored record so the
     // UI (and any retry) sees a stable value.
     let mut job = job.clone();
+    let mut dirty = false;
     if job.iteration == 0 {
         let n = store.allocate_iteration()?;
         job.iteration = n;
+        dirty = true;
+    }
+    // Pin the freedom level on first run so retries / resumes see a
+    // stable value (and a reviewer who later opens the JSON can override
+    // it). `Auto` is resolved once and replaced; concrete values stay.
+    if matches!(job.freedom, FreedomLevel::Auto) {
+        job.freedom =
+            FreedomLevel::from_iteration_and_kind(job.iteration, feedback.feedback_type);
+        dirty = true;
+    }
+    if dirty {
         store.save_lineage_job(&job)?;
     }
     let job = &job;
@@ -1260,10 +1277,13 @@ fn render_stage_prompt(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let contract = trim_trailing_newline(load_prompt("_contract.md", EMBEDDED_CONTRACT));
+    let port = iteration_port(plan.app.iteration.max(1));
     template
+        .replace("{{CONTRACT}}", &contract)
         .replace("{{APP_NAME}}", &plan.app.name)
         .replace("{{JOB_ID}}", job_id)
-        .replace("{{ITERATION}}", &plan.app.iteration.to_string())
+        .replace("{{PORT}}", &port.to_string())
         .replace("{{ROUTE}}", &plan.canvas.route)
         .replace("{{PLAN_PATH}}", &plan_path.display().to_string())
         .replace("{{CANVAS_PNG}}", &canvas_png)
@@ -1652,6 +1672,7 @@ mod tests {
             log_path: None,
             source_repo: None,
             iteration: 0,
+            freedom: crate::types::FreedomLevel::Auto,
             stages: Vec::new(),
             agent: AgentKind::ClaudeCode,
         }
@@ -1734,12 +1755,13 @@ mod tests {
     fn prompt_defaults_unallocated_iteration_to_one() {
         let prompt = build_implementation_prompt(
             &mk_feedback(),
-            &mk_job(), // iteration: 0
+            &mk_job(), // iteration: 0, freedom: Auto
             &[],
             Path::new("/tmp/claude.log"),
         );
-        assert!(prompt.contains("Iteration: `1`"));
-        assert!(prompt.contains("Bootstrap phase"));
+        // Auto + iteration=0 (clamped to 1) + Bug feedback type resolves
+        // to Bootstrap; the phase label leaks into the prompt header.
+        assert!(prompt.contains("Phase: Bootstrap phase"));
     }
 
     #[test]
@@ -1747,13 +1769,13 @@ mod tests {
         let mut fb = mk_feedback();
         fb.feedback_type = FeedbackType::NewApp;
         let mut job = mk_job();
-        job.iteration = 15; // Would normally be "minor, surgical" phase.
+        job.iteration = 15; // Without NewApp this would be Maturation.
 
         let prompt = build_implementation_prompt(&fb, &job, &[], Path::new("/tmp/claude.log"));
         assert!(prompt.contains("NewApp"));
         assert!(prompt.contains("new app from scratch") || prompt.contains("NEW APP from scratch"));
-        assert!(prompt.contains("overrides the iteration-phase latitude"));
-        // The "minor, surgical" guidance must NOT be chosen for NewApp, even at iteration 15.
+        assert!(prompt.contains("full bootstrap latitude"));
+        // The "minor, surgical" maturation guidance must NOT be chosen.
         assert!(!prompt.contains("Make the minimal, focused change"));
     }
 
@@ -1844,7 +1866,7 @@ mod tests {
 
     #[test]
     fn iteration_guidance_enforces_single_trigger_for_canvas_and_feedback() {
-        let g = iteration_guidance(1);
+        let g = iteration_guidance(1, FreedomLevel::Bootstrap);
         assert!(g.contains("ONE button"));
         assert!(g.contains("Canvas overlay"));
         assert!(g.contains("Feedback panel"));
@@ -1854,11 +1876,62 @@ mod tests {
 
     #[test]
     fn iteration_guidance_mentions_port_and_verification() {
-        let g = iteration_guidance(2);
+        let g = iteration_guidance(2, FreedomLevel::Bootstrap);
         assert!(g.contains(&iteration_port(2).to_string()));
         assert!(g.contains("EVOLVO_ITERATION_PORT"));
         assert!(g.contains("Verify-before-done"));
         assert!(g.contains("commit"));
+    }
+
+    #[test]
+    fn iteration_guidance_picks_latitude_from_freedom_level_not_iteration() {
+        // A late iteration with explicit Bootstrap freedom still gets the
+        // bootstrap latitude prose — the freedom field overrides any
+        // iteration-derived default.
+        let g = iteration_guidance(15, FreedomLevel::Bootstrap);
+        assert!(
+            g.contains("Bootstrap phase"),
+            "phase label should be Bootstrap"
+        );
+        assert!(
+            g.contains("wide latitude") || g.contains("rip out") || g.contains("restructure"),
+            "should ship bootstrap latitude prose, got:\n{}",
+            &g[..g.len().min(800)]
+        );
+
+        // Same iteration, Maturation freedom: surgical latitude prose.
+        let g = iteration_guidance(15, FreedomLevel::Maturation);
+        assert!(g.contains("Maturation phase"));
+        assert!(
+            g.contains("minor") || g.contains("surgical") || g.contains("Do NOT refactor"),
+            "should ship maturation latitude prose"
+        );
+    }
+
+    #[test]
+    fn freedom_level_from_iteration_and_kind_matches_phase_buckets() {
+        use crate::types::FeedbackType;
+        assert_eq!(
+            FreedomLevel::from_iteration_and_kind(1, FeedbackType::Bug),
+            FreedomLevel::Bootstrap
+        );
+        assert_eq!(
+            FreedomLevel::from_iteration_and_kind(7, FeedbackType::Bug),
+            FreedomLevel::Shaping
+        );
+        assert_eq!(
+            FreedomLevel::from_iteration_and_kind(11, FeedbackType::Bug),
+            FreedomLevel::Consolidation
+        );
+        assert_eq!(
+            FreedomLevel::from_iteration_and_kind(20, FeedbackType::Bug),
+            FreedomLevel::Maturation
+        );
+        // NewApp always wins regardless of iteration.
+        assert_eq!(
+            FreedomLevel::from_iteration_and_kind(99, FeedbackType::NewApp),
+            FreedomLevel::NewApp
+        );
     }
 
     #[test]
@@ -1927,6 +2000,84 @@ mod tests {
         // substitution was executed without leaving the placeholder behind.
         assert!(!prompt.contains("{agent_label}"));
         assert!(!prompt.contains("{agent_context_files}"));
+    }
+
+    #[test]
+    fn implementation_prompt_injects_operating_contract() {
+        let prompt = build_implementation_prompt_for(
+            &mk_feedback(),
+            &mk_job(),
+            &[],
+            Path::new("/tmp/claude.log"),
+            AgentKind::ClaudeCode,
+        );
+        assert!(!prompt.contains("{contract}"), "contract placeholder leaked");
+        assert!(prompt.contains("STAGE_RESULT:"), "sentinel rule missing");
+        assert!(
+            prompt.contains("Operating contract") || prompt.contains("operating contract"),
+            "contract heading missing from prompt"
+        );
+        assert!(
+            prompt.contains("<user-content>"),
+            "user-content fence missing — prompt-injection defense gone"
+        );
+    }
+
+    #[test]
+    fn stage_prompts_inject_operating_contract() {
+        use crate::plan::IterationPlan;
+        let mut plan = IterationPlan::default();
+        plan.app.name = "test-app".into();
+        plan.app.iteration = 1;
+        let worktree = Path::new("/tmp/wt");
+        let plan_path = Path::new("/tmp/plan.json");
+        for kind in [
+            crate::types::StageKind::BackendPlan,
+            crate::types::StageKind::BackendImpl,
+            crate::types::StageKind::FrontendPlan,
+            crate::types::StageKind::FrontendImpl,
+            crate::types::StageKind::E2EPlan,
+            crate::types::StageKind::E2EImpl,
+            crate::types::StageKind::FinalReview,
+        ] {
+            let template = stage_prompt_template(kind);
+            let rendered = render_stage_prompt(&template, &plan, worktree, plan_path, "job-x");
+            assert!(
+                !rendered.contains("{{CONTRACT}}"),
+                "{kind:?} left CONTRACT placeholder"
+            );
+            assert!(
+                rendered.contains("STAGE_RESULT:"),
+                "{kind:?} missing reply sentinel"
+            );
+            assert!(
+                !rendered.contains("{{ITERATION}}"),
+                "{kind:?} still references the deprecated {{{{ITERATION}}}} placeholder"
+            );
+            assert!(
+                !rendered.contains("{{PORT}}"),
+                "{kind:?} left {{{{PORT}}}} unsubstituted"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_prompts_substitute_concrete_port() {
+        use crate::plan::IterationPlan;
+        let mut plan = IterationPlan::default();
+        plan.app.name = "test-app".into();
+        plan.app.iteration = 5;
+        let worktree = Path::new("/tmp/wt");
+        let plan_path = Path::new("/tmp/plan.json");
+        let template = stage_prompt_template(crate::types::StageKind::E2EImpl);
+        let rendered = render_stage_prompt(&template, &plan, worktree, plan_path, "job-x");
+        let expected_port = iteration_port(5).to_string();
+        assert!(
+            rendered.contains(&expected_port),
+            "expected port {expected_port} substituted into e2e_impl prompt"
+        );
+        // The arithmetic ("1530 + N") must not leak into the agent-facing text.
+        assert!(!rendered.contains("1530 +"));
     }
 
     #[test]

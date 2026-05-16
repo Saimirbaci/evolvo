@@ -1,8 +1,21 @@
 # Stage 4 / 7 — Frontend implementation
 
+{{CONTRACT}}
+
 Build the UI described in `plan.frontend` inside the worktree at
 `{{WORKTREE}}`. The backend is already done; do not modify
 `app/src-tauri/*`.
+
+## Preconditions (fail fast)
+
+1. `{{PLAN_PATH}}` parses and `frontend.routes` + `frontend.components`
+   are non-empty. Otherwise: `STAGE_RESULT: fail: frontend plan missing`.
+2. `cargo` is on PATH and the `wasm32-unknown-unknown` target is
+   installed (`rustup target list --installed`). Otherwise:
+   `STAGE_RESULT: fail: wasm32 target not installed`.
+3. `app/ui/src/shell.rs` exists in the worktree (the invariant chrome
+   must still be there). Otherwise:
+   `STAGE_RESULT: fail: shell.rs missing — prior stage corrupted invariant chrome`.
 
 ## Your inputs
 
@@ -33,12 +46,12 @@ Build the UI described in `plan.frontend` inside the worktree at
   inside `<Shell>`. Append `styles.css` to `app/ui/styles.css` (do not
   replace it — the shell's existing styles must keep working). Walk
   every `// FILL: …` marker in the copied files and replace it with the
-  iteration's code; `// FILL:` left in the diff fails this stage.
+  job's code; `// FILL:` left in the diff fails this stage.
 - `app/ui/src/types.rs` — UI mirrors of any new wire types from the host.
 - **`app/ui/styles.css`** — Trunk bundles this single stylesheet. Every new
   route/component you introduce MUST have matching CSS here: layout,
   spacing, typography, focus states. An unstyled NewApp is a regression —
-  previous iterations shipped correct behaviour on a blank-white page and
+  earlier builds shipped correct behaviour on a blank-white page and
   it was unshippable. Add rules, do not remove existing shell/canvas CSS.
 
 ## Must NOT touch
@@ -83,5 +96,7 @@ Run the check yourself before exiting.
 ## When finished
 
 1. Make sure `cargo check -p evolvo_ui --target wasm32-unknown-unknown`
-   passes.
-2. Reply `frontend_impl done`.
+   passes. If it does not and you cannot fix it inside this stage's
+   scope, reply `STAGE_RESULT: fail: wasm check failed: <one-line cause>`.
+2. Otherwise reply per the Operating contract — final line
+   `STAGE_RESULT: ok`.

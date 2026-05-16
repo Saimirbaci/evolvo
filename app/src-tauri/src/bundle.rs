@@ -339,6 +339,7 @@ mod tests {
             log_path: Some("/Users/host/.evolvo/.../claude.log".into()),
             source_repo: Some("/Users/host/code/evolvo".into()),
             iteration: 3,
+            freedom: crate::types::FreedomLevel::Auto,
             stages: Vec::new(),
             agent: AgentKind::ClaudeCode,
         };

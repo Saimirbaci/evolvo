@@ -1,5 +1,13 @@
 # Stage 5 / 7 — End-to-end plan
 
+{{CONTRACT}}
+
+## Preconditions (fail fast)
+
+1. `{{PLAN_PATH}}` parses and `backend.commands`, `frontend.routes`,
+   `frontend.components` are all non-empty. Otherwise:
+   `STAGE_RESULT: fail: prior stages incomplete — cannot plan e2e`.
+
 Backend + frontend exist. Your job: write the E2E verification contract
 into `plan.e2e` so the next stage (and the final review) can prove the
 app actually works from the user's point of view.
@@ -40,7 +48,7 @@ In `{{PLAN_PATH}}` under `e2e`:
       "id": "happy_path_crud",
       "title": "Create, toggle, delete a task",
       "steps": [
-        "Launch the app at the iteration's port.",
+        "Launch the app at port {{PORT}}.",
         "Type 'Buy milk' in the new-task input and press Enter.",
         "Expect a row 'Buy milk' in the task list.",
         "Click the checkbox on the 'Buy milk' row.",
@@ -67,4 +75,5 @@ In `{{PLAN_PATH}}` under `e2e`:
 
 ## When finished
 
-Save and reply `e2e_plan done`.
+Save and reply per the Operating contract — final line `STAGE_RESULT: ok`
+(or `STAGE_RESULT: fail: <reason>`).

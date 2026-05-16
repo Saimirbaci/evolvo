@@ -80,6 +80,73 @@ pub enum FeedbackType {
     NewApp,
 }
 
+/// How much architectural freedom the agent has on this lineage job. The
+/// runtime computes a default from `(iteration, feedback_type)` the first
+/// time a job runs, but the field is overridable — a reviewer can lock a
+/// late-iteration job into `Bootstrap` (or vice versa) by editing the
+/// stored value. Substituted into the prompt as `{phase}` / `{latitude}`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FreedomLevel {
+    /// Sentinel meaning "derive from (iteration, feedback_type) at run
+    /// time". Persisted records that pre-date this field deserialize to
+    /// `Auto` and get resolved on first run.
+    #[default]
+    Auto,
+    /// Wide latitude. Treat existing code as scaffolding; restructure freely.
+    Bootstrap,
+    /// Cohesive feature additions; refactor when it serves the change.
+    Shaping,
+    /// Targeted changes that extend / refine; restructure only if blocked.
+    Consolidation,
+    /// Minimal surgical change. No unrelated refactors.
+    Maturation,
+    /// User explicitly asked for a new app. Full bootstrap latitude plus
+    /// the NewApp banner, regardless of iteration number.
+    NewApp,
+}
+
+impl FreedomLevel {
+    /// Derive a level from the iteration counter + feedback type. This is
+    /// the default heuristic stamped onto a job at first run; reviewers
+    /// can override the stored value.
+    pub fn from_iteration_and_kind(iteration: u32, ty: FeedbackType) -> Self {
+        if matches!(ty, FeedbackType::NewApp) {
+            return Self::NewApp;
+        }
+        match iteration.max(1) {
+            1..=5 => Self::Bootstrap,
+            6..=9 => Self::Shaping,
+            10..=12 => Self::Consolidation,
+            _ => Self::Maturation,
+        }
+    }
+
+    /// Returns `self` unless it's `Auto`, in which case derives from
+    /// `(iteration, ty)`. Use this at prompt-build sites so the
+    /// resolved level is always concrete.
+    pub fn resolve(self, iteration: u32, ty: FeedbackType) -> Self {
+        match self {
+            Self::Auto => Self::from_iteration_and_kind(iteration, ty),
+            other => other,
+        }
+    }
+
+    /// Human label substituted as `{phase}` in the iteration guidance
+    /// preamble. `Auto` only appears when an unresolved value leaks; the
+    /// label is intentionally noisy so we notice.
+    pub fn phase_label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (unresolved)",
+            Self::Bootstrap => "Bootstrap phase",
+            Self::Shaping => "Shaping phase",
+            Self::Consolidation => "Consolidation phase",
+            Self::Maturation => "Maturation phase",
+            Self::NewApp => "Bootstrap phase (NewApp)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackStatus {
@@ -281,6 +348,13 @@ pub struct LineageJobRecord {
     /// and are treated as iteration 1 when they run.
     #[serde(default)]
     pub iteration: u32,
+    /// Architectural freedom granted to the agent on this job. Defaults
+    /// to `Auto` (derive from `iteration` + `feedback_type`) and is
+    /// resolved to a concrete value the first time the job runs; the
+    /// reviewer can override the stored value to force e.g. `Maturation`
+    /// on an early-iteration job or `Bootstrap` on a late one.
+    #[serde(default)]
+    pub freedom: FreedomLevel,
     /// Multi-stage planner pipeline progress for NewApp iterations. Empty
     /// for classic single-session runs (bug fixes, small features). Each
     /// entry is appended when the corresponding stage starts and mutated

@@ -8,7 +8,8 @@ dispatching the Claude session:
 - `{{APP_NAME}}` — `plan.app.name` (seeded from the feedback text; the
   BackendPlan stage is expected to rewrite it deliberately).
 - `{{JOB_ID}}` — lineage job id.
-- `{{ITERATION}}` — iteration number (1-based).
+- `{{PORT}}` — dev-server port this job's app should bind to (the
+  runner has already rewritten the worktree's config to this port).
 - `{{ROUTE}}` — the page route the canvas was drawn on top of.
 - `{{PLAN_PATH}}` — absolute path to `plan.json` (always read and mutate
   this file; never hold a mental copy).
@@ -21,7 +22,7 @@ dispatching the Claude session:
 - `{{VOICE_TRANSCRIPT}}` — verbatim voice transcript (may be `<none>`).
 - `{{REGION_INDEX}}` — human-readable dump of `plan.canvas.regions`, one
   line per region with its id / bbox / dominant color / labels.
-- `{{WORKTREE}}` — absolute path to the iteration worktree.
+- `{{WORKTREE}}` — absolute path to the job's worktree.
 
 ## The golden rule every stage shares
 

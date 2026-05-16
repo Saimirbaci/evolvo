@@ -365,6 +365,7 @@ mod tests {
             log_path: None,
             source_repo: None,
             iteration: 0,
+            freedom: crate::types::FreedomLevel::Auto,
             stages: Vec::new(),
             agent: AgentKind::ClaudeCode,
         };

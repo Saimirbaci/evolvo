@@ -1,7 +1,17 @@
 # Stage 7 / 7 — Final review
 
+{{CONTRACT}}
+
+## Preconditions (fail fast)
+
+1. `{{PLAN_PATH}}` parses and all six prior stages have a passing
+   history entry. Otherwise: `STAGE_RESULT: fail: prior stage incomplete`.
+2. The dev server is running on port `{{PORT}}`
+   (`lsof -iTCP:{{PORT}} -sTCP:LISTEN` returns a single PID). Otherwise:
+   `STAGE_RESULT: fail: dev server not listening on port {{PORT}}`.
+
 The six prior stages have each been validated. This stage is read-only
-housekeeping: confirm the iteration is shippable and leave breadcrumbs so
+housekeeping: confirm the build is shippable and leave breadcrumbs so
 the reviewer lands on a live build.
 
 ## Your inputs
@@ -23,20 +33,19 @@ the reviewer lands on a live build.
      this by storage shape, just confirm no migration broke it).
 3. `cargo check --workspace` and `cargo test -p evolvo_desktop --lib`
    pass on the worktree.
-4. The iteration's dev-server is running on port `1530 + {{ITERATION}}`.
+4. The dev-server is running on port `{{PORT}}`.
 
 ## What to write
 
 - Update `plan.stage` to `"completed"` and append a final `history`
   entry `{kind: "note", stage: "final_review", message: "ready — port
-  <N>"}`.
+  {{PORT}}"}`.
 - Do not rewrite earlier sections.
 
 ## When finished
 
-Reply with ONLY:
-
-```
-final_review done
-port: <N>
-```
+Reply per the Operating contract. Include `port: {{PORT}}` in your
+summary. The final line must be `STAGE_RESULT: ok` (or
+`STAGE_RESULT: fail: <reason>` if any of the four invariants regressed
+or any check failed — the runner will roll the build back rather than
+ship it).

@@ -1,9 +1,20 @@
 # Stage 2 / 7 — Backend implementation
 
+{{CONTRACT}}
+
 You are implementing the backend plan committed to `{{PLAN_PATH}}` for
-Evolvo iteration `{{ITERATION}}` (job `{{JOB_ID}}`). The BackendPlan stage
-has already written the plan; your job is to make it real in the worktree
-at `{{WORKTREE}}`.
+Evolvo job `{{JOB_ID}}`. The BackendPlan stage has already written the
+plan; your job is to make it real in the worktree at `{{WORKTREE}}`.
+
+## Preconditions (fail fast)
+
+1. `{{PLAN_PATH}}` exists, parses, and has a non-empty
+   `backend.commands` array. Otherwise:
+   `STAGE_RESULT: fail: backend plan missing or empty`.
+2. `cargo` and `git` are on PATH. Otherwise: `STAGE_RESULT: fail: cargo not on PATH`.
+3. The worktree is clean of unrelated edits (`git status` shows only
+   files this stage will touch). If a prior stage left dirty state,
+   continue — but note it in `plan.history`.
 
 ## Your inputs
 
@@ -50,7 +61,7 @@ at `{{WORKTREE}}`.
      to confirm.
   3. Merge `deps.toml` if any optional renderer / dependency is used.
   4. Walk every `// FILL: …` marker in the copied files and replace it
-     with iteration-specific code based on the user's request and the
+     with job-specific code based on the user's request and the
      plan's `entities` list. The validator (planned) refuses any `// FILL:`
      surviving in the final diff.
   5. If `templates.backendBindings.<name>` is set AND the integration's
@@ -70,7 +81,7 @@ at `{{WORKTREE}}`.
 
 The validator will grep your diff for `TODO`, `unimplemented!`, and
 `todo!()`. Any of those in new code fails the stage. If you cannot
-implement something inside the iteration budget, shrink the plan (edit
+implement something inside this job's budget, shrink the plan (edit
 `{{PLAN_PATH}}` to remove the command), then implement the reduced set
 fully.
 
@@ -116,6 +127,9 @@ touches:
 
 ## When finished
 
-1. Make sure `cargo check` and `cargo test` are green.
-2. Reply in chat with ONLY `backend_impl done`. The validator reads the
-   worktree, not your reply.
+1. Make sure `cargo check` and `cargo test` are green. If either fails
+   and you cannot fix it inside this stage's scope, reply
+   `STAGE_RESULT: fail: cargo check|test failed: <one-line cause>`.
+2. Otherwise reply per the Operating contract — a short summary if
+   useful, then a final line `STAGE_RESULT: ok`. The validator reads
+   the worktree; the sentinel is the runtime's signal.

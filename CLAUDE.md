@@ -292,5 +292,3 @@ Agents:
 - Start the new version of the app (the iteration you just built) so the reviewer can see it live when they start their review.
 - Update the LineageJob status to `build_ready` so the next iteration can start from it.
 - In your final summary, note which port the iteration is serving on and how you verified it.
-- If this is the first iteation, create a new agent in the Lineage with staff-product-manager role which knows about the app being built and can provide feedback.
-- Call the new agent staff-product-manager and give it the task of reviewing the last iteration of the new app/feature/fix. The agent should give some recommendations to the user for the next iteration.

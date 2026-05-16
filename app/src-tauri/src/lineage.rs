@@ -15,8 +15,8 @@
 
 use crate::store::{Store, StoreError};
 use crate::types::{
-    current_time_unix_ms, AgentKind, FeedbackRecord, FeedbackStatus, LineageJobRecord,
-    LineageJobStatus, StageKind, StageState, StageStatus,
+    current_time_unix_ms, AgentKind, FeedbackRecord, FeedbackStatus, FreedomLevel,
+    LineageJobRecord, LineageJobStatus, StageKind, StageState, StageStatus,
 };
 
 pub struct LineageEngine<'a> {
@@ -93,6 +93,7 @@ impl<'a> LineageEngine<'a> {
             log_path: None,
             source_repo: None,
             iteration: 0,
+            freedom: FreedomLevel::Auto,
             stages: Vec::new(),
             agent,
         };
