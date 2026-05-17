@@ -446,7 +446,7 @@ pub fn validate_e2e_impl(plan: &IterationPlan, worktree: &Path) -> StageReport {
 
 /// --- Final review: aggregate gate across all prior stages + region
 /// ownership completeness. Runs after `e2e_impl`. ---
-pub fn validate_final(plan: &IterationPlan) -> StageReport {
+pub fn validate_final(plan: &IterationPlan, worktree: &Path) -> StageReport {
     let mut r = StageReport::new("final_review");
     let owned: std::collections::HashSet<String> =
         crate::plan::owned_region_ids(plan).into_iter().collect();
@@ -472,7 +472,55 @@ pub fn validate_final(plan: &IterationPlan) -> StageReport {
             || matches!(plan.stage, crate::plan::PlanStage::Completed),
         format!("stage={}", plan.stage.label()),
     );
+    // Iteration-1 NewApp runs MUST rewrite CLAUDE.md so the next
+    // iteration's agent sees the new app's domain — not the host
+    // Evolvo's shell. We check for unmistakable host fingerprints; the
+    // check is intentionally narrow (false-positive cost is high — a
+    // user might legitimately keep the Tauri stack and still mention
+    // Evolvo, that's fine). The fingerprints we look for only appear
+    // verbatim in the host's CLAUDE.md.
+    //
+    // Skipped for iteration ≥ 2: those iterations are bug fixes /
+    // feature requests on an app that's already been documented; we
+    // don't force a rewrite on every iteration.
+    if plan.app.iteration <= 1 {
+        let claude_md_path = worktree.join("CLAUDE.md");
+        let (passed, detail) = check_claude_md_rewritten(&claude_md_path);
+        r.push("CLAUDE.md rewritten for new app (iteration 1)", passed, detail);
+    }
     r.finalize()
+}
+
+/// Stale-host-fingerprint check for iteration-1 NewApp runs. Returns
+/// `(passed, detail)`. Passes (with a permissive detail string) if the
+/// file is missing or empty — the check is a soft nudge, not a hard
+/// gate, and a missing file is a different problem this validator
+/// doesn't own.
+fn check_claude_md_rewritten(path: &Path) -> (bool, String) {
+    let body = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return (true, "no CLAUDE.md at worktree root (not enforced)".into()),
+    };
+    // Two fingerprints that only appear in the host Evolvo's CLAUDE.md
+    // verbatim. Either survives a rewrite means the agent didn't
+    // rewrite — they just appended.
+    let host_header = "# Evolvo — Repository Guide for Claude";
+    let host_one_liner = "Evolvo is a **Tauri 2** desktop app";
+    let has_header = body.contains(host_header);
+    let has_one_liner = body.contains(host_one_liner);
+    if has_header && has_one_liner {
+        (
+            false,
+            "still contains host Evolvo's exact header + one-liner — rewrite CLAUDE.md to describe the new app".into(),
+        )
+    } else if has_header {
+        (
+            false,
+            "still contains the host Evolvo header line verbatim — replace it with the new app's name".into(),
+        )
+    } else {
+        (true, "host fingerprints absent — looks rewritten".into())
+    }
 }
 
 // --- helpers ---
@@ -816,5 +864,80 @@ mod tests {
         let r = r.finalize();
         assert!(!r.passed);
         assert!(r.headline.contains("failed"));
+    }
+
+    #[test]
+    fn final_review_fails_when_claude_md_still_has_host_fingerprint_on_iter_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        // The host Evolvo's exact header + one-liner survived intact.
+        std::fs::write(
+            worktree.join("CLAUDE.md"),
+            "# Evolvo — Repository Guide for Claude\n\
+             \n\
+             Evolvo is a **Tauri 2** desktop app with a Leptos frontend.\n",
+        )
+        .unwrap();
+
+        let mut plan = crate::plan::IterationPlan::default();
+        plan.app.iteration = 1;
+        plan.stage = crate::plan::PlanStage::E2EImplemented;
+        let report = validate_final(&plan, worktree);
+        let rewrite_check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("CLAUDE.md rewritten"))
+            .expect("rewrite check should exist for iteration 1");
+        assert!(!rewrite_check.passed, "should flag stale host fingerprints");
+        assert!(rewrite_check.detail.contains("host Evolvo"));
+    }
+
+    #[test]
+    fn final_review_passes_rewrite_check_when_claude_md_describes_new_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        std::fs::write(
+            worktree.join("CLAUDE.md"),
+            "# Tasky — local-first todo app\n\
+             \n\
+             Tasky is a single-user task tracker built on the Evolvo shell.\n",
+        )
+        .unwrap();
+
+        let mut plan = crate::plan::IterationPlan::default();
+        plan.app.iteration = 1;
+        plan.stage = crate::plan::PlanStage::E2EImplemented;
+        let report = validate_final(&plan, worktree);
+        let rewrite_check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("CLAUDE.md rewritten"))
+            .expect("rewrite check should run on iteration 1");
+        assert!(rewrite_check.passed, "should accept a rewritten file");
+    }
+
+    #[test]
+    fn final_review_skips_rewrite_check_on_iteration_2() {
+        // Iteration 2+ is a bug fix on an already-documented app —
+        // we don't force a rewrite. CLAUDE.md can keep referencing the
+        // (already-correctly-named) app from iteration 1.
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        std::fs::write(
+            worktree.join("CLAUDE.md"),
+            "# Evolvo — Repository Guide for Claude\n\nEvolvo is a **Tauri 2** desktop app",
+        )
+        .unwrap();
+        let mut plan = crate::plan::IterationPlan::default();
+        plan.app.iteration = 2;
+        plan.stage = crate::plan::PlanStage::E2EImplemented;
+        let report = validate_final(&plan, worktree);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.name.contains("CLAUDE.md rewritten")),
+            "rewrite check should not fire on iteration 2+"
+        );
     }
 }

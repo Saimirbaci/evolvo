@@ -333,7 +333,7 @@ fn run_validator(
         StageKind::BackendImpl => validate_backend_impl(plan, worktree),
         StageKind::FrontendImpl => validate_frontend_impl(plan, worktree, job_dir),
         StageKind::E2EImpl => validate_e2e_impl(plan, worktree),
-        StageKind::FinalReview => validate_final(plan),
+        StageKind::FinalReview => validate_final(plan, worktree),
     }
 }
 
