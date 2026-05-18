@@ -134,9 +134,16 @@ that uses canvas feedback to evolve itself", you didn't rewrite.
 
 ## What to write into `plan.json`
 
-- Update `plan.stage` to `"completed"` and append a final `history`
-  entry `{kind: "note", stage: "final_review", message: "ready — port
+- Append a final `history` entry of the shape
+  `{kind: "note", stage: "final_review", message: "ready — port
   {{PORT}}; CLAUDE.md rewritten for <app.name>"}`.
+- **Do NOT edit `plan.stage`.** The runtime advances it for you the
+  moment this validator passes (via `advance_plan_stage` in
+  `stages.rs`). Manually setting it (e.g. writing `"planned"`,
+  `"done"`, or any other near-miss string) was the historical cause
+  of "reload plan: unknown variant" deadlocks. The deserialiser is
+  now tolerant of common drift patterns, but the cleanest behaviour
+  is still: leave the field alone.
 - Do not rewrite earlier sections of `plan.json`.
 
 ## When finished

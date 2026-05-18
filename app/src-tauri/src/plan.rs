@@ -30,20 +30,62 @@ pub const PLAN_FILENAME: &str = "plan.json";
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
 
 /// State of the plan file in terms of which stages have produced content.
-/// Written by each stage's planner *and* by the validator when a stage is
-/// accepted. The runner uses it to decide what to dispatch next.
+/// **Owned by the runtime, not the agent.** `advance_plan_stage` in
+/// `stages.rs` moves it forward monotonically after each validator
+/// passes; the agent should not edit `plan.stage` directly.
+///
+/// The deserialiser is **deliberately forgiving**. Older NewApp
+/// pipelines instructed the agent to mutate this field, which produced
+/// a string-typo deadlock the first time the agent wrote a near-miss
+/// (`"planned"` instead of `"backend_planned"`). Each variant carries
+/// `#[serde(alias = …)]` entries for the most common drift patterns:
+/// the most-upstream stage wins for ambiguous shortenings since
+/// `advance_plan_stage` is monotonic — a wrong intermediate state gets
+/// repaired by the next validator pass.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStage {
     #[default]
     Seeded,
+    #[serde(alias = "planned", alias = "backend_plan", alias = "backendPlanned")]
     BackendPlanned,
+    #[serde(
+        alias = "implemented",
+        alias = "backend_impl",
+        alias = "backendImplemented"
+    )]
     BackendImplemented,
+    #[serde(alias = "frontend_plan", alias = "frontendPlanned")]
     FrontendPlanned,
+    #[serde(alias = "frontend_impl", alias = "frontendImplemented")]
     FrontendImplemented,
+    /// Renamed from the serde-default `e2_e_planned` (which was ugly and
+    /// itself a typo magnet) to `e2e_planned`. Old plan.json files
+    /// still load via the alias.
+    #[serde(
+        rename = "e2e_planned",
+        alias = "e2_e_planned",
+        alias = "e2e_plan",
+        alias = "e2ePlanned"
+    )]
     E2EPlanned,
+    #[serde(
+        rename = "e2e_implemented",
+        alias = "e2_e_implemented",
+        alias = "e2e_impl",
+        alias = "e2eImplemented"
+    )]
     E2EImplemented,
+    #[serde(
+        alias = "complete",
+        alias = "done",
+        alias = "ready",
+        alias = "final",
+        alias = "final_review",
+        alias = "final_reviewed"
+    )]
     Completed,
+    #[serde(alias = "error", alias = "rejected")]
     Failed,
 }
 
@@ -1052,5 +1094,95 @@ mod tests {
         });
         let ids = owned_region_ids(&plan);
         assert_eq!(ids, vec!["R1", "R2", "R3"]);
+    }
+
+    #[test]
+    fn plan_stage_canonical_strings_round_trip() {
+        // Canonical names. Critically, `e2e_planned` (NOT
+        // `e2_e_planned`) is the on-disk form going forward.
+        let pairs: &[(&str, PlanStage)] = &[
+            ("seeded", PlanStage::Seeded),
+            ("backend_planned", PlanStage::BackendPlanned),
+            ("backend_implemented", PlanStage::BackendImplemented),
+            ("frontend_planned", PlanStage::FrontendPlanned),
+            ("frontend_implemented", PlanStage::FrontendImplemented),
+            ("e2e_planned", PlanStage::E2EPlanned),
+            ("e2e_implemented", PlanStage::E2EImplemented),
+            ("completed", PlanStage::Completed),
+            ("failed", PlanStage::Failed),
+        ];
+        for (s, variant) in pairs {
+            let raw = format!("\"{s}\"");
+            let decoded: PlanStage = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("{s} should decode: {e}"));
+            assert_eq!(decoded, *variant);
+            let encoded = serde_json::to_string(variant).unwrap();
+            assert_eq!(encoded, raw, "{:?} should re-encode to {s}", variant);
+        }
+    }
+
+    #[test]
+    fn plan_stage_tolerates_common_agent_typos() {
+        // The exact case that produced "reload plan: serde: unknown
+        // variant `planned`": an agent in a backend_plan stage wrote
+        // "planned" instead of "backend_planned". We now route it.
+        let cases: &[(&str, PlanStage)] = &[
+            ("planned", PlanStage::BackendPlanned),
+            ("backend_plan", PlanStage::BackendPlanned),
+            ("backendPlanned", PlanStage::BackendPlanned),
+            ("implemented", PlanStage::BackendImplemented),
+            ("backend_impl", PlanStage::BackendImplemented),
+            ("frontend_plan", PlanStage::FrontendPlanned),
+            ("frontend_impl", PlanStage::FrontendImplemented),
+            ("e2e_plan", PlanStage::E2EPlanned),
+            ("e2e_impl", PlanStage::E2EImplemented),
+            ("done", PlanStage::Completed),
+            ("complete", PlanStage::Completed),
+            ("ready", PlanStage::Completed),
+            ("final_review", PlanStage::Completed),
+            ("error", PlanStage::Failed),
+            ("rejected", PlanStage::Failed),
+        ];
+        for (raw, expected) in cases {
+            let v: PlanStage = serde_json::from_str(&format!("\"{raw}\""))
+                .unwrap_or_else(|e| panic!("{raw} should be aliased: {e}"));
+            assert_eq!(v, *expected, "alias `{raw}` should map to {:?}", expected);
+        }
+    }
+
+    #[test]
+    fn plan_stage_back_compat_for_old_e2_e_serialization() {
+        // Plans saved before the e2_e_* → e2e_* rename must still load.
+        let v: PlanStage = serde_json::from_str("\"e2_e_planned\"").unwrap();
+        assert_eq!(v, PlanStage::E2EPlanned);
+        let v: PlanStage = serde_json::from_str("\"e2_e_implemented\"").unwrap();
+        assert_eq!(v, PlanStage::E2EImplemented);
+    }
+
+    #[test]
+    fn plan_stage_still_rejects_outright_garbage() {
+        // Robustness is bounded — we only accept variants we can map
+        // to a real stage. A completely foreign value still errors so
+        // the runner sees the problem.
+        let bad = serde_json::from_str::<PlanStage>("\"totally_unknown_value\"");
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn plan_stage_load_survives_aliased_string_in_plan_json() {
+        // End-to-end: a plan.json with an aliased stage value loads via
+        // the full IterationPlan path (which is what `load_plan` does
+        // in stages.rs and is the path that previously crashed).
+        let raw = r#"{
+            "schemaVersion": 1,
+            "app": {"name": "Demo"},
+            "stage": "planned",
+            "canvas": {"pngPath": null, "annotationsPath": null, "route": "/"},
+            "backend": {},
+            "frontend": {},
+            "e2e": {}
+        }"#;
+        let plan: IterationPlan = serde_json::from_str(raw).unwrap();
+        assert_eq!(plan.stage, PlanStage::BackendPlanned);
     }
 }
