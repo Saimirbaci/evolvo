@@ -71,6 +71,16 @@ pub fn seed_plan_from_feedback(
     let annotations_path = stage_annotations(feedback, &inputs_dir)?;
     let regions = extract_regions(&feedback.annotations);
 
+    // Seed the backend budget so the planner sees a region-scaled
+    // floor from the start. The planner is free to raise these
+    // values; the validator clamps to max(plan_value, floor) at
+    // validation time, so a planner that "lazily" downgrades the
+    // budget still gets held to the floor.
+    let backend = crate::plan::BackendSection {
+        budget: crate::plan::budget_floor_for_regions(regions.len()),
+        ..Default::default()
+    };
+
     let plan = IterationPlan {
         schema_version: PLAN_SCHEMA_VERSION,
         app: AppIdentity {
@@ -94,7 +104,7 @@ pub fn seed_plan_from_feedback(
         user_text: feedback.feedback_text.clone(),
         voice_transcript: feedback.voice_transcript.clone(),
         templates: Default::default(),
-        backend: Default::default(),
+        backend,
         frontend: Default::default(),
         e2e: Default::default(),
         history: Vec::new(),

@@ -79,11 +79,59 @@ plan; your job is to make it real in the worktree at `{{WORKTREE}}`.
 
 ## Zero-tolerance stub smells
 
-The validator will grep your diff for `TODO`, `unimplemented!`, and
-`todo!()`. Any of those in new code fails the stage. If you cannot
-implement something inside this job's budget, shrink the plan (edit
-`{{PLAN_PATH}}` to remove the command), then implement the reduced set
-fully.
+The validator will grep your diff for **the full set of stub
+shapes** — not just the ones Claude knows to avoid by default. Each
+of these will fail the stage:
+
+- `TODO`, `unimplemented!`, `todo!()` (historic)
+- `Err("not impl…")`, `Err("nyi…")`, `Err("todo…")`, `Err("not yet…")`
+- `panic!("not impl…")`, `panic!("nyi…")`, `panic!("not yet…")`
+- A **trailing** empty default at the end of a function body:
+  `Ok(Vec::new())`, `Ok(vec![])`, `Ok(Default::default())`,
+  `Ok(HashMap::new())`, `Ok(BTreeMap::new())`, `Ok(HashSet::new())`
+  immediately followed by `}`. If you legitimately need to return
+  an empty container, route through `state.store().list_*()` — the
+  empty case is the store's job, not the command's.
+
+If you cannot implement something inside this job's budget, shrink
+the plan (edit `{{PLAN_PATH}}` to remove the command), then
+implement the reduced set fully.
+
+## Anchor contract — the plan tells you what each body must mention
+
+Every command in `plan.backend.commands` carries a `bodySketch` (and
+optionally explicit `anchors`). The validator extracts identifier-
+shaped tokens from these and asserts at least one appears in your
+implemented function body. Examples:
+
+- A command with `anchors: ["save_task", "current_time_unix_ms"]`
+  must mention at least one of those identifiers in the body. If your
+  body says `Ok(Task::default())` and never calls `save_task`, the
+  validator fails the stage.
+- A command with only a `bodySketch` (no explicit anchors) has its
+  anchors derived from the sketch — typically the store method names
+  and helper function names the planner referenced.
+
+This is the contract between plan and implementation. **Don't fake
+it**: if the plan's `bodySketch` says "call store.save_task", your
+body must actually call `save_task`. Naming the function correctly
+is no longer enough.
+
+## Persistence layer — every entity needs CRUD in store.rs
+
+For each entity in `plan.backend.entities`, the validator requires at
+least 3 of the 4 CRUD verbs to be implemented in the host crate
+(typically in `app/src-tauri/src/store.rs`, but any module is fine):
+
+- `fn save_<entity>` / `fn save_<entity_plural>`
+- `fn load_<entity>`
+- `fn list_<entity_plural>` (or `fn list_<entity>` as a tolerated alias)
+- `fn delete_<entity>`
+
+This is what prevents the "command returns fake data, never wrote
+to disk" failure mode. A command that just builds a default value
+and returns it passes neither the anchor check nor this CRUD
+check — surface area is properly bounded.
 
 `// FILL: …` markers from app-shape scaffolds count as stub smells once
 the scaffold has been copied in: every `FILL` you do not legitimately

@@ -87,31 +87,74 @@ Fill in these sections of `plan.json` (camelCase on wire):
   of JSON files.
 - `backend.entities` — at least `budget.minEntities` (default 1) domain
   entities, each with its fields and the region ids that motivated it.
-- `backend.commands` — at least `budget.minCommands` (default 4) Tauri
-  commands. Conventional CRUD is a good start: `create_*`, `list_*`,
-  `get_*`, `delete_*`. Every command: `name` in snake_case, `input`
-  (payload struct name or `()`), `output` (Rust type inside `Result<T,
-  String>`), `motivatedByRegions`, and a one-line `summary` of the
-  **behaviour** (not the implementation).
+- `backend.commands` — at least `budget.minCommands` Tauri commands.
+  The runtime computes a region-scaled floor at seed time
+  (`max(4, regions * 2)`) and writes it into the plan. **The floor is
+  not a target** — it's the minimum. A canvas with five distinct
+  regions is signalling at least five separate features; if you can
+  defend more commands by reading the canvas, ship more. Conventional
+  CRUD (`create_*`, `list_*`, `get_*`, `delete_*`) is a starting set;
+  add `update_*`, `search_*`, `filter_*`, domain-specific actions
+  (e.g. `mark_paid`, `archive_thread`, `summarise_week`) when the
+  drawing implies them. Every command needs:
+    - `name` — snake_case
+    - `input` — payload struct name or `()`
+    - `output` — Rust type inside `Result<T, String>`
+    - `motivatedByRegions` — region ids the command serves
+    - `summary` — one line of behaviour (not implementation)
+    - `bodySketch` — **3-6 lines of pseudocode** describing what the
+      body actually does. The implementer will be held to this — the
+      validator extracts identifiers from `bodySketch` (or from
+      explicit `anchors`) and confirms they appear in the implemented
+      function body. A vague sketch ("does the right thing") yields
+      no anchors and forfeits the protection.
+    - `anchors` — optional. 1-4 identifier-shaped substrings the
+      implementation body MUST contain (e.g.
+      `["save_task", "current_time_unix_ms"]`). Use this when you
+      want a strong contract beyond what `bodySketch` extraction
+      catches. Leave empty when the sketch already names the right
+      identifiers.
 - `backend.tests` — at least `budget.minTests` (default 3) host-side test
   functions by exact `fn <name>`. Aim for one happy-path CRUD test, one
   persistence roundtrip test, one edge case.
 - `backend.storage` — `kind` (`json_per_entity` unless you have a reason),
   `path` relative to `EVOLVO_WORKSPACE_ROOT`.
 
-## Budget enforcement
+## Floor vs ceiling — the budget is the floor, not the target
 
-The validator rejects the stage if any of `backend.entities`,
-`backend.commands`, `backend.tests` falls below its budget. Do not "save
-work for later" — later stages can ADD to these lists, but they cannot
-cover for a missing backend plan.
+The validator enforces a **region-scaled floor**: for a canvas with
+`N` regions, it requires `max(4, N * 2)` commands, `max(1, N / 2)`
+entities, and `max(3, N)` tests. Writing a smaller `budget.min*` in
+the plan won't help — the validator clamps to the floor regardless.
+
+**The floor is the lowest acceptable plan, not the right one.**
+A NewApp that needs a real backend usually exceeds the floor:
+
+- A todo app with one drawn input field (1 region, floor = 4 commands)
+  often still wants 5-7 commands once you include `update_task`,
+  `search_tasks`, `clear_completed`.
+- A budget tracker with 4-5 drawn elements (4 regions, floor = 8
+  commands) realistically wants 12-15: CRUD on transactions,
+  CRUD on categories, monthly summary, search, export.
+- An LLM chat surface implies sessions, messages, model selection —
+  even at 2 regions, floor 4 is a low ceiling; ship 8-10.
+
+Under-planning a complex canvas IS a failure mode. The implementer
+treats your plan as the spec. If you plan four CRUD commands and the
+canvas described a richer app, the user gets four CRUD commands.
+**Read the canvas like you're the user and ask "what would I click
+on this app?" Then translate every clickable element to a command.**
+
+Do not "save work for later" — later stages can ADD to these lists,
+but they cannot cover for a missing backend plan.
 
 ## Golden examples
 
-### Golden 1 — no app-shape (the default)
+### Golden 1 — thin canvas, CRUD floor
 
 A user drew a single red circle around what looks like a task-list input
-field and wrote "build a todo app". A good `backend` section:
+field and wrote "build a todo app". One region → floor of 4 commands.
+This is the **smallest** acceptable plan:
 
 ```json
 {
@@ -128,10 +171,42 @@ field and wrote "build a todo app". A good `backend` section:
     }
   ],
   "commands": [
-    {"name": "create_task",  "input": "CreateTaskPayload", "output": "Task",            "motivatedByRegions": ["R1"], "summary": "Persist a new task with a generated id and return it."},
-    {"name": "list_tasks",   "input": "()",                "output": "Vec<Task>",       "motivatedByRegions": ["R1"], "summary": "Return all tasks in creation order."},
-    {"name": "toggle_task",  "input": "EntityIdPayload",   "output": "Task",            "motivatedByRegions": ["R1"], "summary": "Flip the `done` flag on the task with the given id."},
-    {"name": "delete_task",  "input": "EntityIdPayload",   "output": "bool",            "motivatedByRegions": ["R1"], "summary": "Remove the task and return true if it existed."}
+    {
+      "name": "create_task",
+      "input": "CreateTaskPayload",
+      "output": "Task",
+      "motivatedByRegions": ["R1"],
+      "summary": "Persist a new task with a generated id and return it.",
+      "bodySketch": "1. Generate id via `format!(\"task-{}\", current_time_unix_ms()).\n2. Build Task with payload.title and done=false.\n3. Call state.store().save_task(&rec).\n4. Return rec.",
+      "anchors": ["save_task", "current_time_unix_ms"]
+    },
+    {
+      "name": "list_tasks",
+      "input": "()",
+      "output": "Vec<Task>",
+      "motivatedByRegions": ["R1"],
+      "summary": "Return all tasks in creation order.",
+      "bodySketch": "1. Call state.store().list_tasks().\n2. Return the vector.",
+      "anchors": ["list_tasks"]
+    },
+    {
+      "name": "toggle_task",
+      "input": "EntityIdPayload",
+      "output": "Task",
+      "motivatedByRegions": ["R1"],
+      "summary": "Flip the `done` flag on the task with the given id.",
+      "bodySketch": "1. Load Task by id via store.load_task.\n2. Flip done.\n3. Save updated rec.\n4. Return rec.",
+      "anchors": ["load_task", "save_task"]
+    },
+    {
+      "name": "delete_task",
+      "input": "EntityIdPayload",
+      "output": "bool",
+      "motivatedByRegions": ["R1"],
+      "summary": "Remove the task and return true if it existed.",
+      "bodySketch": "1. Call state.store().delete_task(id).\n2. Return the bool.",
+      "anchors": ["delete_task"]
+    }
   ],
   "tests": [
     {"name": "task_round_trips",           "module": "store::tests",    "covers": "save + load a Task preserves fields"},
@@ -144,7 +219,10 @@ field and wrote "build a todo app". A good `backend` section:
 ```
 
 Every command cites `R1` because the user's one drawing motivates the
-whole CRUD surface. If there were more regions you would distribute them.
+whole CRUD surface. Each `bodySketch` names the store method the
+implementer must invoke — the validator will reject a body that
+doesn't mention `save_task` / `load_task` / `delete_task` /
+`list_tasks` per command.
 
 ### Golden 2 — picking an app-shape
 
@@ -177,10 +255,42 @@ canvas is empty (no regions). A good `templates` + `backend` section:
       }
     ],
     "commands": [
-      {"name": "list_documents",   "input": "()",                  "output": "Vec<Document>", "motivatedByRegions": [], "summary": "Return all documents, newest first."},
-      {"name": "load_document",    "input": "EntityIdPayload",     "output": "Document",      "motivatedByRegions": [], "summary": "Fetch a single document by id."},
-      {"name": "save_document",    "input": "SaveDocumentPayload", "output": "Document",      "motivatedByRegions": [], "summary": "Create or update a document; returns the persisted record."},
-      {"name": "delete_document",  "input": "EntityIdPayload",     "output": "bool",          "motivatedByRegions": [], "summary": "Delete a document; true if it existed."}
+      {
+        "name": "list_documents",
+        "input": "()",
+        "output": "Vec<Document>",
+        "motivatedByRegions": [],
+        "summary": "Return all documents, newest first.",
+        "bodySketch": "1. Call store.list_documents() (sqlite seam).\n2. Return Vec<Document> sorted by updatedAt DESC.",
+        "anchors": ["list_documents"]
+      },
+      {
+        "name": "load_document",
+        "input": "EntityIdPayload",
+        "output": "Document",
+        "motivatedByRegions": [],
+        "summary": "Fetch a single document by id.",
+        "bodySketch": "1. Call store.load_document(id).\n2. Return the document or NotFound error.",
+        "anchors": ["load_document"]
+      },
+      {
+        "name": "save_document",
+        "input": "SaveDocumentPayload",
+        "output": "Document",
+        "motivatedByRegions": [],
+        "summary": "Create or update a document; returns the persisted record.",
+        "bodySketch": "1. If payload.id is None, generate one.\n2. Build Document with payload fields + updatedAt = now().\n3. Call store.save_document(&rec) (upsert).\n4. Return rec.",
+        "anchors": ["save_document"]
+      },
+      {
+        "name": "delete_document",
+        "input": "EntityIdPayload",
+        "output": "bool",
+        "motivatedByRegions": [],
+        "summary": "Delete a document; true if it existed.",
+        "bodySketch": "1. Call store.delete_document(id).\n2. Return the bool result.",
+        "anchors": ["delete_document"]
+      }
     ],
     "tests": [
       {"name": "json_document_store_round_trips", "module": "app_shapes::markdown_editor::tests", "covers": "save+load preserves Document fields"},
@@ -199,6 +309,201 @@ contribution — a `// FILL: domain-specific document fields` marker the
 implementer fills based on the user's "research notes" hint. Tests reuse
 the scaffold's existing test names so the validator's grep on
 `fn <name>` still passes after the copy.
+
+### Golden 3 — rich canvas, blowing past the floor
+
+A user drew **five distinct boxes** on the canvas: a transaction
+input, a category pill row, a "this month" summary card, a search
+bar, and a recurring-charges section. Voice transcript: *"I want a
+budget tracker that handles recurring expenses, lets me filter by
+category, and shows a monthly summary."*
+
+Five regions → floor of **10 commands**. The right plan blows past
+the floor because the canvas described five real surfaces, each with
+multiple actions:
+
+```json
+{
+  "app": {
+    "name": "Tally",
+    "oneLiner": "Personal budget tracker with categories and recurring charges",
+    "domain": "personal-finance"
+  },
+  "backend": {
+    "entities": [
+      {
+        "name": "Transaction",
+        "fields": [
+          {"name": "id",              "ty": "String", "required": true},
+          {"name": "amount_cents",    "ty": "i64",    "required": true},
+          {"name": "categoryId",      "ty": "String", "required": true},
+          {"name": "note",            "ty": "String", "required": false},
+          {"name": "occurredAtUnixMs","ty": "u64",    "required": true},
+          {"name": "createdAtUnixMs", "ty": "u64",    "required": true}
+        ],
+        "motivatedByRegions": ["R1", "R3", "R4"]
+      },
+      {
+        "name": "Category",
+        "fields": [
+          {"name": "id",    "ty": "String", "required": true},
+          {"name": "name",  "ty": "String", "required": true},
+          {"name": "color", "ty": "String", "required": false}
+        ],
+        "motivatedByRegions": ["R2", "R4"]
+      },
+      {
+        "name": "RecurringCharge",
+        "fields": [
+          {"name": "id",             "ty": "String", "required": true},
+          {"name": "amountCents",    "ty": "i64",    "required": true},
+          {"name": "categoryId",     "ty": "String", "required": true},
+          {"name": "cadenceDays",    "ty": "u32",    "required": true},
+          {"name": "nextDueUnixMs",  "ty": "u64",    "required": true},
+          {"name": "note",           "ty": "String", "required": false}
+        ],
+        "motivatedByRegions": ["R5"]
+      }
+    ],
+    "commands": [
+      {
+        "name": "create_transaction",
+        "input": "CreateTransactionPayload",
+        "output": "Transaction",
+        "motivatedByRegions": ["R1"],
+        "summary": "Persist a new transaction.",
+        "bodySketch": "1. Generate id `tx-<now>`.\n2. Validate categoryId resolves (store.load_category).\n3. Build Transaction with payload + occurredAtUnixMs (default now).\n4. Call store.save_transaction(&rec).\n5. Return rec.",
+        "anchors": ["save_transaction", "load_category"]
+      },
+      {
+        "name": "list_transactions",
+        "input": "ListTransactionsPayload",
+        "output": "Vec<Transaction>",
+        "motivatedByRegions": ["R3", "R4"],
+        "summary": "List transactions, optionally filtered by category id and date range.",
+        "bodySketch": "1. Call store.list_transactions().\n2. Filter by payload.categoryId when set.\n3. Filter by payload.sinceUnixMs / untilUnixMs when set.\n4. Return sorted by occurredAtUnixMs DESC.",
+        "anchors": ["list_transactions"]
+      },
+      {
+        "name": "delete_transaction",
+        "input": "EntityIdPayload",
+        "output": "bool",
+        "motivatedByRegions": ["R1"],
+        "summary": "Delete a transaction.",
+        "bodySketch": "1. Call store.delete_transaction(id).\n2. Return bool.",
+        "anchors": ["delete_transaction"]
+      },
+      {
+        "name": "create_category",
+        "input": "CreateCategoryPayload",
+        "output": "Category",
+        "motivatedByRegions": ["R2"],
+        "summary": "Add a new spending category.",
+        "bodySketch": "1. Generate id `cat-<now>`.\n2. Build Category from payload.\n3. store.save_category(&rec).\n4. Return rec.",
+        "anchors": ["save_category"]
+      },
+      {
+        "name": "list_categories",
+        "input": "()",
+        "output": "Vec<Category>",
+        "motivatedByRegions": ["R2"],
+        "summary": "List all categories.",
+        "bodySketch": "1. Call store.list_categories().\n2. Return sorted alphabetically.",
+        "anchors": ["list_categories"]
+      },
+      {
+        "name": "delete_category",
+        "input": "EntityIdPayload",
+        "output": "bool",
+        "motivatedByRegions": ["R2"],
+        "summary": "Delete a category (refuses when transactions reference it).",
+        "bodySketch": "1. store.list_transactions(), check none references this id.\n2. If any do, return Err.\n3. Otherwise store.delete_category(id) and return bool.",
+        "anchors": ["delete_category", "list_transactions"]
+      },
+      {
+        "name": "search_transactions",
+        "input": "SearchTransactionsPayload",
+        "output": "Vec<Transaction>",
+        "motivatedByRegions": ["R4"],
+        "summary": "Free-text + amount-range search.",
+        "bodySketch": "1. store.list_transactions().\n2. Lowercase payload.query; keep records where note contains it.\n3. Apply payload.minCents / maxCents bounds.\n4. Return sorted by occurredAtUnixMs DESC.",
+        "anchors": ["list_transactions"]
+      },
+      {
+        "name": "monthly_summary",
+        "input": "MonthlySummaryPayload",
+        "output": "MonthlySummary",
+        "motivatedByRegions": ["R3"],
+        "summary": "Aggregate spend per category for a given month.",
+        "bodySketch": "1. store.list_transactions() filtered by month window.\n2. Group by categoryId, sum amount_cents.\n3. Join with store.list_categories() for display names.\n4. Return MonthlySummary { totalCents, byCategory[] }.",
+        "anchors": ["list_transactions", "list_categories"]
+      },
+      {
+        "name": "create_recurring_charge",
+        "input": "CreateRecurringPayload",
+        "output": "RecurringCharge",
+        "motivatedByRegions": ["R5"],
+        "summary": "Schedule a recurring expense.",
+        "bodySketch": "1. Generate id `rec-<now>`.\n2. Compute nextDueUnixMs from payload.startAt + cadenceDays.\n3. store.save_recurring_charge(&rec).\n4. Return rec.",
+        "anchors": ["save_recurring_charge"]
+      },
+      {
+        "name": "list_recurring_charges",
+        "input": "()",
+        "output": "Vec<RecurringCharge>",
+        "motivatedByRegions": ["R5"],
+        "summary": "List active recurring charges.",
+        "bodySketch": "1. Call store.list_recurring_charges().\n2. Return sorted by nextDueUnixMs ASC.",
+        "anchors": ["list_recurring_charges"]
+      },
+      {
+        "name": "delete_recurring_charge",
+        "input": "EntityIdPayload",
+        "output": "bool",
+        "motivatedByRegions": ["R5"],
+        "summary": "Cancel a recurring charge.",
+        "bodySketch": "1. Call store.delete_recurring_charge(id).\n2. Return bool.",
+        "anchors": ["delete_recurring_charge"]
+      },
+      {
+        "name": "post_due_recurring_charges",
+        "input": "()",
+        "output": "Vec<Transaction>",
+        "motivatedByRegions": ["R5"],
+        "summary": "Convert every recurring charge whose nextDueUnixMs is in the past into a real Transaction; bump nextDueUnixMs forward.",
+        "bodySketch": "1. store.list_recurring_charges() filtered by nextDueUnixMs <= now.\n2. For each: create a Transaction via store.save_transaction.\n3. Advance nextDueUnixMs by cadenceDays via store.save_recurring_charge.\n4. Return the freshly-created transactions.",
+        "anchors": ["save_transaction", "list_recurring_charges", "save_recurring_charge"]
+      }
+    ],
+    "tests": [
+      {"name": "transaction_round_trips",          "module": "store::tests",    "covers": "save+load Transaction preserves fields"},
+      {"name": "category_round_trips",             "module": "store::tests",    "covers": "save+load Category preserves fields"},
+      {"name": "recurring_round_trips",            "module": "store::tests",    "covers": "save+load RecurringCharge preserves fields"},
+      {"name": "list_transactions_filters_by_cat", "module": "commands::tests", "covers": "list with categoryId returns only that category"},
+      {"name": "delete_category_refuses_in_use",   "module": "commands::tests", "covers": "edge: delete blocked when txs reference cat"},
+      {"name": "monthly_summary_groups_by_cat",    "module": "commands::tests", "covers": "summary aggregates correctly"},
+      {"name": "search_transactions_filters_by_note","module": "commands::tests","covers": "search returns only matching notes"},
+      {"name": "post_due_advances_next_due",       "module": "commands::tests", "covers": "posting moves nextDueUnixMs forward by cadenceDays"}
+    ],
+    "storage": {"kind": "json_per_entity", "path": "tally"},
+    "budget": {"minEntities": 3, "minCommands": 12, "minTests": 8}
+  }
+}
+```
+
+Twelve commands, three entities, eight tests — well above the
+5-region floor of `(2, 10, 5)`. Each command has a concrete
+`bodySketch` naming the store method to call, and `anchors` that
+force the validator to confirm the implementation uses it.
+
+Reading this plan back, you can answer "what would I click on this
+app?" for every box the user drew: create/delete in R1, create/list/
+delete categories in R2, see the summary in R3 (driven by
+`monthly_summary`), filter and search in R4, manage recurring in R5
+including the not-obvious `post_due_recurring_charges` job that
+materialises charges into transactions. **That's planning at the
+ceiling — every drawn element produces commands until the canvas is
+fully covered.**
 
 ## When finished
 

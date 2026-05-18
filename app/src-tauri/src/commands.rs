@@ -1009,6 +1009,9 @@ mod tests {
             output: "Budget".into(),
             motivated_by_regions: vec!["R1".into()],
             summary: "Create a budget".into(),
+            body_sketch: "Generate id, build Budget, persist via store.save_budget(rec)."
+                .into(),
+            anchors: vec!["save_budget".into()],
         });
         plan.frontend.components.push(ComponentPlan {
             name: "BudgetForm".into(),

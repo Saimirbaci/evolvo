@@ -273,6 +273,31 @@ pub struct CommandPlan {
     /// matches the region(s).
     #[serde(default)]
     pub summary: String,
+    /// Multi-line pseudocode sketch of what the command does. Written by
+    /// the planner so the implementer can't fake the body. The validator
+    /// enforces a minimum length and uses [`anchors`] for cheap
+    /// substring assertions against the implemented body.
+    ///
+    /// Example:
+    /// ```text
+    /// 1. Decode payload into CreateTaskPayload.
+    /// 2. Generate id = format!("task-{}", current_time_unix_ms()).
+    /// 3. Persist via state.store().save_task(&rec).
+    /// 4. Return the persisted Task.
+    /// ```
+    ///
+    /// Forward-compatible default: older plans without this field
+    /// deserialise as empty — validate_backend_plan flags that.
+    #[serde(default)]
+    pub body_sketch: String,
+    /// 1-4 identifier-shaped substrings the implemented body MUST
+    /// contain. Anchors are the concrete contract between the plan and
+    /// the implementation: typically the entity name, the store method
+    /// being called, or a domain function the body must invoke.
+    /// Example: `["save_task", "current_time_unix_ms"]`. Empty falls
+    /// back to body_sketch identifier extraction.
+    #[serde(default)]
+    pub anchors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -324,6 +349,27 @@ impl Default for BackendBudget {
             min_commands: 4,
             min_tests: 3,
         }
+    }
+}
+
+/// System floor for the backend budget, scaled by the canvas region
+/// count. The planner is free to **raise** these values in its own
+/// output; `validate_backend_plan` enforces the max of the plan's
+/// declared budget and this floor, so a "lazy" planner can't downgrade
+/// the targets below what the canvas demands.
+///
+/// Heuristic:
+/// - `min_commands = max(4, regions * 2)` — every region the user drew
+///   typically needs two commands (e.g. a create + a list per region).
+/// - `min_entities = max(1, regions / 2)` — multiple regions can share
+///   an entity, so we're conservative here.
+/// - `min_tests = max(3, regions)` — one test per region is the floor.
+pub fn budget_floor_for_regions(region_count: usize) -> BackendBudget {
+    let regions = region_count as u32;
+    BackendBudget {
+        min_entities: (regions / 2).max(1),
+        min_commands: (regions.saturating_mul(2)).max(4),
+        min_tests: regions.max(3),
     }
 }
 
@@ -791,6 +837,9 @@ mod tests {
             output: "Thing".into(),
             motivated_by_regions: vec!["R1".into()],
             summary: "Create a Thing".into(),
+            body_sketch: "1. Decode payload. 2. Generate id. 3. Save via store.save_thing. 4. Return."
+                .into(),
+            anchors: vec!["save_thing".into()],
         });
 
         save_plan(dir.path(), &plan).unwrap();

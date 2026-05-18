@@ -107,31 +107,49 @@ pub fn validate_backend_plan(plan: &IterationPlan) -> StageReport {
             .unwrap_or_else(|| "<missing>".to_string()),
     );
 
+    // Region-scaled floor — the planner can RAISE the budget in its
+    // own output but can't fall below this. Recomputed here so a
+    // planner that wrote `budget: { 1, 1, 1 }` still gets held to the
+    // floor derived from the canvas.
+    let floor = crate::plan::budget_floor_for_regions(plan.canvas.regions.len());
+    let entity_floor = plan.backend.budget.min_entities.max(floor.min_entities);
+    let command_floor = plan.backend.budget.min_commands.max(floor.min_commands);
+    let test_floor = plan.backend.budget.min_tests.max(floor.min_tests);
+
     let entity_count = plan.backend.entities.len() as u32;
     r.push(
         "entities meet budget",
-        entity_count >= plan.backend.budget.min_entities.max(1),
+        entity_count >= entity_floor,
         format!(
-            "have {} entities (min {})",
-            entity_count, plan.backend.budget.min_entities
+            "have {} entities (min {}; floor for {} regions = {})",
+            entity_count,
+            entity_floor,
+            plan.canvas.regions.len(),
+            floor.min_entities
         ),
     );
     let cmd_count = plan.backend.commands.len() as u32;
     r.push(
         "commands meet budget",
-        cmd_count >= plan.backend.budget.min_commands.max(1),
+        cmd_count >= command_floor,
         format!(
-            "have {} commands (min {})",
-            cmd_count, plan.backend.budget.min_commands
+            "have {} commands (min {}; floor for {} regions = {})",
+            cmd_count,
+            command_floor,
+            plan.canvas.regions.len(),
+            floor.min_commands
         ),
     );
     let test_count = plan.backend.tests.len() as u32;
     r.push(
         "tests meet budget",
-        test_count >= plan.backend.budget.min_tests.max(1),
+        test_count >= test_floor,
         format!(
-            "have {} tests (min {})",
-            test_count, plan.backend.budget.min_tests
+            "have {} tests (min {}; floor for {} regions = {})",
+            test_count,
+            test_floor,
+            plan.canvas.regions.len(),
+            floor.min_tests
         ),
     );
 
@@ -151,6 +169,31 @@ pub fn validate_backend_plan(plan: &IterationPlan) -> StageReport {
                 .map(|c| c.name.as_str())
                 .collect();
             format!("non-snake: {:?}", bad)
+        },
+    );
+
+    // Every command has a non-trivial body_sketch. The sketch forces
+    // the planner to think through behaviour up front; the implementer
+    // grepping against it (in validate_backend_impl) is what prevents
+    // the trivial-stub failure mode.
+    const MIN_SKETCH_BYTES: usize = 30;
+    let thin_sketches: Vec<&str> = plan
+        .backend
+        .commands
+        .iter()
+        .filter(|c| c.body_sketch.trim().len() < MIN_SKETCH_BYTES)
+        .map(|c| c.name.as_str())
+        .collect();
+    r.push(
+        &format!(
+            "every command has a body_sketch (>= {} chars)",
+            MIN_SKETCH_BYTES
+        ),
+        thin_sketches.is_empty(),
+        if thin_sketches.is_empty() {
+            "ok".to_string()
+        } else {
+            format!("thin or missing body_sketch: {:?}", thin_sketches)
         },
     );
 
@@ -275,6 +318,82 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
             ),
             has_registration,
             "search lib.rs + main.rs",
+        );
+
+        // Anchor check — the planned body_sketch / anchors say what the
+        // implementation should mention. We extract the function body
+        // and require at least one anchor (or sketched identifier) to
+        // appear in it. Catches the "compiles + named correctly but
+        // doesn't actually do the work" failure mode.
+        if has_def {
+            let anchors = effective_anchors(cmd);
+            if !anchors.is_empty() {
+                let body = extract_function_body(&commands_body, &cmd.name).unwrap_or_default();
+                let hit = anchors.iter().any(|a| body.contains(a.as_str()));
+                r.push(
+                    &format!(
+                        "backend command `{}` body references an anchor",
+                        cmd.name
+                    ),
+                    hit,
+                    if hit {
+                        "ok".to_string()
+                    } else {
+                        format!(
+                            "body does not mention any of {:?} — possible shallow stub",
+                            anchors
+                        )
+                    },
+                );
+            }
+        }
+    }
+
+    // Store integration: for every planned entity, the host crate
+    // must contain at least 3 of the 4 CRUD verbs scoped to the
+    // entity. The check is tolerant of pluralization (we look for
+    // `<verb>_<entity>` and `<verb>_<plural>`) and tolerant of where
+    // the functions live — they can be in `store.rs`, a new
+    // app-shape module, etc. The goal is just: persistence layer
+    // exists, the commands aren't returning fake in-memory data.
+    let host_src_files = collect_host_rs_files(worktree);
+    let host_src_body = host_src_files
+        .iter()
+        .map(|p| read(p))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for entity in &plan.backend.entities {
+        let names = expected_crud_fn_names(&entity.name);
+        let mut hits: Vec<&str> = Vec::new();
+        let mut misses: Vec<&str> = Vec::new();
+        for verb in ["save", "load", "list", "delete"] {
+            let candidates: Vec<&String> = names
+                .iter()
+                .filter(|n| n.starts_with(&format!("{verb}_")))
+                .collect();
+            let found = candidates
+                .iter()
+                .any(|n| host_src_body.contains(&format!("fn {}", n)));
+            if found {
+                hits.push(verb);
+            } else {
+                misses.push(verb);
+            }
+        }
+        r.push(
+            &format!(
+                "entity `{}` has CRUD persistence (>= 3 of save/load/list/delete)",
+                entity.name
+            ),
+            hits.len() >= 3,
+            if hits.len() >= 3 {
+                format!("present: {:?}", hits)
+            } else {
+                format!(
+                    "missing CRUD verb(s) for `{}`: {:?} (looked for {:?})",
+                    entity.name, misses, names
+                )
+            },
         );
     }
 
@@ -533,8 +652,260 @@ fn is_snake_case(s: &str) -> bool {
         && !s.ends_with('_')
 }
 
+/// Anchors to grep for inside a planned command's implementation body.
+/// Prefers the explicit `anchors` list when the planner provided one;
+/// otherwise falls back to identifier-shaped tokens extracted from the
+/// `body_sketch`. We filter common stopwords / Rust keywords so the
+/// extraction doesn't anchor on noise like "the", "and", "Self".
+fn effective_anchors(cmd: &crate::plan::CommandPlan) -> Vec<String> {
+    if !cmd.anchors.is_empty() {
+        return cmd
+            .anchors
+            .iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+    }
+    extract_identifier_anchors(&cmd.body_sketch)
+}
+
+const ANCHOR_STOPWORDS: &[&str] = &[
+    "and", "the", "for", "into", "from", "with", "return", "returns", "self", "Self", "store",
+    "result", "ok", "err", "true", "false", "let", "mut", "fn", "pub", "use", "ref", "match",
+    "if", "else", "loop", "while", "as", "in", "of", "to", "on", "this", "that", "then",
+    "build", "make", "call", "id", "rec", "row", "row_id", "value", "string", "vec", "option",
+];
+
+fn extract_identifier_anchors(sketch: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let flush = |buf: &mut String, out: &mut Vec<String>| {
+        if buf.is_empty() {
+            return;
+        }
+        let lower = buf.to_ascii_lowercase();
+        // Looks like a multi-word identifier — snake_case (has `_`) or
+        // PascalCase / camelCase (has an uppercase letter at position
+        // > 0). A single capitalised English word like "Generate" has
+        // only its first letter uppercase and gets rejected.
+        let looks_like_ident = buf.contains('_')
+            || buf
+                .chars()
+                .enumerate()
+                .any(|(i, c)| i > 0 && c.is_ascii_uppercase());
+        let ok = buf.len() >= 5
+            && !ANCHOR_STOPWORDS.contains(&lower.as_str())
+            && !ANCHOR_STOPWORDS.contains(&buf.as_str())
+            && looks_like_ident;
+        if ok && !out.iter().any(|existing| existing == buf) {
+            out.push(std::mem::take(buf));
+        } else {
+            buf.clear();
+        }
+    };
+    for ch in sketch.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else {
+            flush(&mut current, &mut out);
+        }
+    }
+    flush(&mut current, &mut out);
+    out
+}
+
+/// Walk `<worktree>/app/src-tauri/src/` and collect every `*.rs` file
+/// path. The CRUD integration check greps all of them so the agent
+/// can put persistence in any module (e.g. a new app-shape under
+/// `app_shapes/<name>.rs`) and still be credited.
+fn collect_host_rs_files(worktree: &Path) -> Vec<std::path::PathBuf> {
+    let root = worktree.join("app/src-tauri/src");
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = match entry.file_type() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Build the set of acceptable CRUD function names for an entity.
+/// Tolerant of pluralization (English-ish): `Task → save_task,
+/// load_task, list_tasks, delete_task` and `Story → list_stories`.
+/// Both the singular and plural forms are returned for `list_*` so a
+/// grep for either succeeds.
+fn expected_crud_fn_names(entity: &str) -> Vec<String> {
+    let snake = pascal_to_snake(entity);
+    let plural = pluralize_snake(&snake);
+    vec![
+        format!("save_{snake}"),
+        format!("load_{snake}"),
+        format!("list_{plural}"),
+        format!("list_{snake}"), // tolerant fallback
+        format!("delete_{snake}"),
+    ]
+}
+
+fn pascal_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Simple English-ish pluralisation: `_y` (consonant + y) → `_ies`;
+/// `_s|_x|_ch|_sh|_z` → `+es`; everything else → `+s`. Sufficient for
+/// the common entity-name cases (Task → tasks, Entry → entries,
+/// BudgetEntry → budget_entries, Box → boxes).
+fn pluralize_snake(s: &str) -> String {
+    if let Some(stem) = s.strip_suffix('y') {
+        let prev = stem.chars().last();
+        let is_vowel = matches!(prev, Some('a' | 'e' | 'i' | 'o' | 'u'));
+        if !is_vowel {
+            return format!("{stem}ies");
+        }
+    }
+    if s.ends_with('s')
+        || s.ends_with('x')
+        || s.ends_with('z')
+        || s.ends_with("ch")
+        || s.ends_with("sh")
+    {
+        return format!("{s}es");
+    }
+    format!("{s}s")
+}
+
+/// Locate the body of a function named `name` inside `source` and
+/// return its text (between the matching braces). Returns `None` when
+/// the function isn't found or the braces don't balance. Coarse — we
+/// don't tokenise Rust properly — but adequate for "does this body
+/// mention identifier X" checks.
+fn extract_function_body(source: &str, name: &str) -> Option<String> {
+    let needle = format!("fn {}", name);
+    let mut search_start = 0;
+    loop {
+        let idx = source[search_start..].find(&needle)?;
+        let abs_idx = search_start + idx;
+        // Avoid matching `fn create_taskish` when searching `create_task`.
+        let after = &source[abs_idx + needle.len()..];
+        let next_char = after.chars().next();
+        let is_ident_cont = matches!(next_char, Some(c) if c == '_' || c.is_ascii_alphanumeric());
+        if is_ident_cont {
+            search_start = abs_idx + needle.len();
+            continue;
+        }
+        let brace_idx = source[abs_idx..].find('{')?;
+        let body_start = abs_idx + brace_idx + 1;
+        let bytes = source.as_bytes();
+        let mut depth = 1i32;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(source[body_start..i].to_string());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return None;
+    }
+}
+
+/// Pattern-based stub detection. Catches the obvious "agent named a
+/// function but didn't implement it" shapes:
+///
+/// - `TODO`, `unimplemented!`, `todo!()` — historic patterns the
+///   agent has been instructed to avoid for years.
+/// - `Err("not impl…")`, `Err("nyi…")`, `Err("todo…")`, `Err("…not
+///   implemented…")` — common bail-out shapes that compile fine.
+/// - `panic!("…not implemented…")` / `panic!("…nyi…")` / `panic!("…not
+///   yet…")` — sometimes used in place of `unimplemented!`.
+/// - Trailing-expression returns of empty defaults at the end of a
+///   function body: `Ok(Vec::new())` followed by `}`, `Ok(vec![])` →
+///   `}`, `Ok(Default::default())` → `}`. These compile and pass
+///   `cargo test` but mean the implementation never touched the store.
+///
+/// The trailing-default check is intentionally narrow: it requires the
+/// pattern to be the final expression before a closing brace, with
+/// only whitespace / optional comments in between. A legitimate "empty
+/// list when directory is missing" case lives inside `store.rs`, not
+/// `commands.rs` — `commands.rs` should always route through `Store`.
 fn has_stub_smell(body: &str) -> bool {
-    body.contains("TODO") || body.contains("unimplemented!") || body.contains("todo!()")
+    if body.contains("TODO") || body.contains("unimplemented!") || body.contains("todo!()") {
+        return true;
+    }
+    // String-shaped bail-outs. Case-insensitive lookup on `not impl`
+    // would over-match (e.g. "not implication"). We pin the patterns
+    // to specific phrases known to appear in lazy stubs.
+    for phrase in &[
+        "Err(\"not impl",
+        "Err(\"not yet",
+        "Err(\"nyi",
+        "Err(\"NYI",
+        "Err(\"todo",
+        "Err(\"TODO",
+        "Err(\"not implemented",
+        "panic!(\"not impl",
+        "panic!(\"not yet",
+        "panic!(\"nyi",
+        "panic!(\"todo",
+    ] {
+        if body.contains(*phrase) {
+            return true;
+        }
+    }
+    // Trailing-default returns. Look for the pattern <default> } where
+    // <default> is one of the three known shapes and only whitespace
+    // (no semicolon, no other expression) sits between it and the `}`.
+    for default in &[
+        "Ok(Vec::new())",
+        "Ok(vec![])",
+        "Ok(Default::default())",
+        "Ok(HashMap::new())",
+        "Ok(BTreeMap::new())",
+        "Ok(HashSet::new())",
+    ] {
+        let mut start = 0;
+        while let Some(rel) = body[start..].find(default) {
+            let pos = start + rel + default.len();
+            // Walk forward past whitespace; if we hit `}` before any
+            // other non-whitespace character, this is a trailing return.
+            let rest = body[pos..].as_bytes();
+            let mut i = 0;
+            while i < rest.len() && (rest[i] == b' ' || rest[i] == b'\n' || rest[i] == b'\t') {
+                i += 1;
+            }
+            if i < rest.len() && rest[i] == b'}' {
+                return true;
+            }
+            start = pos;
+        }
+    }
+    false
 }
 
 fn read(p: &Path) -> String {
@@ -621,6 +992,10 @@ mod tests {
                         output: "Project".into(),
                         motivated_by_regions: vec!["R1".into()],
                         summary: "".into(),
+                        body_sketch:
+                            "Generate id, build Project, save via store.save_project(rec)."
+                                .into(),
+                        anchors: vec!["save_project".into()],
                     },
                     CommandPlan {
                         name: "list_projects".into(),
@@ -628,6 +1003,8 @@ mod tests {
                         output: "Vec<Project>".into(),
                         motivated_by_regions: vec!["R1".into()],
                         summary: "".into(),
+                        body_sketch: "Call store.list_projects() and return.".into(),
+                        anchors: vec!["list_projects".into()],
                     },
                     CommandPlan {
                         name: "get_project".into(),
@@ -635,6 +1012,8 @@ mod tests {
                         output: "Option<Project>".into(),
                         motivated_by_regions: vec!["R1".into()],
                         summary: "".into(),
+                        body_sketch: "Resolve id, return store.load_project(id).".into(),
+                        anchors: vec!["load_project".into()],
                     },
                     CommandPlan {
                         name: "delete_project".into(),
@@ -642,6 +1021,9 @@ mod tests {
                         output: "bool".into(),
                         motivated_by_regions: vec!["R1".into()],
                         summary: "".into(),
+                        body_sketch: "Resolve id, call store.delete_project(id), return bool."
+                            .into(),
+                        anchors: vec!["delete_project".into()],
                     },
                 ],
                 tests: vec![
@@ -752,6 +1134,241 @@ mod tests {
         assert!(has_stub_smell("// TODO: hook this up"));
         assert!(has_stub_smell("unimplemented!();"));
         assert!(!has_stub_smell("let x = 1;"));
+    }
+
+    #[test]
+    fn stub_smell_catches_err_bailouts() {
+        assert!(has_stub_smell(r#"return Err("not impl".into());"#));
+        assert!(has_stub_smell(r#"Err("nyi".into())"#));
+        assert!(has_stub_smell(r#"Err("not implemented yet".into())"#));
+        assert!(has_stub_smell(r#"panic!("not impl");"#));
+        assert!(has_stub_smell(r#"panic!("nyi");"#));
+        // Not a bail-out — legitimate error string.
+        assert!(!has_stub_smell(r#"Err(format!("could not parse: {e}"))"#));
+    }
+
+    #[test]
+    fn stub_smell_catches_trailing_empty_defaults() {
+        // Trailing return of an empty container — most common shallow
+        // pattern.
+        let body = "fn list_tasks() -> Result<Vec<Task>, String> {\n    Ok(Vec::new())\n}";
+        assert!(has_stub_smell(body));
+        let body = "fn list_x() -> Result<Vec<u32>, String> {\n    Ok(vec![])\n}";
+        assert!(has_stub_smell(body));
+        let body = "fn get_thing() -> Result<Thing, String> {\n    Ok(Default::default())\n}";
+        assert!(has_stub_smell(body));
+    }
+
+    #[test]
+    fn stub_smell_allows_legitimate_intermediate_empties() {
+        // An empty vec used as an intermediate value (not a trailing
+        // return) is fine — common in real code.
+        let body = r#"
+            let mut acc: Vec<Task> = Ok(Vec::new())?;
+            acc.push(t);
+            Ok(acc)
+        "#;
+        assert!(!has_stub_smell(body));
+    }
+
+    #[test]
+    fn extract_function_body_grabs_balanced_braces() {
+        let src = r#"
+            pub fn create_task(state: State<'_>) -> Result<Task, String> {
+                let id = format!("task-{}", now());
+                let rec = Task { id: id.clone() };
+                state.store().save_task(&rec)?;
+                Ok(rec)
+            }
+
+            pub fn unrelated() -> i32 { 7 }
+        "#;
+        let body = extract_function_body(src, "create_task").unwrap();
+        assert!(body.contains("save_task"));
+        assert!(body.contains("format!"));
+        assert!(!body.contains("unrelated"));
+    }
+
+    #[test]
+    fn extract_function_body_skips_partial_name_matches() {
+        let src = r#"
+            fn create_taskish() -> i32 { 1 }
+            fn create_task() -> i32 { 42 }
+        "#;
+        let body = extract_function_body(src, "create_task").unwrap();
+        assert!(body.contains("42"));
+        assert!(!body.contains("1"));
+    }
+
+    #[test]
+    fn extract_identifier_anchors_picks_likely_idents() {
+        let sketch = "Generate id with current_time_unix_ms, then call store.save_task and return.";
+        let anchors = extract_identifier_anchors(sketch);
+        assert!(anchors.contains(&"current_time_unix_ms".to_string()));
+        assert!(anchors.contains(&"save_task".to_string()));
+        // Common stopwords (`and`, `the`, `then`, `Generate`) shouldn't anchor.
+        assert!(!anchors.iter().any(|a| a == "Generate"));
+        assert!(!anchors.iter().any(|a| a == "and"));
+    }
+
+    #[test]
+    fn pluralize_snake_handles_y_and_s_endings() {
+        assert_eq!(pluralize_snake("task"), "tasks");
+        assert_eq!(pluralize_snake("entry"), "entries");
+        assert_eq!(pluralize_snake("budget_entry"), "budget_entries");
+        assert_eq!(pluralize_snake("box"), "boxes");
+        assert_eq!(pluralize_snake("status"), "statuses");
+        assert_eq!(pluralize_snake("day"), "days"); // vowel before y → keep y
+    }
+
+    #[test]
+    fn expected_crud_fn_names_for_camel_cased_entity() {
+        let names = expected_crud_fn_names("BudgetEntry");
+        assert!(names.iter().any(|n| n == "save_budget_entry"));
+        assert!(names.iter().any(|n| n == "list_budget_entries"));
+        assert!(names.iter().any(|n| n == "delete_budget_entry"));
+    }
+
+    #[test]
+    fn budget_floor_scales_with_region_count() {
+        let f0 = crate::plan::budget_floor_for_regions(0);
+        assert_eq!(f0.min_commands, 4);
+        assert_eq!(f0.min_entities, 1);
+        assert_eq!(f0.min_tests, 3);
+
+        let f5 = crate::plan::budget_floor_for_regions(5);
+        assert_eq!(f5.min_commands, 10); // 5 * 2
+        assert_eq!(f5.min_entities, 2);  // 5 / 2
+        assert_eq!(f5.min_tests, 5);
+    }
+
+    #[test]
+    fn validate_backend_plan_enforces_region_floor_even_when_budget_low() {
+        use crate::plan::{
+            AppIdentity, BackendBudget, BackendSection, CanvasReference, CanvasRegion,
+            CommandPlan, EntityPlan, FieldPlan, IterationPlan, PlanStage, TestPlan,
+            PLAN_SCHEMA_VERSION,
+        };
+        let mut plan = IterationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            app: AppIdentity {
+                name: "Demo".into(),
+                ..Default::default()
+            },
+            stage: PlanStage::Seeded,
+            canvas: CanvasReference {
+                regions: (0..5)
+                    .map(|i| CanvasRegion {
+                        id: format!("R{}", i + 1),
+                        bbox: [0.0; 4],
+                        stroke_count: 0,
+                        dominant_color: None,
+                        labels: Vec::new(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            backend: BackendSection {
+                budget: BackendBudget {
+                    min_entities: 1,
+                    min_commands: 1, // planner tried to lower the bar
+                    min_tests: 1,
+                },
+                entities: vec![EntityPlan {
+                    name: "Task".into(),
+                    fields: vec![FieldPlan {
+                        name: "id".into(),
+                        ty: "String".into(),
+                        required: true,
+                    }],
+                    motivated_by_regions: vec!["R1".into(), "R2".into(), "R3".into(), "R4".into(), "R5".into()],
+                }],
+                commands: vec![CommandPlan {
+                    name: "list_tasks".into(),
+                    input: "()".into(),
+                    output: "Vec<Task>".into(),
+                    motivated_by_regions: vec!["R1".into(), "R2".into(), "R3".into(), "R4".into(), "R5".into()],
+                    summary: "".into(),
+                    body_sketch: "Call store.list_tasks() and return the vector.".into(),
+                    anchors: vec!["list_tasks".into()],
+                }],
+                tests: vec![TestPlan {
+                    name: "t".into(),
+                    module: "".into(),
+                    covers: "".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = validate_backend_plan(&plan);
+        // The plan declared min_commands=1 but the canvas has 5
+        // regions so the floor is 10. Should fail "commands meet
+        // budget".
+        let cmd_check = r
+            .checks
+            .iter()
+            .find(|c| c.name == "commands meet budget")
+            .unwrap();
+        assert!(!cmd_check.passed, "should fail when below region floor");
+        assert!(cmd_check.detail.contains("floor for 5 regions = 10"));
+
+        // Now bump commands to 10 — should pass.
+        for i in 0..9 {
+            plan.backend.commands.push(CommandPlan {
+                name: format!("filler_cmd_{i}"),
+                input: "()".into(),
+                output: "()".into(),
+                motivated_by_regions: vec!["R1".into()],
+                summary: "".into(),
+                body_sketch: "Filler command for the test; calls store.list_tasks.".into(),
+                anchors: vec!["list_tasks".into()],
+            });
+        }
+        let r = validate_backend_plan(&plan);
+        let cmd_check = r
+            .checks
+            .iter()
+            .find(|c| c.name == "commands meet budget")
+            .unwrap();
+        assert!(cmd_check.passed, "10 commands meets the 5-region floor");
+    }
+
+    #[test]
+    fn validate_backend_plan_requires_body_sketch() {
+        use crate::plan::{
+            AppIdentity, BackendSection, CommandPlan, IterationPlan, PlanStage,
+            PLAN_SCHEMA_VERSION,
+        };
+        let plan = IterationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            app: AppIdentity {
+                name: "Demo".into(),
+                ..Default::default()
+            },
+            stage: PlanStage::Seeded,
+            backend: BackendSection {
+                commands: vec![CommandPlan {
+                    name: "create_task".into(),
+                    input: "()".into(),
+                    output: "Task".into(),
+                    motivated_by_regions: vec![],
+                    summary: "creates".into(),
+                    body_sketch: "too short".into(), // < 30 chars
+                    anchors: vec![],
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = validate_backend_plan(&plan);
+        let sketch_check = r
+            .checks
+            .iter()
+            .find(|c| c.name.contains("body_sketch"))
+            .unwrap();
+        assert!(!sketch_check.passed);
+        assert!(sketch_check.detail.contains("create_task"));
     }
 
     #[test]
