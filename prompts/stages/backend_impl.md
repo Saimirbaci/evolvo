@@ -112,10 +112,40 @@ implemented function body. Examples:
   anchors derived from the sketch — typically the store method names
   and helper function names the planner referenced.
 
-This is the contract between plan and implementation. **Don't fake
-it**: if the plan's `bodySketch` says "call store.save_task", your
-body must actually call `save_task`. Naming the function correctly
-is no longer enough.
+### The thin-wrapper pattern is recognised
+
+This file already tells you to ship every command as a thin
+`#[tauri::command] fn <name>` wrapping a plain `fn <name>_impl(&Store,
+…)` so tests can hit the logic without the macro. The anchor check
+**looks at both bodies** — `<name>` and `<name>_impl` — and accepts a
+match in either. The canonical shape is:
+
+```rust
+pub fn create_task_impl(
+    store: &crate::store::Store,
+    payload: CreateTaskPayload,
+) -> Result<Task, String> {
+    let now = current_time_unix_ms();       // ← anchor lives here
+    let rec = Task { id: format!("task-{now}"), title: payload.title, done: false };
+    store.save_task(&rec).map_err(store_error)?;   // ← anchor lives here
+    Ok(rec)
+}
+
+#[tauri::command]
+pub fn create_task(
+    state: State<'_, AppState>,
+    payload: CreateTaskPayload,
+) -> Result<Task, String> {
+    create_task_impl(&state.store(), payload)
+}
+```
+
+The wrapper body is empty of anchors — that's fine, the validator
+reads `create_task_impl` too. **Don't fake the anchors by stuffing
+them as comments into the wrapper just to satisfy the check.** If the
+plan's `bodySketch` says "call store.save_task", the `_impl` body
+must actually call `save_task`. Naming the function correctly is no
+longer enough.
 
 ## Persistence layer — every entity needs CRUD in store.rs
 

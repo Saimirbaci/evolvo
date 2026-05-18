@@ -325,11 +325,23 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
         // and require at least one anchor (or sketched identifier) to
         // appear in it. Catches the "compiles + named correctly but
         // doesn't actually do the work" failure mode.
+        //
+        // backend_impl.md prescribes a thin-wrapper pattern: the
+        // `#[tauri::command]` `fn <name>(...)` delegates straight to a
+        // plain `fn <name>_impl(&Store, ...)` so tests can call the
+        // logic without the macro. The real work — and the anchored
+        // identifiers — live in `_impl`. We therefore concatenate both
+        // bodies and let either satisfy the anchor.
         if has_def {
             let anchors = effective_anchors(cmd);
             if !anchors.is_empty() {
-                let body = extract_function_body(&commands_body, &cmd.name).unwrap_or_default();
-                let hit = anchors.iter().any(|a| body.contains(a.as_str()));
+                let wrapper_body =
+                    extract_function_body(&commands_body, &cmd.name).unwrap_or_default();
+                let impl_name = format!("{}_impl", cmd.name);
+                let impl_body =
+                    extract_function_body(&commands_body, &impl_name).unwrap_or_default();
+                let combined = format!("{wrapper_body}\n{impl_body}");
+                let hit = anchors.iter().any(|a| combined.contains(a.as_str()));
                 r.push(
                     &format!(
                         "backend command `{}` body references an anchor",
@@ -340,8 +352,8 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
                         "ok".to_string()
                     } else {
                         format!(
-                            "body does not mention any of {:?} — possible shallow stub",
-                            anchors
+                            "neither `{}` nor `{}_impl` body mentions any of {:?} — possible shallow stub",
+                            cmd.name, cmd.name, anchors
                         )
                     },
                 );
@@ -1209,6 +1221,121 @@ mod tests {
         // Common stopwords (`and`, `the`, `then`, `Generate`) shouldn't anchor.
         assert!(!anchors.iter().any(|a| a == "Generate"));
         assert!(!anchors.iter().any(|a| a == "and"));
+    }
+
+    #[test]
+    fn validate_backend_impl_credits_anchors_found_in_impl_function() {
+        // Regression: the thin-wrapper pattern that backend_impl.md
+        // prescribes — `fn <name>(...)` delegates to `fn <name>_impl(...)`
+        // where the real work lives. The wrapper body contains zero
+        // anchors; the validator must also look at `_impl` and accept
+        // a match there.
+        use crate::plan::{
+            AppIdentity, BackendSection, CommandPlan, EntityPlan, FieldPlan, IterationPlan,
+            PlanStage, PLAN_SCHEMA_VERSION,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        let src_dir = worktree.join("app/src-tauri/src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // commands.rs: thin wrapper + _impl, exactly as the prompt
+        // tells the agent to ship.
+        std::fs::write(
+            src_dir.join("commands.rs"),
+            r#"
+                pub fn create_expense_impl(
+                    store: &crate::store::Store,
+                    payload: CreateExpensePayload,
+                ) -> Result<Expense, String> {
+                    let now = current_time_unix_ms();
+                    let rec = Expense { id: format!("exp-{now}") };
+                    store.save_expense(&rec).map_err(store_error)?;
+                    Ok(rec)
+                }
+
+                #[tauri::command]
+                pub fn create_expense(
+                    state: State<'_, AppState>,
+                    payload: CreateExpensePayload,
+                ) -> Result<Expense, String> {
+                    create_expense_impl(&state.store(), payload)
+                }
+            "#,
+        )
+        .unwrap();
+        // Need a lib.rs / main.rs so the registration check finds a
+        // `commands::create_expense` reference.
+        std::fs::write(
+            src_dir.join("lib.rs"),
+            "invoke_handler![commands::create_expense];",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("main.rs"), "// no-op").unwrap();
+        // Store-side CRUD: satisfy the CRUD-presence check too.
+        std::fs::write(
+            src_dir.join("store.rs"),
+            r#"
+                pub fn save_expense() {}
+                pub fn load_expense() {}
+                pub fn list_expenses() {}
+                pub fn delete_expense() {}
+            "#,
+        )
+        .unwrap();
+
+        let plan = IterationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            app: AppIdentity {
+                name: "Ledger".into(),
+                ..Default::default()
+            },
+            stage: PlanStage::Seeded,
+            backend: BackendSection {
+                entities: vec![EntityPlan {
+                    name: "Expense".into(),
+                    fields: vec![FieldPlan {
+                        name: "id".into(),
+                        ty: "String".into(),
+                        required: true,
+                    }],
+                    motivated_by_regions: vec![],
+                }],
+                commands: vec![CommandPlan {
+                    name: "create_expense".into(),
+                    input: "CreateExpensePayload".into(),
+                    output: "Expense".into(),
+                    motivated_by_regions: vec![],
+                    summary: "Persist an expense.".into(),
+                    body_sketch: "Generate id, build Expense, persist via store.save_expense, return rec."
+                        .into(),
+                    anchors: vec!["save_expense".into(), "current_time_unix_ms".into()],
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // We can't run the full validate_backend_impl here because it
+        // shells out to `cargo` and that path is the host repo, not
+        // the tempdir. Hit the anchor logic directly via the same
+        // primitives.
+        let commands_body = std::fs::read_to_string(src_dir.join("commands.rs")).unwrap();
+        let anchors = effective_anchors(&plan.backend.commands[0]);
+        assert!(anchors.contains(&"save_expense".to_string()));
+        let wrapper_body =
+            extract_function_body(&commands_body, "create_expense").unwrap_or_default();
+        let impl_body =
+            extract_function_body(&commands_body, "create_expense_impl").unwrap_or_default();
+        let combined = format!("{wrapper_body}\n{impl_body}");
+        let hit = anchors.iter().any(|a| combined.contains(a.as_str()));
+        assert!(
+            hit,
+            "expected an anchor to be found in wrapper+_impl bodies; wrapper={:?} impl={:?}",
+            wrapper_body, impl_body
+        );
+        // Sanity: anchors are NOT in the wrapper alone — that's the
+        // condition that produced the original false positive.
+        let wrapper_only_hit = anchors.iter().any(|a| wrapper_body.contains(a.as_str()));
+        assert!(!wrapper_only_hit, "regression: wrapper alone now contains an anchor — test premise broken");
     }
 
     #[test]
