@@ -85,7 +85,11 @@ pub fn seed_plan_from_feedback(
 
     let canvas_png = stage_canvas_png(store, feedback, &inputs_dir)?;
     let annotations_path = stage_annotations(feedback, &inputs_dir)?;
-    let regions = extract_regions(&feedback.annotations);
+    let regions = extract_regions(
+        &feedback.annotations,
+        feedback.window_width,
+        feedback.window_height,
+    );
 
     // Seed the backend budget so the planner sees a region-scaled
     // floor from the start. The planner is free to raise these
@@ -296,6 +300,11 @@ pub fn run_stage<D: StageDispatcher>(
     let mut previous_failure: Option<String> = None;
 
     for attempt in 1..=MAX_STAGE_ATTEMPTS {
+        // The agent's own STAGE_RESULT declaration for this attempt (only
+        // available when a dispatch actually ran). Advisory — the validator
+        // below stays authoritative — but it travels into notes and the
+        // Reflexion feedback for legibility.
+        let mut declared: Option<crate::runner::StageResultDecl> = None;
         if attempt == 1 && resume_skip {
             let _ = engine.append_note(
                 job_id,
@@ -360,6 +369,18 @@ pub fn run_stage<D: StageDispatcher>(
                     s.log_path = Some(log_path.display().to_string());
                 })
                 .map_err(|e| format!("mark validating: {e}"))?;
+
+            declared = crate::runner::read_stage_result(&log_path);
+            if let Some(decl) = declared.as_ref().filter(|d| !d.ok) {
+                let _ = engine.append_note(
+                    job_id,
+                    &format!(
+                        "{}: agent exited 0 but declared STAGE_RESULT: fail: {}",
+                        stage.slug(),
+                        decl.reason.as_deref().unwrap_or("<no reason given>")
+                    ),
+                );
+            }
         }
 
         // A plan that no longer loads is a *failed attempt*, not a hard
@@ -393,7 +414,14 @@ pub fn run_stage<D: StageDispatcher>(
             return Ok(true);
         }
 
-        previous_failure = Some(report.failure_block());
+        let mut feedback = report.failure_block();
+        if let Some(decl) = declared.as_ref().filter(|d| !d.ok) {
+            feedback = format!(
+                "agent self-declared failure: {}\n{feedback}",
+                decl.reason.as_deref().unwrap_or("<no reason given>")
+            );
+        }
+        previous_failure = Some(feedback);
         if attempt < MAX_STAGE_ATTEMPTS {
             let _ = engine.append_note(
                 job_id,
@@ -880,6 +908,61 @@ mod tests {
         assert!(
             second.contains("failed to parse"),
             "parse error is fed back to the retry: {second}"
+        );
+    }
+
+    #[test]
+    fn run_stage_feeds_agent_declared_failure_into_retry_prompt() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+
+        // Exits 0 but writes a STAGE_RESULT: fail declaration into its log
+        // and never completes the plan — the declared reason must reach the
+        // next attempt's previous_failure.
+        struct DeclaresFailure {
+            job_dir: PathBuf,
+            calls: std::cell::RefCell<Vec<Option<String>>>,
+        }
+        impl StageDispatcher for DeclaresFailure {
+            fn dispatch(&self, ctx: StageDispatch<'_>) -> Result<PathBuf, String> {
+                self.calls.borrow_mut().push(ctx.previous_failure.clone());
+                let log = self.job_dir.join("logs").join("backend_plan.log");
+                std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+                std::fs::write(&log, "...\nSTAGE_RESULT: fail: canvas png unreadable\n").unwrap();
+                Ok(log)
+            }
+        }
+        let dispatcher = DeclaresFailure {
+            job_dir: job_dir.clone(),
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let passed = run_stage(
+            &store,
+            &engine,
+            &dispatcher,
+            StageKind::BackendPlan,
+            &worktree,
+            &job_dir,
+            &job_id,
+        )
+        .unwrap();
+        assert!(!passed);
+        let calls = dispatcher.calls.borrow();
+        let second = calls[1].as_deref().unwrap();
+        assert!(
+            second.contains("agent self-declared failure: canvas png unreadable"),
+            "declared reason missing from retry feedback: {second}"
+        );
+        let job = store.load_lineage_job(&job_id).unwrap().unwrap();
+        assert!(
+            job.notes
+                .iter()
+                .any(|n| n.contains("declared STAGE_RESULT: fail: canvas png unreadable")),
+            "declared failure should be recorded as a lineage note"
         );
     }
 

@@ -1339,6 +1339,75 @@ pub fn build_stage_prompt(
     prompt
 }
 
+/// The agent's own verdict on its session, extracted from the transcript.
+/// Every prompt's operating contract requires the session to end with
+/// `STAGE_RESULT: ok` or `STAGE_RESULT: fail: <reason>`. The verdict is
+/// **advisory** — the deterministic validator stays authoritative for
+/// pass/fail — but it carries the agent's one-line failure reason (far
+/// better failure legibility than "exited 1"), and it exposes the nasty
+/// case where the CLI exits 0 while the agent declared failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageResultDecl {
+    pub ok: bool,
+    pub reason: Option<String>,
+}
+
+/// Scan transcript text for the **last** `STAGE_RESULT:` declaration.
+/// Works on raw log bytes regardless of agent: in JSONL transcripts
+/// (claude/codex) the sentinel sits inside a JSON string, so the reason is
+/// terminated at the first `"` / `\` escape as well as at end-of-line.
+/// Placeholder echoes of the contract text (`fail: <one short reason…`,
+/// anything containing `{{`) are ignored.
+pub fn parse_stage_result(log_text: &str) -> Option<StageResultDecl> {
+    const TOKEN: &str = "STAGE_RESULT:";
+    const MAX_REASON_CHARS: usize = 160;
+    let mut found: Option<StageResultDecl> = None;
+    let mut search_from = 0;
+    while let Some(rel) = log_text[search_from..].find(TOKEN) {
+        let start = search_from + rel + TOKEN.len();
+        search_from = start;
+        let rest = log_text[start..].trim_start_matches([' ', '\t']);
+        if let Some(after) = rest.strip_prefix("ok") {
+            // Require a non-alphanumeric boundary so "okay…" doesn't match.
+            if !after.chars().next().is_some_and(|c| c.is_alphanumeric()) {
+                found = Some(StageResultDecl {
+                    ok: true,
+                    reason: None,
+                });
+            }
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("fail") {
+            let after = after.trim_start_matches([':', ' ', '\t']);
+            let reason: String = after
+                .chars()
+                .take_while(|c| !matches!(c, '\n' | '\r' | '"' | '\\' | '`'))
+                .take(MAX_REASON_CHARS)
+                .collect();
+            let reason = reason.trim().to_string();
+            if reason.starts_with('<') || reason.contains("{{") {
+                continue; // prompt template echoed into the transcript
+            }
+            found = Some(StageResultDecl {
+                ok: false,
+                reason: (!reason.is_empty()).then_some(reason),
+            });
+        }
+    }
+    found
+}
+
+/// Read the tail of a transcript file and parse the agent's declared
+/// stage result. Bounded read so multi-MB transcripts stay cheap — the
+/// sentinel is contractually the last thing the agent emits.
+pub fn read_stage_result(log_path: &Path) -> Option<StageResultDecl> {
+    const TAIL_BYTES: usize = 256 * 1024;
+    let bytes = fs::read(log_path).ok()?;
+    let start = bytes.len().saturating_sub(TAIL_BYTES);
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    parse_stage_result(&text)
+}
+
 /// Concrete `StageDispatcher` that spawns the selected agent CLI per
 /// stage and streams its output to `<job_dir>/logs/<slug>.log`. Blocks the
 /// calling thread until the agent exits.
@@ -1445,8 +1514,15 @@ impl crate::stages::StageDispatcher for AgentStageDispatcher {
             .map_err(|e| format!("spawn {} for {}: {e}", backend.binary(), ctx.stage.slug()))?;
 
         if !status.success() {
+            // Surface the agent's own one-line reason when it declared one
+            // — "exited 1" tells the reviewer nothing.
+            let declared = read_stage_result(&log_path)
+                .filter(|d| !d.ok)
+                .and_then(|d| d.reason)
+                .map(|r| format!(" (agent declared: {r})"))
+                .unwrap_or_default();
             return Err(format!(
-                "{} exited {status} for stage {} — see {}",
+                "{} exited {status} for stage {}{declared} — see {}",
                 self.agent.label(),
                 ctx.stage.slug(),
                 log_path.display()
@@ -2128,6 +2204,55 @@ mod tests {
                 "{kind:?} left {{{{PORT}}}} unsubstituted"
             );
         }
+    }
+
+    #[test]
+    fn parse_stage_result_reads_ok_and_fail_with_reason() {
+        assert_eq!(
+            parse_stage_result("blah\nSTAGE_RESULT: ok\n"),
+            Some(StageResultDecl {
+                ok: true,
+                reason: None
+            })
+        );
+        let fail = parse_stage_result("STAGE_RESULT: fail: canvas png unreadable\n").unwrap();
+        assert!(!fail.ok);
+        assert_eq!(fail.reason.as_deref(), Some("canvas png unreadable"));
+        assert_eq!(parse_stage_result("no sentinel here"), None);
+    }
+
+    #[test]
+    fn parse_stage_result_takes_last_declaration() {
+        let log = "STAGE_RESULT: fail: first try\n...fixed it...\nSTAGE_RESULT: ok\n";
+        assert!(parse_stage_result(log).unwrap().ok);
+        let log = "STAGE_RESULT: ok\n...wait no...\nSTAGE_RESULT: fail: regression\n";
+        let d = parse_stage_result(log).unwrap();
+        assert!(!d.ok);
+        assert_eq!(d.reason.as_deref(), Some("regression"));
+    }
+
+    #[test]
+    fn parse_stage_result_handles_jsonl_embedding() {
+        // claude.log is JSONL — the sentinel sits inside a JSON string and
+        // the reason must stop at the closing quote / escape.
+        let log = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done.\nSTAGE_RESULT: fail: missing dep trunk"}]}}"#;
+        let d = parse_stage_result(log).unwrap();
+        assert!(!d.ok);
+        assert_eq!(d.reason.as_deref(), Some("missing dep trunk"));
+    }
+
+    #[test]
+    fn parse_stage_result_ignores_prompt_template_echoes() {
+        // If the transcript echoes the contract text, the placeholder
+        // examples must not register as a verdict.
+        let log = "STAGE_RESULT: fail: <one short reason, ASCII, ≤120 chars>\n";
+        assert_eq!(parse_stage_result(log), None);
+        // ...but a real declaration after an echo still wins.
+        let log = "STAGE_RESULT: fail: <one short reason>\nSTAGE_RESULT: fail: cargo not on PATH\n";
+        let d = parse_stage_result(log).unwrap();
+        assert_eq!(d.reason.as_deref(), Some("cargo not on PATH"));
+        // "okay" must not count as ok.
+        assert_eq!(parse_stage_result("STAGE_RESULT: okay then"), None);
     }
 
     #[test]

@@ -578,24 +578,57 @@ pub fn append_history(
 /// interpretation, no LLM — just connected-component-style clustering by
 /// bounding-box proximity.
 ///
-/// Input shape (what `canvas.rs` writes today):
+/// Input shape (what `canvas.rs` writes today — see `Shape::to_json`):
 /// - Each annotation is a JSON object with a geometric shape. We look for
-///   any of `bounds: {x, y, w, h}`, `points: [{x, y}, …]`, `x`+`y`+`w`+`h`
-///   at the top level, or a `text` field with `x`+`y`.
+///   any of `bounds: {x, y, w, h}`, `points: [[x, y], …]` or
+///   `points: [{x, y}, …]`, `from`/`to` endpoint pairs (line / arrow),
+///   `x`+`y`+`w`+`h` at the top level, or a `text` field with `x`+`y`.
 /// - A `stroke` / `color` / `strokeColor` field contributes the dominant
 ///   color.
 /// - A `text` field contributes a `labels[]` entry verbatim.
 ///
+/// canvas.rs stores coordinates as **normalised ratios (0..1)** so strokes
+/// re-render at any canvas size; region bboxes and the clustering pad are
+/// in **pixels**, so ratio-shaped annotations are scaled up by the
+/// viewport recorded with the feedback. Pixel-shaped inputs (hand-written
+/// fixtures, older records) are detected by extent and left untouched.
+///
 /// Unknown / unparseable shapes are skipped silently — this is a
 /// best-effort index, never the source of truth (the PNG is).
-pub fn extract_regions(annotations: &[serde_json::Value]) -> Vec<CanvasRegion> {
+pub fn extract_regions(
+    annotations: &[serde_json::Value],
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Vec<CanvasRegion> {
     let mut raw: Vec<RawAnnotation> = Vec::new();
     for ann in annotations {
-        if let Some(r) = parse_annotation(ann) {
+        if let Some(mut r) = parse_annotation(ann) {
+            scale_ratio_bbox(&mut r.bbox, viewport_width, viewport_height);
+            // Degenerate strokes (points, zero-size rects) still occupy at
+            // least one pixel so the overlap test has something to work on.
+            r.bbox[2] = r.bbox[2].max(1.0);
+            r.bbox[3] = r.bbox[3].max(1.0);
             raw.push(r);
         }
     }
     cluster(&raw)
+}
+
+/// Scale a bbox from normalised ratio space (0..1) to viewport pixels when
+/// it looks ratio-shaped. The clamp at 2.0 (not 1.0) tolerates strokes that
+/// run slightly off-canvas; anything larger is already in pixels.
+fn scale_ratio_bbox(bbox: &mut [f32; 4], viewport_width: u32, viewport_height: u32) {
+    if viewport_width == 0 || viewport_height == 0 {
+        return;
+    }
+    let looks_ratio =
+        bbox[0] >= -0.5 && bbox[1] >= -0.5 && bbox[0] + bbox[2] <= 2.0 && bbox[1] + bbox[3] <= 2.0;
+    if looks_ratio {
+        bbox[0] *= viewport_width as f32;
+        bbox[2] *= viewport_width as f32;
+        bbox[1] *= viewport_height as f32;
+        bbox[3] *= viewport_height as f32;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -639,7 +672,9 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
             label,
         });
     }
-    // Shape C: polyline / freehand with `points[]`.
+    // Shape C: polyline / freehand with `points[]`. canvas.rs `path`
+    // shapes serialise points as `[x, y]` arrays; tolerate `{x, y}`
+    // objects too (older fixtures and hand-written feedback).
     if let Some(points) = v.get("points").and_then(|p| p.as_array()) {
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;
@@ -647,9 +682,7 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
         let mut max_y = f32::MIN;
         let mut count = 0u32;
         for p in points {
-            let x = p.get("x").and_then(|n| n.as_f64()).map(|n| n as f32);
-            let y = p.get("y").and_then(|n| n.as_f64()).map(|n| n as f32);
-            if let (Some(x), Some(y)) = (x, y) {
+            if let Some((x, y)) = point_xy(p) {
                 min_x = min_x.min(x);
                 min_y = min_y.min(y);
                 max_x = max_x.max(x);
@@ -658,14 +691,19 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
             }
         }
         if count > 0 {
-            let bbox = [
-                min_x,
-                min_y,
-                (max_x - min_x).max(1.0),
-                (max_y - min_y).max(1.0),
-            ];
+            let bbox = [min_x, min_y, max_x - min_x, max_y - min_y];
             return Some(RawAnnotation { bbox, color, label });
         }
+    }
+    // Shape E: line / arrow with `from` / `to` endpoint pairs.
+    if let (Some(from), Some(to)) = (
+        v.get("from").and_then(point_xy),
+        v.get("to").and_then(point_xy),
+    ) {
+        let min_x = from.0.min(to.0);
+        let min_y = from.1.min(to.1);
+        let bbox = [min_x, min_y, (from.0 - to.0).abs(), (from.1 - to.1).abs()];
+        return Some(RawAnnotation { bbox, color, label });
     }
     // Shape D: text note with just x/y.
     if let (Some(x), Some(y)) = (
@@ -673,7 +711,7 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
         v.get("y").and_then(|n| n.as_f64()),
     ) {
         return Some(RawAnnotation {
-            bbox: [x as f32, y as f32, 1.0, 1.0],
+            bbox: [x as f32, y as f32, 0.0, 0.0],
             color,
             label,
         });
@@ -681,21 +719,37 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
     None
 }
 
+/// Read one point as either a 2-element `[x, y]` array (what canvas.rs
+/// emits) or an `{x, y}` object.
+fn point_xy(p: &serde_json::Value) -> Option<(f32, f32)> {
+    if let Some(arr) = p.as_array() {
+        if arr.len() < 2 {
+            return None;
+        }
+        let x = arr[0].as_f64()?;
+        let y = arr[1].as_f64()?;
+        return Some((x as f32, y as f32));
+    }
+    let x = p.get("x").and_then(|n| n.as_f64())?;
+    let y = p.get("y").and_then(|n| n.as_f64())?;
+    Some((x as f32, y as f32))
+}
+
 fn read_xywh(v: &serde_json::Value) -> Option<[f32; 4]> {
     let x = v.get("x").and_then(|n| n.as_f64())?;
     let y = v.get("y").and_then(|n| n.as_f64())?;
+    // No minimum clamp here — ratio-shaped boxes (w/h in 0..1) must survive
+    // until `scale_ratio_bbox` has run; extract_regions clamps post-scale.
     let w = v
         .get("w")
         .or_else(|| v.get("width"))
         .and_then(|n| n.as_f64())
-        .unwrap_or(0.0)
-        .max(1.0);
+        .unwrap_or(0.0);
     let h = v
         .get("h")
         .or_else(|| v.get("height"))
         .and_then(|n| n.as_f64())
-        .unwrap_or(0.0)
-        .max(1.0);
+        .unwrap_or(0.0);
     Some([x as f32, y as f32, w as f32, h as f32])
 }
 
@@ -912,7 +966,7 @@ mod tests {
             json!({"x": 25, "y": 15, "w": 20, "h": 20, "color": "#ff0000"}),
             json!({"x": 400, "y": 400, "w": 10, "h": 10, "color": "#00ff00"}),
         ];
-        let regions = extract_regions(&ann);
+        let regions = extract_regions(&ann, 1440, 900);
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].id, "R1");
         assert_eq!(regions[0].stroke_count, 2);
@@ -930,7 +984,7 @@ mod tests {
             ],
             "color": "#0000ff"
         })];
-        let regions = extract_regions(&ann);
+        let regions = extract_regions(&ann, 1440, 900);
         assert_eq!(regions.len(), 1);
         let bbox = regions[0].bbox;
         assert!((bbox[0] - 100.0).abs() < 0.01);
@@ -943,7 +997,7 @@ mod tests {
             json!({"x": 10, "y": 10, "w": 20, "h": 20, "text": "MISSING!"}),
             json!({"x": 15, "y": 12, "w": 20, "h": 20, "text": "FIX THIS"}),
         ];
-        let regions = extract_regions(&ann);
+        let regions = extract_regions(&ann, 1440, 900);
         assert_eq!(regions.len(), 1);
         assert!(regions[0].labels.contains(&"MISSING!".to_string()));
         assert!(regions[0].labels.contains(&"FIX THIS".to_string()));
@@ -951,8 +1005,101 @@ mod tests {
 
     #[test]
     fn extract_regions_empty_input_yields_empty() {
-        let regions = extract_regions(&[]);
+        let regions = extract_regions(&[], 1440, 900);
         assert!(regions.is_empty());
+    }
+
+    // --- Fixtures below mirror `Shape::to_json` in app/ui/src/canvas.rs
+    // verbatim: array-shaped points, from/to endpoints, and normalised
+    // ratio coordinates (0..1). These are the shapes real feedback
+    // submissions carry; regressions here silently gut the planner's
+    // region index (budget floor collapses to the minimum).
+
+    #[test]
+    fn extract_regions_parses_canvas_path_with_array_points() {
+        // Freehand pen stroke, exactly as canvas.rs serialises it.
+        let ann = vec![json!({
+            "type": "path",
+            "points": [[0.10, 0.20], [0.13, 0.24], [0.15, 0.25]],
+            "color": "#ef4444",
+            "width": 4.0
+        })];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(regions.len(), 1, "pen strokes must produce a region");
+        let bbox = regions[0].bbox;
+        assert!(
+            (bbox[0] - 144.0).abs() < 0.5,
+            "x scaled to pixels: {bbox:?}"
+        );
+        assert!(
+            (bbox[1] - 180.0).abs() < 0.5,
+            "y scaled to pixels: {bbox:?}"
+        );
+        assert!((bbox[2] - 72.0).abs() < 0.5, "w scaled to pixels: {bbox:?}");
+        assert!((bbox[3] - 45.0).abs() < 0.5, "h scaled to pixels: {bbox:?}");
+        assert_eq!(regions[0].dominant_color.as_deref(), Some("#ef4444"));
+    }
+
+    #[test]
+    fn extract_regions_parses_canvas_line_and_arrow_endpoints() {
+        let ann = vec![
+            json!({"type": "line", "from": [0.50, 0.50], "to": [0.60, 0.55], "color": "#22c55e", "width": 3.0}),
+            json!({"type": "arrow", "from": [0.58, 0.54], "to": [0.62, 0.60], "color": "#22c55e", "width": 3.0}),
+        ];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(
+            regions.len(),
+            1,
+            "overlapping line + arrow cluster into one region"
+        );
+        assert_eq!(regions[0].stroke_count, 2);
+        let bbox = regions[0].bbox;
+        assert!((bbox[0] - 720.0).abs() < 0.5, "from.x scaled: {bbox:?}");
+    }
+
+    #[test]
+    fn extract_regions_scales_ratio_rects_and_separates_distant_strokes() {
+        // Two rects far apart in ratio space (0.05 vs 0.85). Unscaled they
+        // would be 0.8 "pixels" apart — inside the 32 px clustering pad —
+        // and wrongly merge into one region. Scaled they are ~1150 px
+        // apart and must stay separate.
+        let ann = vec![
+            json!({"type": "rect", "x": 0.05, "y": 0.05, "w": 0.10, "h": 0.10, "color": "#ef4444", "width": 2.0}),
+            json!({"type": "rect", "x": 0.85, "y": 0.80, "w": 0.10, "h": 0.10, "color": "#3b82f6", "width": 2.0}),
+        ];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(
+            regions.len(),
+            2,
+            "distant ratio strokes must not cluster after scaling"
+        );
+        let bbox = regions[0].bbox;
+        assert!(
+            (bbox[2] - 144.0).abs() < 0.5,
+            "ratio width scaled: {bbox:?}"
+        );
+    }
+
+    #[test]
+    fn extract_regions_parses_canvas_text_shape() {
+        let ann = vec![json!({
+            "type": "text", "x": 0.30, "y": 0.40,
+            "text": "ADD A CHART HERE", "color": "#ef4444", "fontSize": 16.0
+        })];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].labels.contains(&"ADD A CHART HERE".to_string()));
+        assert!((regions[0].bbox[0] - 432.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn extract_regions_leaves_pixel_coordinates_unscaled() {
+        // Hand-written / legacy pixel annotations (coords > 2) pass through
+        // untouched even when a viewport is provided.
+        let ann = vec![json!({"x": 400, "y": 300, "w": 50, "h": 40, "color": "#ff0000"})];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].bbox, [400.0, 300.0, 50.0, 40.0]);
     }
 
     #[test]
