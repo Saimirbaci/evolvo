@@ -225,6 +225,14 @@ The multi-stage NewApp pipeline works for every backend because it drives off `p
 
 The feedback panel's Agent chip row probes `list_available_agents` on mount and greys out chips whose binary is not on PATH — install the missing CLI and restart Evolvo to re-probe (availability is cached per-process).
 
+## Stage self-correction: Reflexion retries, validate CLI, checkpoints
+
+Three load-bearing mechanisms in the stage pipeline (`stages.rs` / `runner.rs`):
+
+- **Reflexion retries.** A validator rejection no longer fails the job outright — `run_stage` re-dispatches the stage up to `MAX_STAGE_ATTEMPTS` (3) times, rendering the previous attempt's failed checks into the prompt (`build_stage_prompt`). Retries keep the worktree as the failed attempt left it; each retry's transcript is `logs/<slug>.attempt<N>.log`. A `plan.json` the agent corrupted counts as a failed attempt (parse error fed back), not a hard error.
+- **`evolvo_desktop validate` CLI.** The exact stage validators are callable headlessly: `evolvo_desktop validate --stage <slug> --job-dir <dir> --worktree <dir> [--json]` (exit 0 = accepted, 1 = rejected with `FAIL` lines, 2 = usage error). The runner passes the host binary to every stage session as `$EVOLVO_VALIDATE_BIN`, and `prompts/stages/_self_validate.md` instructs agents to iterate until it passes *before* exiting. Agents must never edit `validators.rs` to make it pass — the pipeline runs the host's copy.
+- **Green-stage checkpoints.** After a stage validates green, the runner best-effort commits the worktree as `stage(<slug>): green checkpoint — job <id>` (identity `Evolvo Pipeline <pipeline@evolvo.local>`). Plan-only stages produce no commit (clean tree). These anchors exist so recovery can reset to the last green stage instead of discarding the worktree.
+
 ## Debugging a lineage run — `claude.log` is JSONL
 
 Each lineage job's `claude.log` (under `~/.evolvo/evolvo_workspace/lineage_workspaces/<job-id>/`) is captured with `claude -p ... --output-format stream-json --verbose`, so it is **one JSON event per line**, not human-readable prose. Each line has a `type` (`system`, `assistant`, `user`, `result`, etc.); assistant messages carry `message.content[]` with `tool_use` / `text` entries; user messages carry `tool_result` entries.

@@ -385,13 +385,13 @@ pub struct StagedAttachment {
     pub path: PathBuf,
 }
 
-/// Embedded fallbacks so the binary still works when the prompts dir is
-/// missing. Overrides are resolved at runtime from (in order):
-///   1. `$EVOLVO_PROMPTS_DIR`
-///   2. `<source_repo>/prompts/`
-///   3. the compiled-in string below.
-/// This lets the user edit the on-disk prompt files and see the change on the
-/// next lineage run without rebuilding the host binary.
+// Embedded fallbacks so the binary still works when the prompts dir is
+// missing. Overrides are resolved at runtime from (in order):
+//   1. `$EVOLVO_PROMPTS_DIR`
+//   2. `<source_repo>/prompts/`
+//   3. the compiled-in string below.
+// This lets the user edit the on-disk prompt files and see the change on the
+// next lineage run without rebuilding the host binary.
 const EMBEDDED_ITERATION_GUIDANCE: &str = include_str!("../../../prompts/iteration_guidance.md");
 const EMBEDDED_IMPLEMENTATION: &str = include_str!("../../../prompts/implementation.md");
 const EMBEDDED_NEW_APP_BANNER: &str = include_str!("../../../prompts/new_app_banner.md");
@@ -410,6 +410,11 @@ const EMBEDDED_STAGE_FRONTEND_IMPL: &str = include_str!("../../../prompts/stages
 const EMBEDDED_STAGE_E2E_PLAN: &str = include_str!("../../../prompts/stages/e2e_plan.md");
 const EMBEDDED_STAGE_E2E_IMPL: &str = include_str!("../../../prompts/stages/e2e_impl.md");
 const EMBEDDED_STAGE_FINAL_REVIEW: &str = include_str!("../../../prompts/stages/final_review.md");
+/// Self-validation instructions appended to every stage prompt: how to run
+/// the `evolvo_desktop validate` CLI (the exact gate the pipeline applies)
+/// from inside the session and iterate until it passes.
+const EMBEDDED_STAGE_SELF_VALIDATE: &str =
+    include_str!("../../../prompts/stages/_self_validate.md");
 /// Local-model delegation rules. Appended to the supervisor prompt when
 /// the user opted into pi+Ollama delegation on the feedback record.
 const EMBEDDED_DELEGATE_RULES: &str = include_str!("../../../prompts/pi.md");
@@ -472,9 +477,7 @@ pub fn iteration_guidance(iteration: u32, freedom: FreedomLevel) -> String {
             ("phases/bootstrap.md", EMBEDDED_PHASE_BOOTSTRAP)
         }
         FreedomLevel::Shaping => ("phases/shaping.md", EMBEDDED_PHASE_SHAPING),
-        FreedomLevel::Consolidation => {
-            ("phases/consolidation.md", EMBEDDED_PHASE_CONSOLIDATION)
-        }
+        FreedomLevel::Consolidation => ("phases/consolidation.md", EMBEDDED_PHASE_CONSOLIDATION),
         FreedomLevel::Maturation => ("phases/maturation.md", EMBEDDED_PHASE_MATURATION),
         FreedomLevel::Auto => {
             // Should never reach prompt build with an unresolved freedom; if
@@ -796,8 +799,7 @@ pub fn prepare_run(
     // stable value (and a reviewer who later opens the JSON can override
     // it). `Auto` is resolved once and replaced; concrete values stay.
     if matches!(job.freedom, FreedomLevel::Auto) {
-        job.freedom =
-            FreedomLevel::from_iteration_and_kind(job.iteration, feedback.feedback_type);
+        job.freedom = FreedomLevel::from_iteration_and_kind(job.iteration, feedback.feedback_type);
         dirty = true;
     }
     if dirty {
@@ -1294,6 +1296,49 @@ fn render_stage_prompt(
         .replace("{{WORKTREE}}", &worktree.display().to_string())
 }
 
+/// Assemble the complete prompt for one stage attempt: the stage template
+/// rendered with plan values, plus — on Reflexion retries — the previous
+/// attempt's failed validator checks, plus the self-validation block that
+/// points the agent at the `evolvo_desktop validate` CLI. Public so tests
+/// can assert the assembled prompt carries both feedback loops.
+#[allow(clippy::too_many_arguments)]
+pub fn build_stage_prompt(
+    stage: crate::types::StageKind,
+    plan: &crate::plan::IterationPlan,
+    worktree: &Path,
+    plan_path: &Path,
+    job_dir: &Path,
+    job_id: &str,
+    attempt: u32,
+    previous_failure: Option<&str>,
+) -> String {
+    let template = stage_prompt_template(stage);
+    let mut prompt = render_stage_prompt(&template, plan, worktree, plan_path, job_id);
+
+    if let Some(failure) = previous_failure {
+        prompt.push_str(&format!(
+            "\n\n---\n\n## Previous attempt failed validation (this is attempt {attempt} of {max})\n\n\
+             The deterministic validator rejected the previous attempt of this stage.\n\
+             The worktree and plan.json are exactly as that attempt left them — do NOT\n\
+             start over and do NOT redo work whose checks already pass. Fix the specific\n\
+             findings below, then re-run the validator before you finish.\n\n\
+             ```\n{failure}```\n",
+            max = crate::stages::MAX_STAGE_ATTEMPTS,
+        ));
+    }
+
+    let self_validate = trim_trailing_newline(load_prompt(
+        "stages/_self_validate.md",
+        EMBEDDED_STAGE_SELF_VALIDATE,
+    ))
+    .replace("{{STAGE_SLUG}}", stage.slug())
+    .replace("{{JOB_DIR}}", &job_dir.display().to_string())
+    .replace("{{WORKTREE}}", &worktree.display().to_string());
+    prompt.push_str("\n\n---\n\n");
+    prompt.push_str(&self_validate);
+    prompt
+}
+
 /// Concrete `StageDispatcher` that spawns the selected agent CLI per
 /// stage and streams its output to `<job_dir>/logs/<slug>.log`. Blocks the
 /// calling thread until the agent exits.
@@ -1335,16 +1380,31 @@ impl crate::stages::StageDispatcher for AgentStageDispatcher {
 
         let logs_dir = ctx.job_dir.join("logs");
         fs::create_dir_all(&logs_dir).map_err(|e| format!("create logs dir: {e}"))?;
-        let log_path = logs_dir.join(format!("{}.log", ctx.stage.slug()));
+        // Attempt 1 keeps the historical name so existing log-tailing UI
+        // paths stay valid; Reflexion retries get their own file so no
+        // attempt's transcript is overwritten.
+        let log_name = if ctx.attempt <= 1 {
+            format!("{}.log", ctx.stage.slug())
+        } else {
+            format!("{}.attempt{}.log", ctx.stage.slug(), ctx.attempt)
+        };
+        let log_path = logs_dir.join(log_name);
         let log_handle = fs::File::create(&log_path)
             .map_err(|e| format!("create log {}: {e}", log_path.display()))?;
         let log_err = log_handle
             .try_clone()
             .map_err(|e| format!("clone log handle: {e}"))?;
 
-        let template = stage_prompt_template(ctx.stage);
-        let mut prompt =
-            render_stage_prompt(&template, &plan, ctx.worktree, &ctx.plan_path, ctx.job_id);
+        let mut prompt = build_stage_prompt(
+            ctx.stage,
+            &plan,
+            ctx.worktree,
+            &ctx.plan_path,
+            ctx.job_dir,
+            ctx.job_id,
+            ctx.attempt,
+            ctx.previous_failure.as_deref(),
+        );
 
         // Per-stage delegation policy: only `*_impl` stages get the
         // delegation rules + env vars. `*_plan` and `final_review`
@@ -1363,6 +1423,12 @@ impl crate::stages::StageDispatcher for AgentStageDispatcher {
 
         let backend = backend_for(self.agent);
         let mut command = backend.build_command(&prompt, ctx.worktree);
+        // Hand the agent the host binary so the self-validation block in the
+        // prompt resolves: `$EVOLVO_VALIDATE_BIN validate --stage ...` runs
+        // the exact validator this pipeline will apply after the session.
+        if let Ok(exe) = std::env::current_exe() {
+            command.env("EVOLVO_VALIDATE_BIN", exe);
+        }
         if let Some(d) = stage_delegate {
             command
                 .env("EVOLVO_DELEGATE_BIN", &d.wrapper)
@@ -2011,7 +2077,10 @@ mod tests {
             Path::new("/tmp/claude.log"),
             AgentKind::ClaudeCode,
         );
-        assert!(!prompt.contains("{contract}"), "contract placeholder leaked");
+        assert!(
+            !prompt.contains("{contract}"),
+            "contract placeholder leaked"
+        );
         assert!(prompt.contains("STAGE_RESULT:"), "sentinel rule missing");
         assert!(
             prompt.contains("Operating contract") || prompt.contains("operating contract"),
@@ -2059,6 +2128,68 @@ mod tests {
                 "{kind:?} left {{{{PORT}}}} unsubstituted"
             );
         }
+    }
+
+    #[test]
+    fn build_stage_prompt_appends_self_validation_block() {
+        use crate::plan::IterationPlan;
+        let mut plan = IterationPlan::default();
+        plan.app.name = "test-app".into();
+        plan.app.iteration = 1;
+        let prompt = build_stage_prompt(
+            crate::types::StageKind::BackendImpl,
+            &plan,
+            Path::new("/tmp/wt"),
+            Path::new("/tmp/job/plan.json"),
+            Path::new("/tmp/job"),
+            "job-x",
+            1,
+            None,
+        );
+        assert!(
+            prompt.contains("Self-validate before you finish"),
+            "self-validation block missing"
+        );
+        assert!(
+            prompt.contains("validate --stage backend_impl"),
+            "validator CLI invocation missing or unsubstituted"
+        );
+        assert!(
+            prompt.contains("--job-dir /tmp/job --worktree /tmp/wt"),
+            "job-dir/worktree not substituted into the validator command"
+        );
+        assert!(
+            !prompt.contains("Previous attempt failed validation"),
+            "first attempt must not carry a failure block"
+        );
+    }
+
+    #[test]
+    fn build_stage_prompt_renders_previous_failure_on_retry() {
+        use crate::plan::IterationPlan;
+        let mut plan = IterationPlan::default();
+        plan.app.name = "test-app".into();
+        plan.app.iteration = 1;
+        let failure = "validator `backend_impl` rejected: 1 of 9 checks failed\n- FAILED cargo check -p evolvo_desktop: exited non-zero\n";
+        let prompt = build_stage_prompt(
+            crate::types::StageKind::BackendImpl,
+            &plan,
+            Path::new("/tmp/wt"),
+            Path::new("/tmp/job/plan.json"),
+            Path::new("/tmp/job"),
+            "job-x",
+            2,
+            Some(failure),
+        );
+        assert!(prompt.contains("Previous attempt failed validation (this is attempt 2 of 3)"));
+        assert!(
+            prompt.contains("FAILED cargo check -p evolvo_desktop"),
+            "the validator finding must travel verbatim into the retry prompt"
+        );
+        assert!(
+            prompt.contains("do NOT\nstart over"),
+            "retry must instruct incremental fixing"
+        );
     }
 
     #[test]

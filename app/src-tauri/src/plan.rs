@@ -1047,7 +1047,10 @@ mod tests {
 
         save_plan(dir.path(), &plan).unwrap();
         let back = load_plan(dir.path()).unwrap().unwrap();
-        assert_eq!(back.templates.use_app_shape.as_deref(), Some("markdown_editor"));
+        assert_eq!(
+            back.templates.use_app_shape.as_deref(),
+            Some("markdown_editor")
+        );
         assert_eq!(
             back.templates.backend_bindings.get("markdown_editor"),
             Some(&"sqlite".to_string())
@@ -1113,8 +1116,8 @@ mod tests {
         ];
         for (s, variant) in pairs {
             let raw = format!("\"{s}\"");
-            let decoded: PlanStage = serde_json::from_str(&raw)
-                .unwrap_or_else(|e| panic!("{s} should decode: {e}"));
+            let decoded: PlanStage =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{s} should decode: {e}"));
             assert_eq!(decoded, *variant);
             let encoded = serde_json::to_string(variant).unwrap();
             assert_eq!(encoded, raw, "{:?} should re-encode to {s}", variant);

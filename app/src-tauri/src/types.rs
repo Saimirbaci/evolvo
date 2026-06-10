@@ -410,6 +410,13 @@ impl StageKind {
         }
     }
 
+    /// Inverse of [`slug`](Self::slug). Used by the `evolvo_desktop
+    /// validate` CLI so an in-worktree agent can name the stage it wants
+    /// to self-check.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::pipeline().iter().copied().find(|k| k.slug() == slug)
+    }
+
     pub fn is_planner(self) -> bool {
         matches!(self, Self::BackendPlan | Self::FrontendPlan | Self::E2EPlan)
     }
@@ -629,6 +636,15 @@ mod tests {
         assert_eq!(raw, "\"bug\"");
         let back: FeedbackType = serde_json::from_str("\"feature_request\"").unwrap();
         assert_eq!(back, FeedbackType::FeatureRequest);
+    }
+
+    #[test]
+    fn stage_kind_from_slug_round_trips_pipeline() {
+        for kind in StageKind::pipeline().iter().copied() {
+            assert_eq!(StageKind::from_slug(kind.slug()), Some(kind));
+        }
+        assert_eq!(StageKind::from_slug("not_a_stage"), None);
+        assert_eq!(StageKind::from_slug(""), None);
     }
 
     #[test]

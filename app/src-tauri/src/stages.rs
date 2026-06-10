@@ -28,6 +28,14 @@ use crate::validators::{
     validate_final, validate_frontend_impl, validate_frontend_plan, StageReport,
 };
 
+/// Maximum number of agent dispatches for a single stage: the first attempt
+/// plus up to two Reflexion retries where the validator's failed checks are
+/// rendered back into the prompt (see `previous_failure` on
+/// [`StageDispatch`]). Deliberately small — every attempt is a full agent
+/// session, and if two corrections don't converge the failure is structural
+/// and a human should look at it.
+pub const MAX_STAGE_ATTEMPTS: u32 = 3;
+
 /// Context handed to a dispatcher when a stage needs to run. Carries all the
 /// on-disk pointers the Claude session needs: the plan file, the canvas PNG,
 /// the worktree root. Dispatcher returns the path to the stage's log file.
@@ -38,6 +46,14 @@ pub struct StageDispatch<'a> {
     pub plan_path: PathBuf,
     pub canvas_png: Option<PathBuf>,
     pub job_id: &'a str,
+    /// 1-based attempt counter. 1 = first dispatch of this stage in this
+    /// pipeline run; >1 = Reflexion retry after a validator rejection.
+    pub attempt: u32,
+    /// When `attempt > 1`, the previous attempt's failed validator checks
+    /// (from [`StageReport::failure_block`]). The dispatcher renders this
+    /// into the prompt so the agent fixes the specific findings instead of
+    /// re-running blind.
+    pub previous_failure: Option<String>,
 }
 
 /// How the runner executes a stage. Production impl spawns `claude -p ...`
@@ -191,7 +207,7 @@ fn derive_app_name(text: &str) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("NewApp");
     let cut = first
-        .split(|c: char| matches!(c, '.' | '!' | '?' | ':' | ','))
+        .split(['.', '!', '?', ':', ','])
         .next()
         .unwrap_or(first)
         .trim();
@@ -242,13 +258,26 @@ fn stage_already_done(plan_stage: PlanStage, stage: StageKind) -> bool {
 /// Run one stage end-to-end: flip to Running, dispatch, reload the plan,
 /// run the validator, and persist the resulting `StageReport` on the job.
 /// Returns `Ok(true)` if the stage passed, `Ok(false)` if the validator
-/// rejected it, `Err(_)` on I/O or dispatcher errors.
+/// rejected every attempt, `Err(_)` on I/O or dispatcher errors.
+///
+/// **Reflexion retries:** a validator rejection does not end the stage —
+/// up to [`MAX_STAGE_ATTEMPTS`] dispatches run, each retry carrying the
+/// previous attempt's failed checks in `StageDispatch::previous_failure`
+/// so the agent fixes the specific findings against the worktree state the
+/// failed attempt left behind. A malformed or missing `plan.json` after a
+/// dispatch counts as a failed attempt (with the parse error fed back),
+/// not a hard pipeline error.
 ///
 /// **Resume behaviour:** if `plan.stage` on disk says this stage's output is
 /// already written (e.g. `BackendPlanned` for the `BackendPlan` stage), the
-/// Claude dispatch is skipped and the validator runs against the existing
-/// plan. This makes re-running the pipeline idempotent — useful after a
+/// first attempt skips the Claude dispatch and validates the existing
+/// artifacts; if that validation fails, the retry attempts dispatch
+/// normally. This keeps re-running the pipeline idempotent — useful after a
 /// deserialisation hiccup or transient dispatcher failure.
+///
+/// **Checkpoint:** when a stage validates green, the worktree is
+/// checkpoint-committed (best-effort) so later recovery can reset to the
+/// last green stage instead of discarding the whole worktree.
 pub fn run_stage<D: StageDispatcher>(
     store: &Store,
     engine: &LineageEngine<'_>,
@@ -264,73 +293,181 @@ pub fn run_stage<D: StageDispatcher>(
         .map(|p| p.stage)
         .unwrap_or(PlanStage::Seeded);
     let resume_skip = stage_already_done(existing_plan_stage, stage);
+    let mut previous_failure: Option<String> = None;
 
-    if resume_skip {
-        let _ = engine.append_note(
-            job_id,
-            &format!(
-                "resume: plan.stage={} — skipping Claude dispatch for {} and re-validating existing artifacts",
-                existing_plan_stage.label(),
-                stage.slug()
-            ),
-        );
-        engine
-            .update_stage(job_id, stage, |s| {
-                s.status = StageStatus::Validating;
-                s.headline = Some(format!(
-                    "resumed — re-validating existing {} output",
+    for attempt in 1..=MAX_STAGE_ATTEMPTS {
+        if attempt == 1 && resume_skip {
+            let _ = engine.append_note(
+                job_id,
+                &format!(
+                    "resume: plan.stage={} — skipping Claude dispatch for {} and re-validating existing artifacts",
+                    existing_plan_stage.label(),
                     stage.slug()
-                ));
-            })
-            .map_err(|e| format!("mark validating (resume): {e}"))?;
-    } else {
-        engine
-            .update_stage(job_id, stage, |s| {
-                s.status = StageStatus::Running;
-                s.headline = Some(format!("running {}", stage.slug()));
-            })
-            .map_err(|e| format!("mark stage running: {e}"))?;
+                ),
+            );
+            engine
+                .update_stage(job_id, stage, |s| {
+                    s.status = StageStatus::Validating;
+                    s.headline = Some(format!(
+                        "resumed — re-validating existing {} output",
+                        stage.slug()
+                    ));
+                })
+                .map_err(|e| format!("mark validating (resume): {e}"))?;
+        } else {
+            let headline = if attempt == 1 {
+                format!("running {}", stage.slug())
+            } else {
+                format!(
+                    "retrying {} (attempt {attempt}/{MAX_STAGE_ATTEMPTS}) with validator findings",
+                    stage.slug()
+                )
+            };
+            engine
+                .update_stage(job_id, stage, |s| {
+                    s.status = StageStatus::Running;
+                    s.headline = Some(headline);
+                })
+                .map_err(|e| format!("mark stage running: {e}"))?;
 
-        let plan_path = job_dir.join(crate::plan::PLAN_FILENAME);
-        let canvas_png = load_plan(job_dir)
-            .ok()
-            .flatten()
-            .and_then(|p| p.canvas.png_path.map(PathBuf::from));
+            let plan_path = job_dir.join(crate::plan::PLAN_FILENAME);
+            let canvas_png = load_plan(job_dir)
+                .ok()
+                .flatten()
+                .and_then(|p| p.canvas.png_path.map(PathBuf::from));
 
-        let dispatch = StageDispatch {
-            stage,
-            worktree,
-            job_dir,
-            plan_path,
-            canvas_png,
-            job_id,
+            let dispatch = StageDispatch {
+                stage,
+                worktree,
+                job_dir,
+                plan_path,
+                canvas_png,
+                job_id,
+                attempt,
+                previous_failure: previous_failure.clone(),
+            };
+            let log_path = dispatcher.dispatch(dispatch).map_err(|e| {
+                let _ = engine.update_stage(job_id, stage, |s| {
+                    s.status = StageStatus::Failed;
+                    s.headline = Some(format!("dispatcher error: {e}"));
+                });
+                e
+            })?;
+
+            engine
+                .update_stage(job_id, stage, |s| {
+                    s.status = StageStatus::Validating;
+                    s.log_path = Some(log_path.display().to_string());
+                })
+                .map_err(|e| format!("mark validating: {e}"))?;
+        }
+
+        // A plan that no longer loads is a *failed attempt*, not a hard
+        // error — the agent gets the parse failure fed back and a chance
+        // to repair the file it broke.
+        let report = match load_plan(job_dir) {
+            Ok(Some(plan)) => run_validator(stage, &plan, worktree, job_dir),
+            Ok(None) => crate::validators::report_failure(
+                stage.slug(),
+                "plan.json exists after stage ran",
+                "plan.json missing after stage ran",
+            ),
+            Err(e) => crate::validators::report_failure(
+                stage.slug(),
+                "plan.json parses after stage ran",
+                &format!("plan.json failed to parse: {e}"),
+            ),
         };
-        let log_path = dispatcher.dispatch(dispatch).map_err(|e| {
-            let _ = engine.update_stage(job_id, stage, |s| {
-                s.status = StageStatus::Failed;
-                s.headline = Some(format!("dispatcher error: {e}"));
-            });
-            e
-        })?;
+        persist_stage_outcome(store, engine, job_id, job_dir, stage, &report)?;
 
-        engine
-            .update_stage(job_id, stage, |s| {
-                s.status = StageStatus::Validating;
-                s.log_path = Some(log_path.display().to_string());
-            })
-            .map_err(|e| format!("mark validating: {e}"))?;
+        if report.passed {
+            if let Some(sha) = checkpoint_worktree(worktree, stage, job_id) {
+                let _ = engine.append_note(
+                    job_id,
+                    &format!(
+                        "checkpoint: committed {} green state as {sha}",
+                        stage.slug()
+                    ),
+                );
+            }
+            return Ok(true);
+        }
+
+        previous_failure = Some(report.failure_block());
+        if attempt < MAX_STAGE_ATTEMPTS {
+            let _ = engine.append_note(
+                job_id,
+                &format!(
+                    "{} rejected by validator (attempt {attempt}/{MAX_STAGE_ATTEMPTS}) — retrying with the failed checks in the prompt",
+                    stage.slug()
+                ),
+            );
+        }
     }
 
-    let plan = load_plan(job_dir)
-        .map_err(|e| format!("reload plan: {e}"))?
-        .ok_or_else(|| "plan.json missing after stage ran".to_string())?;
-
-    let report = run_validator(stage, &plan, worktree, job_dir);
-    persist_stage_outcome(store, engine, job_id, job_dir, stage, &report)?;
-    Ok(report.passed)
+    let _ = engine.append_note(
+        job_id,
+        &format!(
+            "{} still rejected after {MAX_STAGE_ATTEMPTS} attempts — giving up on this stage",
+            stage.slug()
+        ),
+    );
+    Ok(false)
 }
 
-fn run_validator(
+/// Best-effort checkpoint commit after a stage validates green: stage
+/// everything in the worktree and commit it as
+/// `stage(<slug>): green checkpoint — job <id>` under a fixed pipeline
+/// identity. Gives every green stage a durable git anchor so recovery can
+/// `git reset --hard` to the last good state instead of discarding the
+/// worktree. Returns the short sha, or `None` when the directory is not a
+/// git repo, there is nothing to commit (plan-only stages), or git fails —
+/// checkpointing is bookkeeping, never a gate, so it cannot fail the stage.
+fn checkpoint_worktree(worktree: &Path, stage: StageKind, job_id: &str) -> Option<String> {
+    let git = |args: &[&str]| -> Option<std::process::Output> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(args)
+            .output()
+            .ok()
+    };
+
+    let inside = git(&["rev-parse", "--is-inside-work-tree"])?;
+    if !inside.status.success() {
+        return None;
+    }
+    if !git(&["add", "-A"])?.status.success() {
+        return None;
+    }
+    // `diff --cached --quiet` exits 0 when nothing is staged.
+    if git(&["diff", "--cached", "--quiet"])?.status.success() {
+        return None;
+    }
+    let message = format!("stage({}): green checkpoint — job {}", stage.slug(), job_id);
+    let commit = git(&[
+        "-c",
+        "user.name=Evolvo Pipeline",
+        "-c",
+        "user.email=pipeline@evolvo.local",
+        "commit",
+        "-m",
+        &message,
+    ])?;
+    if !commit.status.success() {
+        return None;
+    }
+    let sha = git(&["rev-parse", "--short", "HEAD"])?;
+    if !sha.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&sha.stdout).trim().to_string())
+}
+
+/// Dispatch to the deterministic validator for `stage`. Public so the
+/// `evolvo_desktop validate` CLI can expose the exact gate to an
+/// in-worktree agent session (self-validation before exit).
+pub fn run_validator(
     stage: StageKind,
     plan: &IterationPlan,
     worktree: &Path,
@@ -537,6 +674,253 @@ mod tests {
                 "stage {s:?} should be done when plan Completed"
             );
         }
+    }
+
+    /// Scripted stand-in for the agent: records every dispatch (attempt +
+    /// previous_failure) and, from `fix_on_attempt` onward, writes a plan
+    /// that satisfies `validate_backend_plan`. Before that it leaves the
+    /// seeded (incomplete) plan in place so the validator rejects.
+    struct ScriptedDispatcher {
+        job_dir: PathBuf,
+        fix_on_attempt: u32,
+        calls: std::cell::RefCell<Vec<(u32, Option<String>)>>,
+    }
+
+    impl StageDispatcher for ScriptedDispatcher {
+        fn dispatch(&self, ctx: StageDispatch<'_>) -> Result<PathBuf, String> {
+            self.calls
+                .borrow_mut()
+                .push((ctx.attempt, ctx.previous_failure.clone()));
+            if ctx.attempt >= self.fix_on_attempt {
+                let mut plan = load_plan(&self.job_dir).unwrap().unwrap();
+                plan.canvas.png_path = Some("/tmp/canvas.png".into());
+                plan.backend.entities.push(crate::plan::EntityPlan {
+                    name: "Task".into(),
+                    fields: vec![],
+                    motivated_by_regions: vec!["R1".into()],
+                });
+                for verb in ["create_task", "list_tasks", "update_task", "delete_task"] {
+                    plan.backend.commands.push(crate::plan::CommandPlan {
+                        name: verb.into(),
+                        input: "Payload".into(),
+                        output: "Task".into(),
+                        motivated_by_regions: vec!["R1".into()],
+                        summary: "does the thing".into(),
+                        body_sketch:
+                            "1. Decode payload. 2. Persist via store.save_task. 3. Return record."
+                                .into(),
+                        anchors: vec!["save_task".into()],
+                    });
+                }
+                for t in ["create_persists", "list_returns_all", "delete_removes"] {
+                    plan.backend.tests.push(crate::plan::TestPlan {
+                        name: t.into(),
+                        module: "store::tests".into(),
+                        covers: "crud".into(),
+                    });
+                }
+                save_plan(&self.job_dir, &plan).unwrap();
+            }
+            let log = self.job_dir.join("logs").join("backend_plan.log");
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            std::fs::write(&log, "stub").unwrap();
+            Ok(log)
+        }
+    }
+
+    /// Store + engine + seeded job + seeded plan, ready for run_stage.
+    fn pipeline_fixture(tmp: &std::path::Path) -> (Store, String, PathBuf) {
+        let store = Store::new(tmp.to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = mk_feedback();
+        store.save_feedback(&fb).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, crate::types::AgentKind::default())
+            .unwrap();
+        engine.seed_stages(&job.id, StageKind::pipeline()).unwrap();
+        let job_dir = tmp.join("job-dir");
+        seed_plan_from_feedback(&store, &fb, &job.id, &job_dir, 1).unwrap();
+        (store, job.id, job_dir)
+    }
+
+    #[test]
+    fn run_stage_retries_with_failure_feedback_until_green() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+        let dispatcher = ScriptedDispatcher {
+            job_dir: job_dir.clone(),
+            fix_on_attempt: 2,
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let passed = run_stage(
+            &store,
+            &engine,
+            &dispatcher,
+            StageKind::BackendPlan,
+            &worktree,
+            &job_dir,
+            &job_id,
+        )
+        .unwrap();
+        assert!(passed, "second attempt should validate green");
+
+        let calls = dispatcher.calls.borrow();
+        assert_eq!(calls.len(), 2, "one initial dispatch + one Reflexion retry");
+        assert_eq!(calls[0].0, 1);
+        assert!(calls[0].1.is_none(), "first attempt carries no failure");
+        assert_eq!(calls[1].0, 2);
+        let feedback = calls[1].1.as_deref().expect("retry carries the report");
+        assert!(
+            feedback.contains("FAILED"),
+            "failure block lists failed checks: {feedback}"
+        );
+        assert!(
+            feedback.contains("canvas.pngPath"),
+            "the specific finding travels to the retry prompt: {feedback}"
+        );
+
+        let job = store.load_lineage_job(&job_id).unwrap().unwrap();
+        let stage = job
+            .stages
+            .iter()
+            .find(|s| s.kind == StageKind::BackendPlan)
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Green);
+        let plan = load_plan(&job_dir).unwrap().unwrap();
+        assert_eq!(plan.stage, PlanStage::BackendPlanned);
+    }
+
+    #[test]
+    fn run_stage_gives_up_after_max_attempts() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+        let dispatcher = ScriptedDispatcher {
+            job_dir: job_dir.clone(),
+            fix_on_attempt: u32::MAX, // never fixes the plan
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let passed = run_stage(
+            &store,
+            &engine,
+            &dispatcher,
+            StageKind::BackendPlan,
+            &worktree,
+            &job_dir,
+            &job_id,
+        )
+        .unwrap();
+        assert!(!passed);
+        assert_eq!(
+            dispatcher.calls.borrow().len() as u32,
+            MAX_STAGE_ATTEMPTS,
+            "every attempt dispatches, then the stage gives up"
+        );
+        let job = store.load_lineage_job(&job_id).unwrap().unwrap();
+        let stage = job
+            .stages
+            .iter()
+            .find(|s| s.kind == StageKind::BackendPlan)
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Failed);
+    }
+
+    #[test]
+    fn run_stage_treats_unparseable_plan_as_failed_attempt_not_error() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+
+        /// Corrupts plan.json on every dispatch — simulates an agent that
+        /// breaks the file. The stage must fail cleanly (with the parse
+        /// error fed back), not abort the pipeline with Err.
+        struct Corruptor {
+            job_dir: PathBuf,
+            calls: std::cell::RefCell<Vec<Option<String>>>,
+        }
+        impl StageDispatcher for Corruptor {
+            fn dispatch(&self, ctx: StageDispatch<'_>) -> Result<PathBuf, String> {
+                self.calls.borrow_mut().push(ctx.previous_failure.clone());
+                std::fs::write(self.job_dir.join(crate::plan::PLAN_FILENAME), "{not json").unwrap();
+                let log = self.job_dir.join("logs").join("x.log");
+                std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+                std::fs::write(&log, "stub").unwrap();
+                Ok(log)
+            }
+        }
+        let dispatcher = Corruptor {
+            job_dir: job_dir.clone(),
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let passed = run_stage(
+            &store,
+            &engine,
+            &dispatcher,
+            StageKind::BackendPlan,
+            &worktree,
+            &job_dir,
+            &job_id,
+        )
+        .unwrap();
+        assert!(!passed);
+        let calls = dispatcher.calls.borrow();
+        assert_eq!(calls.len() as u32, MAX_STAGE_ATTEMPTS);
+        let second = calls[1].as_deref().unwrap();
+        assert!(
+            second.contains("failed to parse"),
+            "parse error is fed back to the retry: {second}"
+        );
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn checkpoint_worktree_commits_dirty_state_and_skips_clean() {
+        let tmp = tempdir().unwrap();
+        let wt = tmp.path();
+        assert!(git(wt, &["init"]).status.success());
+        std::fs::write(wt.join("a.txt"), "v1").unwrap();
+
+        let sha = checkpoint_worktree(wt, StageKind::BackendImpl, "job-9");
+        assert!(sha.is_some(), "dirty worktree gets a checkpoint commit");
+        let log = git(wt, &["log", "-1", "--format=%s %an"]);
+        let line = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            line.contains("stage(backend_impl): green checkpoint — job job-9"),
+            "commit message: {line}"
+        );
+        assert!(
+            line.contains("Evolvo Pipeline"),
+            "pipeline identity: {line}"
+        );
+
+        // Clean tree → no checkpoint.
+        assert!(checkpoint_worktree(wt, StageKind::FrontendImpl, "job-9").is_none());
+    }
+
+    #[test]
+    fn checkpoint_worktree_is_noop_outside_git() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "v1").unwrap();
+        assert!(checkpoint_worktree(tmp.path(), StageKind::BackendImpl, "job-9").is_none());
     }
 
     #[test]

@@ -81,9 +81,55 @@ impl StageReport {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }
+
+    /// Render the failed checks as a prompt-ready block. This is what a
+    /// Reflexion retry feeds back to the agent, so it lists only the
+    /// failures, verbatim, with per-check detail capped so one noisy
+    /// cargo error can't blow the prompt budget.
+    pub fn failure_block(&self) -> String {
+        const MAX_DETAIL_CHARS: usize = 500;
+        let mut out = format!("validator `{}` rejected: {}\n", self.stage, self.headline);
+        for c in self.checks.iter().filter(|c| !c.passed) {
+            let detail: String = if c.detail.chars().count() > MAX_DETAIL_CHARS {
+                let truncated: String = c.detail.chars().take(MAX_DETAIL_CHARS).collect();
+                format!("{truncated}… (truncated)")
+            } else {
+                c.detail.clone()
+            };
+            out.push_str(&format!("- FAILED {}: {}\n", c.name, detail));
+        }
+        out
+    }
+
+    /// Render the full checklist for terminal output (`evolvo_desktop
+    /// validate`). One line per check, pass/fail marker first so an agent
+    /// can grep `^FAIL`.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        for c in &self.checks {
+            let marker = if c.passed { "ok  " } else { "FAIL" };
+            out.push_str(&format!("{marker}  {} — {}\n", c.name, c.detail));
+        }
+        out.push_str(&format!(
+            "\n{}: {}\n",
+            if self.passed { "PASSED" } else { "REJECTED" },
+            self.headline
+        ));
+        out
+    }
 }
 
-/// --- Planner validators (read-only: inspect `plan.json` structure). ---
+/// Build a single-check failed report outside the normal validators —
+/// used when the stage can't even be validated (plan.json missing or
+/// unparseable after the agent ran), so the failure still flows through
+/// the same StageReport machinery as a real rejection.
+pub fn report_failure(stage: &str, check_name: &str, detail: &str) -> StageReport {
+    let mut r = StageReport::new(stage);
+    r.push(check_name, false, detail);
+    r.finalize()
+}
+
+// --- Planner validators (read-only: inspect `plan.json` structure). ---
 
 pub fn validate_backend_plan(plan: &IterationPlan) -> StageReport {
     let mut r = StageReport::new("backend_plan");
@@ -292,7 +338,7 @@ pub fn validate_e2e_plan(plan: &IterationPlan) -> StageReport {
     r.finalize()
 }
 
-/// --- Impl validators (inspect worktree files + run cargo). ---
+// --- Impl validators (inspect worktree files + run cargo). ---
 
 pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageReport {
     let mut r = StageReport::new("backend_impl");
@@ -617,7 +663,11 @@ pub fn validate_final(plan: &IterationPlan, worktree: &Path) -> StageReport {
     if plan.app.iteration <= 1 {
         let claude_md_path = worktree.join("CLAUDE.md");
         let (passed, detail) = check_claude_md_rewritten(&claude_md_path);
-        r.push("CLAUDE.md rewritten for new app (iteration 1)", passed, detail);
+        r.push(
+            "CLAUDE.md rewritten for new app (iteration 1)",
+            passed,
+            detail,
+        );
     }
     r.finalize()
 }
@@ -683,9 +733,9 @@ fn effective_anchors(cmd: &crate::plan::CommandPlan) -> Vec<String> {
 
 const ANCHOR_STOPWORDS: &[&str] = &[
     "and", "the", "for", "into", "from", "with", "return", "returns", "self", "Self", "store",
-    "result", "ok", "err", "true", "false", "let", "mut", "fn", "pub", "use", "ref", "match",
-    "if", "else", "loop", "while", "as", "in", "of", "to", "on", "this", "that", "then",
-    "build", "make", "call", "id", "rec", "row", "row_id", "value", "string", "vec", "option",
+    "result", "ok", "err", "true", "false", "let", "mut", "fn", "pub", "use", "ref", "match", "if",
+    "else", "loop", "while", "as", "in", "of", "to", "on", "this", "that", "then", "build", "make",
+    "call", "id", "rec", "row", "row_id", "value", "string", "vec", "option",
 ];
 
 fn extract_identifier_anchors(sketch: &str) -> Vec<String> {
@@ -906,7 +956,7 @@ fn has_stub_smell(body: &str) -> bool {
             let pos = start + rel + default.len();
             // Walk forward past whitespace; if we hit `}` before any
             // other non-whitespace character, this is a trailing return.
-            let rest = body[pos..].as_bytes();
+            let rest = &body.as_bytes()[pos..];
             let mut i = 0;
             while i < rest.len() && (rest[i] == b' ' || rest[i] == b'\n' || rest[i] == b'\t') {
                 i += 1;
@@ -968,6 +1018,44 @@ mod tests {
         EntityPlan, FieldPlan, FrontendBudget, FrontendSection, IterationPlan, PlanStage, TestPlan,
     };
 
+    #[test]
+    fn failure_block_lists_only_failed_checks_and_caps_detail() {
+        let mut r = StageReport::new("backend_impl");
+        r.push("compiles", true, "ok");
+        r.push("tests pass", false, "x".repeat(900));
+        r.push("commands registered", false, "missing: create_task");
+        let r = r.finalize();
+
+        let block = r.failure_block();
+        assert!(block.contains("validator `backend_impl` rejected"));
+        assert!(!block.contains("compiles"), "passed checks excluded");
+        assert!(block.contains("FAILED tests pass"));
+        assert!(block.contains("FAILED commands registered: missing: create_task"));
+        assert!(block.contains("(truncated)"), "long detail capped");
+        assert!(block.len() < 900, "block stays prompt-sized");
+    }
+
+    #[test]
+    fn report_failure_builds_single_check_rejection() {
+        let r = report_failure("backend_plan", "plan.json parses", "expected `,` at line 3");
+        assert!(!r.passed);
+        assert_eq!(r.stage, "backend_plan");
+        assert_eq!(r.checks.len(), 1);
+        assert!(r.headline.contains("plan.json parses"));
+        assert!(r.failure_block().contains("expected `,` at line 3"));
+    }
+
+    #[test]
+    fn render_text_marks_failures_greppably() {
+        let mut r = StageReport::new("e2e_plan");
+        r.push("scenarios present", true, "2 scenarios");
+        r.push("persistence smoke", false, "missing");
+        let text = r.finalize().render_text();
+        assert!(text.contains("ok    scenarios present"));
+        assert!(text.contains("FAIL  persistence smoke — missing"));
+        assert!(text.contains("REJECTED:"));
+    }
+
     fn seed_plan() -> IterationPlan {
         IterationPlan {
             schema_version: 1,
@@ -1005,8 +1093,7 @@ mod tests {
                         motivated_by_regions: vec!["R1".into()],
                         summary: "".into(),
                         body_sketch:
-                            "Generate id, build Project, save via store.save_project(rec)."
-                                .into(),
+                            "Generate id, build Project, save via store.save_project(rec).".into(),
                         anchors: vec!["save_project".into()],
                     },
                     CommandPlan {
@@ -1306,8 +1393,9 @@ mod tests {
                     output: "Expense".into(),
                     motivated_by_regions: vec![],
                     summary: "Persist an expense.".into(),
-                    body_sketch: "Generate id, build Expense, persist via store.save_expense, return rec."
-                        .into(),
+                    body_sketch:
+                        "Generate id, build Expense, persist via store.save_expense, return rec."
+                            .into(),
                     anchors: vec!["save_expense".into(), "current_time_unix_ms".into()],
                 }],
                 ..Default::default()
@@ -1335,7 +1423,10 @@ mod tests {
         // Sanity: anchors are NOT in the wrapper alone — that's the
         // condition that produced the original false positive.
         let wrapper_only_hit = anchors.iter().any(|a| wrapper_body.contains(a.as_str()));
-        assert!(!wrapper_only_hit, "regression: wrapper alone now contains an anchor — test premise broken");
+        assert!(
+            !wrapper_only_hit,
+            "regression: wrapper alone now contains an anchor — test premise broken"
+        );
     }
 
     #[test]
@@ -1365,16 +1456,15 @@ mod tests {
 
         let f5 = crate::plan::budget_floor_for_regions(5);
         assert_eq!(f5.min_commands, 10); // 5 * 2
-        assert_eq!(f5.min_entities, 2);  // 5 / 2
+        assert_eq!(f5.min_entities, 2); // 5 / 2
         assert_eq!(f5.min_tests, 5);
     }
 
     #[test]
     fn validate_backend_plan_enforces_region_floor_even_when_budget_low() {
         use crate::plan::{
-            AppIdentity, BackendBudget, BackendSection, CanvasReference, CanvasRegion,
-            CommandPlan, EntityPlan, FieldPlan, IterationPlan, PlanStage, TestPlan,
-            PLAN_SCHEMA_VERSION,
+            AppIdentity, BackendBudget, BackendSection, CanvasReference, CanvasRegion, CommandPlan,
+            EntityPlan, FieldPlan, IterationPlan, PlanStage, TestPlan, PLAN_SCHEMA_VERSION,
         };
         let mut plan = IterationPlan {
             schema_version: PLAN_SCHEMA_VERSION,
@@ -1408,13 +1498,25 @@ mod tests {
                         ty: "String".into(),
                         required: true,
                     }],
-                    motivated_by_regions: vec!["R1".into(), "R2".into(), "R3".into(), "R4".into(), "R5".into()],
+                    motivated_by_regions: vec![
+                        "R1".into(),
+                        "R2".into(),
+                        "R3".into(),
+                        "R4".into(),
+                        "R5".into(),
+                    ],
                 }],
                 commands: vec![CommandPlan {
                     name: "list_tasks".into(),
                     input: "()".into(),
                     output: "Vec<Task>".into(),
-                    motivated_by_regions: vec!["R1".into(), "R2".into(), "R3".into(), "R4".into(), "R5".into()],
+                    motivated_by_regions: vec![
+                        "R1".into(),
+                        "R2".into(),
+                        "R3".into(),
+                        "R4".into(),
+                        "R5".into(),
+                    ],
                     summary: "".into(),
                     body_sketch: "Call store.list_tasks() and return the vector.".into(),
                     anchors: vec!["list_tasks".into()],
@@ -1464,8 +1566,7 @@ mod tests {
     #[test]
     fn validate_backend_plan_requires_body_sketch() {
         use crate::plan::{
-            AppIdentity, BackendSection, CommandPlan, IterationPlan, PlanStage,
-            PLAN_SCHEMA_VERSION,
+            AppIdentity, BackendSection, CommandPlan, IterationPlan, PlanStage, PLAN_SCHEMA_VERSION,
         };
         let plan = IterationPlan {
             schema_version: PLAN_SCHEMA_VERSION,

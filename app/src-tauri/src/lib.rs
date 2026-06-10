@@ -9,6 +9,7 @@ pub mod stages;
 pub mod state;
 pub mod store;
 pub mod types;
+pub mod validate_cli;
 pub mod validators;
 
 pub use agent::{backend_for, AgentBackend};

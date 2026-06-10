@@ -35,3 +35,18 @@ wrote — if you only "described" it, they see nothing.
 Never paraphrase the canvas. If your output mentions the drawing, cite the
 region ids (`R1`, `R2`, …) from `{{REGION_INDEX}}` and re-read
 `{{CANVAS_PNG}}` in this session.
+
+## Blocks the runner appends to every stage prompt
+
+Beyond the template file, `build_stage_prompt` (runner.rs) appends:
+
+- `_self_validate.md` — instructions for running the stage's deterministic
+  validator from inside the session via `$EVOLVO_VALIDATE_BIN validate
+  --stage <slug> ...`. Substitutes `{{STAGE_SLUG}}`, `{{JOB_DIR}}`,
+  `{{WORKTREE}}`.
+- **On Reflexion retries only**: a "Previous attempt failed validation"
+  section carrying the failed checks from the prior attempt's
+  `StageReport`. A stage gets up to `MAX_STAGE_ATTEMPTS` (currently 3)
+  dispatches before the pipeline gives up; retries run against the
+  worktree state the failed attempt left behind, and each retry's
+  transcript lands in `logs/<slug>.attempt<N>.log`.

@@ -4,6 +4,14 @@ use evolvo_desktop::commands;
 use evolvo_desktop::state::AppState;
 
 fn main() {
+    // Headless `validate` subcommand: lets an in-worktree agent session run
+    // the exact stage gate the pipeline will apply (see validate_cli.rs).
+    // Handled before the Tauri builder so no window/IPC is ever set up.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("validate") {
+        std::process::exit(evolvo_desktop::validate_cli::main(&argv[2..]));
+    }
+
     tauri::Builder::default()
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
