@@ -1487,3 +1487,35 @@ button {
     background: rgba(15, 23, 42, 0.05);
     color: var(--fg);
 }
+
+/* Planner's open questions — guesses recorded in plan.json. Highlighted
+   when the job is parked in Planned by the plan-review gate. */
+.plan-questions {
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+}
+
+.plan-questions h4 {
+    margin: 0 0 4px 0;
+    font-size: 13px;
+}
+
+.plan-questions-hint {
+    margin: 0 0 6px 0;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.plan-questions-list {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.plan-questions-review {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+}

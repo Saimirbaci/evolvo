@@ -28,7 +28,9 @@ use crate::canvas::{CanvasController, CanvasSurface};
 use crate::feedback_panel::FeedbackPanel;
 use crate::interop;
 use crate::toolbar::Toolbar;
-use crate::types::{AppHealth, DelegationSummary, LineageJobRecord, PreviewSummary};
+use crate::types::{
+    AppHealth, DelegationSummary, LineageJobRecord, LineageJobStatus, PreviewSummary,
+};
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
 /// moves. Kept as a constant rather than a build-time env var so the binary
@@ -734,6 +736,32 @@ fn LineageDetail(
     let stages = record.stages.clone();
     let agent_label = record.agent.label();
 
+    // Planner's open questions from plan.json — the guesses it recorded on
+    // ambiguous points. Most important while the job is parked in `Planned`
+    // by the plan-review gate, but shown whenever non-empty so the context
+    // survives into implementation. Fetched once per detail construction
+    // (the component is rebuilt on every poll tick anyway).
+    let open_questions: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    let awaiting_plan_review = matches!(record.status, LineageJobStatus::Planned);
+    {
+        let id = record.id.clone();
+        spawn_local(async move {
+            if let Ok(Some(plan)) = interop::read_job_plan(&id).await {
+                let qs: Vec<String> = plan
+                    .get("openQuestions")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|q| q.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                open_questions.set(qs);
+            }
+        });
+    }
+
     // Per-job delegation telemetry (pi-events.jsonl). `None` either
     // means "not yet loaded" or "this job didn't run delegations".
     // Re-fetched on every `reload` tick so the panel reflects new
@@ -771,6 +799,33 @@ fn LineageDetail(
             </header>
 
             <p class="lineage-detail-summary">{summary}</p>
+
+            {move || {
+                let qs = open_questions.get();
+                if qs.is_empty() {
+                    return view! { <span></span> }.into_any();
+                }
+                let class = if awaiting_plan_review {
+                    "plan-questions plan-questions-review"
+                } else {
+                    "plan-questions"
+                };
+                view! {
+                    <section class=class aria-label="Planner's open questions">
+                        <h4>"Planner's open questions"</h4>
+                        <p class="plan-questions-hint">
+                            {if awaiting_plan_review {
+                                "The plan is paused for your review. These are the guesses the planner made on ambiguous points — Approve to accept them, or Reject and resubmit feedback with answers."
+                            } else {
+                                "Guesses the planner recorded on ambiguous points in this iteration's plan."
+                            }}
+                        </p>
+                        <ul class="plan-questions-list">
+                            {qs.into_iter().map(|q| view! { <li>{q}</li> }).collect_view()}
+                        </ul>
+                    </section>
+                }.into_any()
+            }}
 
             {match branch {
                 Some(b) => view! {

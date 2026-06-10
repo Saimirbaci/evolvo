@@ -1727,6 +1727,58 @@ pub fn launch_pipeline(
     });
 }
 
+/// Most recent green-checkpoint commit in a lineage worktree, if any.
+/// Checkpoints are written by `stages::checkpoint_worktree` with the
+/// message `stage(<slug>): green checkpoint — job <id>` after each stage
+/// validates green.
+pub fn last_green_checkpoint(worktree: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args([
+            "log",
+            "--grep",
+            "green checkpoint — job",
+            "-n",
+            "1",
+            "--format=%H",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Hard-reset a lineage worktree to `sha` and drop all uncommitted debris
+/// (including untracked files a failed stage left behind). Used by the
+/// soft-retry path so a retry restarts from the last green stage instead
+/// of throwing the whole worktree away.
+pub fn reset_worktree_to(worktree: &Path, sha: &str) -> Result<(), String> {
+    let run = |args: &[&str]| -> Result<(), String> {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(args)
+            .output()
+            .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+        if st.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&st.stderr).trim()
+            ))
+        }
+    };
+    run(&["reset", "--hard", sha])?;
+    run(&["clean", "-fd"])?;
+    Ok(())
+}
+
 /// Startup crash recovery: a job left in `Implementing` after the host
 /// process died has no runner thread anymore (threads don't survive the
 /// process), so without this it sits "running" forever with no way to act
@@ -2328,6 +2380,76 @@ mod tests {
                 "{kind:?} left {{{{PORT}}}} unsubstituted"
             );
         }
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn git_commit_all(dir: &Path, msg: &str) {
+        assert!(git_in(dir, &["add", "-A"]).status.success());
+        assert!(git_in(
+            dir,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@local",
+                "commit",
+                "-m",
+                msg,
+            ]
+        )
+        .status
+        .success());
+    }
+
+    #[test]
+    fn last_green_checkpoint_finds_only_checkpoint_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path();
+        assert!(git_in(wt, &["init"]).status.success());
+        std::fs::write(wt.join("a.txt"), "v1").unwrap();
+        git_commit_all(wt, "feat: initial work");
+        assert_eq!(
+            last_green_checkpoint(wt),
+            None,
+            "ordinary commits are not checkpoints"
+        );
+
+        std::fs::write(wt.join("a.txt"), "v2").unwrap();
+        git_commit_all(wt, "stage(backend_impl): green checkpoint — job job-7");
+        let sha = last_green_checkpoint(wt).expect("checkpoint commit found");
+        let head = String::from_utf8_lossy(&git_in(wt, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(sha, head);
+    }
+
+    #[test]
+    fn reset_worktree_to_discards_failed_attempt_debris() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path();
+        assert!(git_in(wt, &["init"]).status.success());
+        std::fs::write(wt.join("a.txt"), "green").unwrap();
+        git_commit_all(wt, "stage(backend_impl): green checkpoint — job job-7");
+        let sha = last_green_checkpoint(wt).unwrap();
+
+        // A failed attempt edits a tracked file and leaves untracked junk.
+        std::fs::write(wt.join("a.txt"), "broken edit").unwrap();
+        std::fs::write(wt.join("junk.rs"), "half-written").unwrap();
+
+        reset_worktree_to(wt, &sha).unwrap();
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "green");
+        assert!(
+            !wt.join("junk.rs").exists(),
+            "untracked debris must be cleaned"
+        );
     }
 
     #[test]

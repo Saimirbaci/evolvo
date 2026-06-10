@@ -481,20 +481,16 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
     );
 
     // `cargo check -p evolvo_desktop` must pass — and so must `cargo test`.
-    match run_cargo(worktree, &["check", "-p", "evolvo_desktop"]) {
-        Ok(true) => r.push("cargo check -p evolvo_desktop", true, "ok"),
-        Ok(false) => r.push("cargo check -p evolvo_desktop", false, "exited non-zero"),
-        Err(e) => r.push("cargo check -p evolvo_desktop", false, e),
-    }
-    match run_cargo(worktree, &["test", "-p", "evolvo_desktop", "--lib"]) {
-        Ok(true) => r.push("cargo test -p evolvo_desktop --lib", true, "ok"),
-        Ok(false) => r.push(
-            "cargo test -p evolvo_desktop --lib",
-            false,
-            "exited non-zero",
-        ),
-        Err(e) => r.push("cargo test -p evolvo_desktop --lib", false, e),
-    }
+    push_tool_gate(
+        &mut r,
+        "cargo check -p evolvo_desktop",
+        run_cargo(worktree, &["check", "-p", "evolvo_desktop"]),
+    );
+    push_tool_gate(
+        &mut r,
+        "cargo test -p evolvo_desktop --lib",
+        run_cargo(worktree, &["test", "-p", "evolvo_desktop", "--lib"]),
+    );
     r.finalize()
 }
 
@@ -581,20 +577,20 @@ pub fn validate_frontend_impl(
         _ => { /* first check already reported the missing file */ }
     }
 
-    match run_cargo(
-        worktree,
-        &[
-            "check",
-            "-p",
-            "evolvo_ui",
-            "--target",
-            "wasm32-unknown-unknown",
-        ],
-    ) {
-        Ok(true) => r.push("cargo check -p evolvo_ui (wasm)", true, "ok"),
-        Ok(false) => r.push("cargo check -p evolvo_ui (wasm)", false, "exited non-zero"),
-        Err(e) => r.push("cargo check -p evolvo_ui (wasm)", false, e),
-    }
+    push_tool_gate(
+        &mut r,
+        "cargo check -p evolvo_ui (wasm)",
+        run_cargo(
+            worktree,
+            &[
+                "check",
+                "-p",
+                "evolvo_ui",
+                "--target",
+                "wasm32-unknown-unknown",
+            ],
+        ),
+    );
     r.finalize()
 }
 
@@ -670,6 +666,45 @@ pub fn validate_final(plan: &IterationPlan, worktree: &Path) -> StageReport {
         );
     }
 
+    // Product-invariant grep gates (I-P1..I-P3b). The NewApp content area
+    // (`app.rs`) may be rewritten freely, but the invariant chrome must
+    // survive every iteration: shell.rs keeps the single Feedback FAB and
+    // its one `panel_open` signal, app.rs keeps mounting <Shell>, and the
+    // overlay CSS keeps `.canvas-overlay`. Previously these were enforced
+    // only by prompt prose — and regressed more than once. Only checkable
+    // on the stock stack; a rewritten stack is reviewed by hand.
+    let shell_rs_path = worktree.join("app/ui/src/shell.rs");
+    if shell_rs_path.exists() {
+        let shell_body = read(&shell_rs_path);
+        r.push(
+            "shell.rs keeps FeedbackFab + panel_open (I-P3b)",
+            shell_body.contains("FeedbackFab") && shell_body.contains("panel_open"),
+            if shell_body.contains("FeedbackFab") {
+                "panel_open signal missing from shell.rs".to_string()
+            } else {
+                "FeedbackFab missing from shell.rs — the single feedback trigger is invariant chrome".to_string()
+            },
+        );
+        let app_body = read(&worktree.join("app/ui/src/app.rs"));
+        r.push(
+            "app.rs still mounts <Shell> (I-P1/I-P2/I-P3)",
+            app_body.contains("Shell"),
+            "NewApp content must render inside <Shell> so Lineage + Feedback overlay stay reachable",
+        );
+        let styles_body = read(&worktree.join("app/ui/styles.css"));
+        r.push(
+            ".canvas-overlay styles present (I-P3)",
+            styles_body.contains(".canvas-overlay"),
+            "canvas overlay CSS removed — the per-page annotation overlay would not render",
+        );
+    } else {
+        r.push(
+            "shell invariants (I-P1..I-P3b)",
+            true,
+            "no app/ui/src/shell.rs — stack rewritten; invariants must be reviewed by hand",
+        );
+    }
+
     // The frontend must actually BUILD, not just type-check. `cargo check`
     // passes while Trunk fails on index.html asset errors, hook scripts, or
     // wasm-bindgen version drift — and a Trunk failure means the reviewer's
@@ -678,15 +713,11 @@ pub fn validate_final(plan: &IterationPlan, worktree: &Path) -> StageReport {
     // covered by the e2e run-iteration.sh check instead.
     let ui_dir = worktree.join("app/ui");
     if ui_dir.join("Trunk.toml").exists() {
-        match run_tool(&ui_dir, "trunk", &["build"]) {
-            Ok(true) => r.push("trunk build (app/ui)", true, "ok"),
-            Ok(false) => r.push(
-                "trunk build (app/ui)",
-                false,
-                "exited non-zero — the frontend does not build; run `trunk build` in app/ui for the error",
-            ),
-            Err(e) => r.push("trunk build (app/ui)", false, e),
-        }
+        push_tool_gate(
+            &mut r,
+            "trunk build (app/ui)",
+            run_tool(&ui_dir, "trunk", &["build"]),
+        );
     } else {
         r.push(
             "trunk build (app/ui)",
@@ -714,34 +745,34 @@ pub fn validate_build_gates(worktree: &Path) -> StageReport {
         );
         return r.finalize();
     }
-    match run_cargo(worktree, &["check", "--workspace"]) {
-        Ok(true) => r.push("cargo check --workspace", true, "ok"),
-        Ok(false) => r.push("cargo check --workspace", false, "exited non-zero"),
-        Err(e) => r.push("cargo check --workspace", false, e),
-    }
-    match run_cargo(worktree, &["test", "--workspace", "--lib"]) {
-        Ok(true) => r.push("cargo test --workspace --lib", true, "ok"),
-        Ok(false) => r.push("cargo test --workspace --lib", false, "exited non-zero"),
-        Err(e) => r.push("cargo test --workspace --lib", false, e),
-    }
+    push_tool_gate(
+        &mut r,
+        "cargo check --workspace",
+        run_cargo(worktree, &["check", "--workspace"]),
+    );
+    push_tool_gate(
+        &mut r,
+        "cargo test --workspace --lib",
+        run_cargo(worktree, &["test", "--workspace", "--lib"]),
+    );
     // The wasm target only applies while the stock UI crate is present —
     // a renamed/rewritten UI crate is allowed (freedom levels permit it).
     let ui_manifest = read(&worktree.join("app/ui/Cargo.toml"));
     if ui_manifest.contains("name = \"evolvo_ui\"") {
-        match run_cargo(
-            worktree,
-            &[
-                "check",
-                "-p",
-                "evolvo_ui",
-                "--target",
-                "wasm32-unknown-unknown",
-            ],
-        ) {
-            Ok(true) => r.push("cargo check -p evolvo_ui (wasm)", true, "ok"),
-            Ok(false) => r.push("cargo check -p evolvo_ui (wasm)", false, "exited non-zero"),
-            Err(e) => r.push("cargo check -p evolvo_ui (wasm)", false, e),
-        }
+        push_tool_gate(
+            &mut r,
+            "cargo check -p evolvo_ui (wasm)",
+            run_cargo(
+                worktree,
+                &[
+                    "check",
+                    "-p",
+                    "evolvo_ui",
+                    "--target",
+                    "wasm32-unknown-unknown",
+                ],
+            ),
+        );
     }
     r.finalize()
 }
@@ -994,6 +1025,12 @@ fn has_stub_smell(body: &str) -> bool {
     if body.contains("TODO") || body.contains("unimplemented!") || body.contains("todo!()") {
         return true;
     }
+    // `// FILL:` is the marker the prompts use for scaffold holes the
+    // implementer must replace — one surviving into a "done" stage means
+    // the work wasn't finished.
+    if body.contains("// FILL") || body.contains("FILL:") {
+        return true;
+    }
     // String-shaped bail-outs. Case-insensitive lookup on `not impl`
     // would over-match (e.g. "not implication"). We pin the patterns
     // to specific phrases known to appear in lazy stubs.
@@ -1081,28 +1118,81 @@ fn has_any_component(worktree: &Path, name: &str) -> bool {
 /// hung rustc / wasm-bindgen can't wedge the stage forever.
 const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-fn run_cargo(worktree: &Path, args: &[&str]) -> Result<bool, String> {
+/// Outcome of one build-tool run: exit success plus the tail of its
+/// combined stdout/stderr, so a failed check can say *what* broke instead
+/// of "exited non-zero" — that tail is exactly what the Reflexion retry
+/// prompt needs to fix the right thing.
+struct ToolRun {
+    success: bool,
+    tail: String,
+}
+
+fn run_cargo(worktree: &Path, args: &[&str]) -> Result<ToolRun, String> {
     run_tool(worktree, "cargo", args)
 }
 
-/// Run a build tool to completion (status only), with the process-group
-/// timeout from `proc.rs` and the GUI-safe PATH from the runner — a
-/// packaged app launched from Finder inherits a PATH without
-/// ~/.cargo/bin, which is where cargo and trunk actually live.
-fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<bool, String> {
+/// Run a build tool to completion with the process-group timeout from
+/// `proc.rs` and the GUI-safe PATH from the runner (a packaged app
+/// launched from Finder inherits a PATH without ~/.cargo/bin, which is
+/// where cargo and trunk actually live). Output is captured via a temp
+/// file — piping would deadlock once the child writes more than the pipe
+/// buffer, which cargo error output easily does.
+fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<ToolRun, String> {
+    let capture = tempfile::NamedTempFile::new().map_err(|e| format!("tool capture file: {e}"))?;
+    let out = capture
+        .reopen()
+        .map_err(|e| format!("reopen capture file: {e}"))?;
+    let err = out
+        .try_clone()
+        .map_err(|e| format!("clone capture handle: {e}"))?;
+
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(dir)
         .env("PATH", crate::runner::enriched_path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err));
     match crate::proc::run_with_timeout(&mut cmd, TOOL_TIMEOUT) {
-        Ok(crate::proc::WaitOutcome::Exited(s)) => Ok(s.success()),
+        Ok(crate::proc::WaitOutcome::Exited(s)) => Ok(ToolRun {
+            success: s.success(),
+            tail: read_tail(capture.path(), 1500),
+        }),
         Ok(crate::proc::WaitOutcome::TimedOut) => Err(format!(
             "{program} timed out after {}s (process group killed)",
             TOOL_TIMEOUT.as_secs()
         )),
         Err(e) => Err(format!("spawn {program}: {e}")),
+    }
+}
+
+/// Last `max_chars` of a file, lossily decoded. Best-effort — an
+/// unreadable capture file yields an empty tail, never an error.
+fn read_tail(path: &Path, max_chars: usize) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_end();
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.len().saturating_sub(max_chars);
+    chars[start..].iter().collect()
+}
+
+/// Push one tool-gate result onto the report, carrying the output tail
+/// into the detail on failure.
+fn push_tool_gate(r: &mut StageReport, name: &str, res: Result<ToolRun, String>) {
+    match res {
+        Ok(t) if t.success => r.push(name, true, "ok"),
+        Ok(t) => r.push(
+            name,
+            false,
+            if t.tail.is_empty() {
+                "exited non-zero (no output captured)".to_string()
+            } else {
+                format!("exited non-zero — output tail:\n{}", t.tail)
+            },
+        ),
+        Err(e) => r.push(name, false, e),
     }
 }
 
@@ -1899,6 +1989,80 @@ mod tests {
             .expect("trunk gate must always report");
         assert!(trunk.passed);
         assert!(trunk.detail.contains("skipped"), "{}", trunk.detail);
+    }
+
+    #[test]
+    fn stub_smell_catches_fill_markers() {
+        assert!(has_stub_smell("fn x() { // FILL: real query here\n }"));
+        assert!(has_stub_smell("let q = \"FILL: where clause\";"));
+        assert!(!has_stub_smell("fn x() { fulfill_order(); }"));
+    }
+
+    #[test]
+    fn read_tail_returns_last_chars_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("out.log");
+        std::fs::write(&p, format!("{}END", "x".repeat(5000))).unwrap();
+        let tail = read_tail(&p, 100);
+        assert_eq!(tail.chars().count(), 100);
+        assert!(tail.ends_with("END"));
+        assert!(read_tail(&tmp.path().join("missing"), 100).is_empty());
+    }
+
+    #[test]
+    fn final_review_invariant_gates_catch_missing_fab_and_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        let ui_dir = worktree.join("app/ui/src");
+        std::fs::create_dir_all(&ui_dir).unwrap();
+        // shell.rs lost the FAB; app.rs forgot to mount Shell; styles
+        // dropped the overlay. All three gates must go red.
+        std::fs::write(ui_dir.join("shell.rs"), "pub fn Shell() {}").unwrap();
+        std::fs::write(ui_dir.join("app.rs"), "fn HomePage() {}").unwrap();
+        std::fs::write(worktree.join("app/ui/styles.css"), "body {}").unwrap();
+
+        let mut plan = crate::plan::IterationPlan::default();
+        plan.app.iteration = 2;
+        plan.stage = crate::plan::PlanStage::E2EImplemented;
+        let report = validate_final(&plan, worktree);
+        for name in [
+            "shell.rs keeps FeedbackFab",
+            "app.rs still mounts",
+            ".canvas-overlay styles present",
+        ] {
+            let check = report
+                .checks
+                .iter()
+                .find(|c| c.name.contains(name))
+                .unwrap_or_else(|| panic!("missing check {name}"));
+            assert!(!check.passed, "{name} should be red: {}", check.detail);
+        }
+
+        // Restore the invariants — all three gates go green.
+        std::fs::write(
+            ui_dir.join("shell.rs"),
+            "pub fn Shell() { let panel_open = RwSignal::new(false); FeedbackFab(); }",
+        )
+        .unwrap();
+        std::fs::write(ui_dir.join("app.rs"), "view! { <Shell>..</Shell> }").unwrap();
+        std::fs::write(
+            worktree.join("app/ui/styles.css"),
+            ".canvas-overlay { background: transparent; }",
+        )
+        .unwrap();
+        let report = validate_final(&plan, worktree);
+        for name in [
+            "shell.rs keeps FeedbackFab",
+            "app.rs still mounts",
+            ".canvas-overlay styles present",
+        ] {
+            let check = report
+                .checks
+                .iter()
+                .find(|c| c.name.contains(name))
+                .unwrap();
+            assert!(check.passed, "{name} should be green: {}", check.detail);
+        }
     }
 
     #[test]

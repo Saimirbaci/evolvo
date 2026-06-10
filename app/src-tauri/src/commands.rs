@@ -463,11 +463,54 @@ pub fn retry_lineage_job(
         ));
     }
 
+    let workspace_root = store.layout().root().to_path_buf();
+
+    // Soft retry: when the multi-stage pipeline already banked green
+    // checkpoints in this worktree, reset to the last one and resume —
+    // the green stages' work survives and the Reflexion loop re-attacks
+    // only the failed stage. Far cheaper than rebuilding the worktree.
+    // Falls through to the destructive path when there's no checkpoint
+    // (legacy runs, or a pipeline that never went green) or the reset
+    // itself fails.
+    if let Some(worktree) = job
+        .worktree_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+    {
+        let job_dir = runner::job_workspace_dir(&workspace_root, &job.id);
+        if job_dir.join(crate::plan::PLAN_FILENAME).exists() {
+            if let Some(sha) = runner::last_green_checkpoint(&worktree) {
+                match runner::reset_worktree_to(&worktree, &sha) {
+                    Ok(()) => {
+                        let _ = engine.append_note(
+                            &job.id,
+                            &format!(
+                                "retry: worktree reset to last green checkpoint {} — resuming pipeline (green stages keep their work)",
+                                &sha[..sha.len().min(8)]
+                            ),
+                        );
+                        let updated = engine
+                            .force_status(&job.id, LineageJobStatus::Implementing)
+                            .map_err(store_error)?;
+                        runner::resume_pipeline(store.clone(), job.id.clone())?;
+                        return Ok(updated);
+                    }
+                    Err(e) => {
+                        let _ = engine.append_note(
+                            &job.id,
+                            &format!("retry: checkpoint reset failed ({e}) — falling back to full teardown"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     let source = runner::resolve_source_repo().ok_or_else(|| {
         "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
             .to_string()
     })?;
-    let workspace_root = store.layout().root().to_path_buf();
     runner::cleanup_previous_run(&source, &workspace_root, &job.id).map_err(|e| {
         let msg = store_error(e);
         let _ = engine.append_note(&job.id, &format!("retry cleanup failed: {msg}"));
