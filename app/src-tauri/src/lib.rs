@@ -4,6 +4,7 @@ pub mod commands;
 pub mod delegation;
 pub mod lineage;
 pub mod plan;
+pub mod proc;
 pub mod runner;
 pub mod stages;
 pub mod state;

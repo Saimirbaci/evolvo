@@ -669,6 +669,80 @@ pub fn validate_final(plan: &IterationPlan, worktree: &Path) -> StageReport {
             detail,
         );
     }
+
+    // The frontend must actually BUILD, not just type-check. `cargo check`
+    // passes while Trunk fails on index.html asset errors, hook scripts, or
+    // wasm-bindgen version drift — and a Trunk failure means the reviewer's
+    // Run lands on a blank WebView. Gate on `trunk build` whenever the
+    // standard UI stack is present; a rewritten stack (no Trunk.toml) is
+    // covered by the e2e run-iteration.sh check instead.
+    let ui_dir = worktree.join("app/ui");
+    if ui_dir.join("Trunk.toml").exists() {
+        match run_tool(&ui_dir, "trunk", &["build"]) {
+            Ok(true) => r.push("trunk build (app/ui)", true, "ok"),
+            Ok(false) => r.push(
+                "trunk build (app/ui)",
+                false,
+                "exited non-zero — the frontend does not build; run `trunk build` in app/ui for the error",
+            ),
+            Err(e) => r.push("trunk build (app/ui)", false, e),
+        }
+    } else {
+        r.push(
+            "trunk build (app/ui)",
+            true,
+            "no app/ui/Trunk.toml — stack rewritten, skipped",
+        );
+    }
+    r.finalize()
+}
+
+/// Build gates for **single-session (legacy) lineage runs** — every
+/// non-NewApp feedback. Exit code 0 from the agent CLI means "the agent
+/// process didn't crash", not "the change is good"; the runner calls this
+/// before flipping such a job to `BuildReady`. The checks are the repo's
+/// own commit contract, made tolerant of rewritten stacks: no root
+/// Cargo.toml → gates are skipped with an explicit note rather than
+/// failing a stack we can't recognise.
+pub fn validate_build_gates(worktree: &Path) -> StageReport {
+    let mut r = StageReport::new("build_gates");
+    if !worktree.join("Cargo.toml").exists() {
+        r.push(
+            "cargo workspace present",
+            true,
+            "no root Cargo.toml — stack rewritten; build gates skipped",
+        );
+        return r.finalize();
+    }
+    match run_cargo(worktree, &["check", "--workspace"]) {
+        Ok(true) => r.push("cargo check --workspace", true, "ok"),
+        Ok(false) => r.push("cargo check --workspace", false, "exited non-zero"),
+        Err(e) => r.push("cargo check --workspace", false, e),
+    }
+    match run_cargo(worktree, &["test", "--workspace", "--lib"]) {
+        Ok(true) => r.push("cargo test --workspace --lib", true, "ok"),
+        Ok(false) => r.push("cargo test --workspace --lib", false, "exited non-zero"),
+        Err(e) => r.push("cargo test --workspace --lib", false, e),
+    }
+    // The wasm target only applies while the stock UI crate is present —
+    // a renamed/rewritten UI crate is allowed (freedom levels permit it).
+    let ui_manifest = read(&worktree.join("app/ui/Cargo.toml"));
+    if ui_manifest.contains("name = \"evolvo_ui\"") {
+        match run_cargo(
+            worktree,
+            &[
+                "check",
+                "-p",
+                "evolvo_ui",
+                "--target",
+                "wasm32-unknown-unknown",
+            ],
+        ) {
+            Ok(true) => r.push("cargo check -p evolvo_ui (wasm)", true, "ok"),
+            Ok(false) => r.push("cargo check -p evolvo_ui (wasm)", false, "exited non-zero"),
+            Err(e) => r.push("cargo check -p evolvo_ui (wasm)", false, e),
+        }
+    }
     r.finalize()
 }
 
@@ -1001,13 +1075,35 @@ fn has_any_component(worktree: &Path, name: &str) -> bool {
     false
 }
 
+/// Hard ceiling for one build-tool invocation inside a validator. A
+/// cold-worktree `cargo check` of the Tauri stack takes single-digit
+/// minutes; 15 gives slow machines headroom while still guaranteeing a
+/// hung rustc / wasm-bindgen can't wedge the stage forever.
+const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 fn run_cargo(worktree: &Path, args: &[&str]) -> Result<bool, String> {
-    let out = Command::new("cargo")
-        .args(args)
-        .current_dir(worktree)
-        .output()
-        .map_err(|e| format!("spawn cargo: {e}"))?;
-    Ok(out.status.success())
+    run_tool(worktree, "cargo", args)
+}
+
+/// Run a build tool to completion (status only), with the process-group
+/// timeout from `proc.rs` and the GUI-safe PATH from the runner — a
+/// packaged app launched from Finder inherits a PATH without
+/// ~/.cargo/bin, which is where cargo and trunk actually live.
+fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<bool, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(dir)
+        .env("PATH", crate::runner::enriched_path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match crate::proc::run_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+        Ok(crate::proc::WaitOutcome::Exited(s)) => Ok(s.success()),
+        Ok(crate::proc::WaitOutcome::TimedOut) => Err(format!(
+            "{program} timed out after {}s (process group killed)",
+            TOOL_TIMEOUT.as_secs()
+        )),
+        Err(e) => Err(format!("spawn {program}: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -1784,5 +1880,35 @@ mod tests {
                 .any(|c| c.name.contains("CLAUDE.md rewritten")),
             "rewrite check should not fire on iteration 2+"
         );
+    }
+
+    #[test]
+    fn final_review_skips_trunk_build_when_stack_rewritten() {
+        // No app/ui/Trunk.toml in the worktree → the trunk gate records a
+        // pass with an explicit "skipped" detail instead of failing a
+        // stack it can't recognise.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut plan = crate::plan::IterationPlan::default();
+        plan.app.iteration = 2;
+        plan.stage = crate::plan::PlanStage::E2EImplemented;
+        let report = validate_final(&plan, tmp.path());
+        let trunk = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("trunk build"))
+            .expect("trunk gate must always report");
+        assert!(trunk.passed);
+        assert!(trunk.detail.contains("skipped"), "{}", trunk.detail);
+    }
+
+    #[test]
+    fn build_gates_skip_cleanly_on_rewritten_stack() {
+        // A worktree with no root Cargo.toml (fully rewritten stack) must
+        // not be failed by gates that assume the stock layout.
+        let tmp = tempfile::tempdir().unwrap();
+        let report = validate_build_gates(tmp.path());
+        assert!(report.passed);
+        assert_eq!(report.checks.len(), 1);
+        assert!(report.checks[0].detail.contains("skipped"));
     }
 }

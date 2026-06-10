@@ -954,17 +954,56 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
 
         match status {
             Ok(s) if s.success() => {
-                let _ = engine.append_note(
-                    &job_id,
-                    &format!("{} completed successfully", agent.label()),
-                );
-                let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
-            }
-            Ok(s) => {
+                // Exit 0 means "the agent process didn't crash", not "the
+                // change is good". Honour the agent's own STAGE_RESULT
+                // verdict, then run the build gates, before promoting.
+                if let Some(decl) = read_stage_result(&prepared.log_file).filter(|d| !d.ok) {
+                    let _ = engine.append_note(
+                        &job_id,
+                        &format!(
+                            "{} exited 0 but declared STAGE_RESULT: fail: {} — see log {}",
+                            agent.label(),
+                            decl.reason.as_deref().unwrap_or("<no reason given>"),
+                            prepared.log_file.display()
+                        ),
+                    );
+                    let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                    return;
+                }
+
                 let _ = engine.append_note(
                     &job_id,
                     &format!(
-                        "{} exited with status {s} — see log {}",
+                        "{} completed — running build gates before marking build ready",
+                        agent.label()
+                    ),
+                );
+                let gates = crate::validators::validate_build_gates(&prepared.worktree);
+                if gates.passed {
+                    let _ = engine
+                        .append_note(&job_id, &format!("build gates passed — {}", gates.headline));
+                    let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
+                } else {
+                    let _ = engine.append_note(
+                        &job_id,
+                        &format!(
+                            "build gates rejected the worktree:\n{}",
+                            gates.failure_block()
+                        ),
+                    );
+                    let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                }
+            }
+            Ok(s) => {
+                let declared = read_stage_result(&prepared.log_file)
+                    .filter(|d| !d.ok)
+                    .and_then(|d| d.reason)
+                    .map(|r| format!(" (agent declared: {r})"))
+                    .unwrap_or_default();
+                let _ = engine.append_note(
+                    &job_id,
+                    &format!(
+                        "{} exited with status {s}{declared} — see log {}",
                         agent.label(),
                         prepared.log_file.display()
                     ),
