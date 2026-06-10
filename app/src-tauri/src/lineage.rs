@@ -23,6 +23,27 @@ pub struct LineageEngine<'a> {
     store: &'a Store,
 }
 
+/// Per-job write lock serialising every load-mutate-save on a
+/// `LineageJobRecord`. The runner thread and the Tauri command thread both
+/// mutate the same JSON file through this engine; without the lock, two
+/// interleaved read-modify-write cycles silently drop one side's update
+/// (e.g. a note appended by the runner vanishes when a status write from
+/// the main thread lands a millisecond later — the race documented at
+/// `commands::resume_lineage_job`). Process-wide because engines are
+/// constructed ad-hoc per call; atomic file writes alone cannot fix this,
+/// only serialise the torn file, so the lock is load-bearing.
+fn job_write_lock(job_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.entry(job_id.to_string()).or_default().clone()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     Triage,
@@ -113,6 +134,8 @@ impl<'a> LineageEngine<'a> {
         job_id: &str,
         transition: Transition,
     ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -129,6 +152,8 @@ impl<'a> LineageEngine<'a> {
     }
 
     pub fn append_note(&self, job_id: &str, note: &str) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -150,6 +175,8 @@ impl<'a> LineageEngine<'a> {
         job_id: &str,
         status: LineageJobStatus,
     ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -169,6 +196,8 @@ impl<'a> LineageEngine<'a> {
         job_id: &str,
         stages: &[StageKind],
     ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -195,6 +224,8 @@ impl<'a> LineageEngine<'a> {
     where
         F: FnOnce(&mut StageState),
     {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -225,6 +256,8 @@ impl<'a> LineageEngine<'a> {
     /// Arm the plan-review gate on a job: the pipeline will stop after the
     /// BackendPlan stage validates and wait for reviewer approval.
     pub fn request_plan_review(&self, job_id: &str) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -239,6 +272,8 @@ impl<'a> LineageEngine<'a> {
     /// plan-review pause never fires again for this job, so resuming the
     /// pipeline proceeds straight into implementation.
     pub fn mark_plan_approved(&self, job_id: &str) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -260,6 +295,8 @@ impl<'a> LineageEngine<'a> {
         log_path: String,
         source_repo: String,
     ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -310,6 +347,47 @@ mod tests {
             lineage_job_id: None,
             local_delegate: None,
         }
+    }
+
+    #[test]
+    fn concurrent_note_appends_do_not_lose_updates() {
+        // The documented lost-update race: runner thread and main thread
+        // both load-mutate-save the same job record. With the per-job
+        // write lock every append survives; without it this test flakes
+        // hard (interleaved read-modify-write drops notes).
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = mk_feedback("fb-race");
+        store.save_feedback(&fb).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
+
+        let store_t = store.clone();
+        let id_t = job.id.clone();
+        let t = std::thread::spawn(move || {
+            let engine = LineageEngine::new(&store_t);
+            for i in 0..50 {
+                engine
+                    .append_note(&id_t, &format!("thread note {i}"))
+                    .unwrap();
+            }
+        });
+        for i in 0..50 {
+            engine
+                .append_note(&job.id, &format!("main note {i}"))
+                .unwrap();
+        }
+        t.join().unwrap();
+
+        let back = store.load_lineage_job(&job.id).unwrap().unwrap();
+        assert_eq!(
+            back.notes.len(),
+            100,
+            "every append from both threads must survive"
+        );
     }
 
     #[test]

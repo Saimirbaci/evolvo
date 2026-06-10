@@ -947,10 +947,26 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                 // for the by-stage breakdown and the per-stage cap.
                 .env("EVOLVO_DELEGATE_STAGE_SLUG", "main");
         }
-        let status = command
+        command
             .stdout(Stdio::from(log_handle))
-            .stderr(Stdio::from(log_for_err))
-            .status();
+            .stderr(Stdio::from(log_for_err));
+        let status = match crate::proc::run_with_timeout(&mut command, agent_session_timeout()) {
+            Ok(crate::proc::WaitOutcome::Exited(s)) => Ok(s),
+            Ok(crate::proc::WaitOutcome::TimedOut) => {
+                let _ = engine.append_note(
+                    &job_id,
+                    &format!(
+                        "{} timed out after {}s — process group killed; see log {}",
+                        agent.label(),
+                        agent_session_timeout().as_secs(),
+                        prepared.log_file.display()
+                    ),
+                );
+                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                return;
+            }
+            Err(e) => Err(e),
+        };
 
         match status {
             Ok(s) if s.success() => {
@@ -1378,6 +1394,20 @@ pub fn build_stage_prompt(
     prompt
 }
 
+/// Hard ceiling for a single agent CLI session (one pipeline stage, or one
+/// legacy single-shot run). Generous — an impl stage legitimately spends
+/// many minutes in cargo builds — but finite: a hung CLI previously wedged
+/// the job in `Implementing` forever, with trunk/cargo grandchildren
+/// holding the iteration port. Override with `EVOLVO_AGENT_TIMEOUT_SECS`.
+pub fn agent_session_timeout() -> std::time::Duration {
+    let secs = std::env::var("EVOLVO_AGENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(60 * 60);
+    std::time::Duration::from_secs(secs)
+}
+
 /// The agent's own verdict on its session, extracted from the transcript.
 /// Every prompt's operating contract requires the session to end with
 /// `STAGE_RESULT: ok` or `STAGE_RESULT: fail: <reason>`. The verdict is
@@ -1546,11 +1576,28 @@ impl crate::stages::StageDispatcher for AgentStageDispatcher {
                 .env("EVOLVO_DELEGATE_EVENTS_LOG", &d.events_log)
                 .env("EVOLVO_DELEGATE_STAGE_SLUG", ctx.stage.slug());
         }
-        let status = command
+        command
             .stdout(Stdio::from(log_handle))
-            .stderr(Stdio::from(log_err))
-            .status()
-            .map_err(|e| format!("spawn {} for {}: {e}", backend.binary(), ctx.stage.slug()))?;
+            .stderr(Stdio::from(log_err));
+        let status = match crate::proc::run_with_timeout(&mut command, agent_session_timeout()) {
+            Ok(crate::proc::WaitOutcome::Exited(s)) => s,
+            Ok(crate::proc::WaitOutcome::TimedOut) => {
+                return Err(format!(
+                    "{} timed out after {}s for stage {} — process group killed; see {}",
+                    self.agent.label(),
+                    agent_session_timeout().as_secs(),
+                    ctx.stage.slug(),
+                    log_path.display()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "spawn {} for {}: {e}",
+                    backend.binary(),
+                    ctx.stage.slug()
+                ))
+            }
+        };
 
         if !status.success() {
             // Surface the agent's own one-line reason when it declared one
@@ -1678,6 +1725,32 @@ pub fn launch_pipeline(
             }
         }
     });
+}
+
+/// Startup crash recovery: a job left in `Implementing` after the host
+/// process died has no runner thread anymore (threads don't survive the
+/// process), so without this it sits "running" forever with no way to act
+/// on it. Called once from `main` before the Tauri builder; flips each
+/// orphan to `Failed` with an explanatory note so Resume (continue from
+/// the last green stage) and Retry (start over) become available. Returns
+/// the number of jobs reconciled.
+pub fn reconcile_orphaned_jobs(store: &Store) -> usize {
+    let engine = LineageEngine::new(store);
+    let Ok(jobs) = store.list_lineage_jobs() else {
+        return 0;
+    };
+    let mut reconciled = 0;
+    for job in jobs {
+        if matches!(job.status, LineageJobStatus::Implementing) {
+            let _ = engine.append_note(
+                &job.id,
+                "host restarted while this job was Implementing — its runner is gone; marked failed (Resume continues from the last green stage, Retry starts over)",
+            );
+            let _ = engine.force_status(&job.id, LineageJobStatus::Failed);
+            reconciled += 1;
+        }
+    }
+    reconciled
 }
 
 /// True iff the feedback is a NewApp request carrying a canvas screenshot or
@@ -2255,6 +2328,35 @@ mod tests {
                 "{kind:?} left {{{{PORT}}}} unsubstituted"
             );
         }
+    }
+
+    #[test]
+    fn reconcile_orphans_flips_only_implementing_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        let mut orphan = mk_job();
+        orphan.id = "job-orphan".into();
+        orphan.status = LineageJobStatus::Implementing;
+        store.save_lineage_job(&orphan).unwrap();
+
+        let mut healthy = mk_job();
+        healthy.id = "job-healthy".into();
+        healthy.status = LineageJobStatus::BuildReady;
+        store.save_lineage_job(&healthy).unwrap();
+
+        let n = reconcile_orphaned_jobs(&store);
+        assert_eq!(n, 1);
+
+        let orphan = store.load_lineage_job("job-orphan").unwrap().unwrap();
+        assert_eq!(orphan.status, LineageJobStatus::Failed);
+        assert!(
+            orphan.notes.iter().any(|n| n.contains("host restarted")),
+            "reconciler must explain why the job failed"
+        );
+        let healthy = store.load_lineage_job("job-healthy").unwrap().unwrap();
+        assert_eq!(healthy.status, LineageJobStatus::BuildReady, "untouched");
     }
 
     #[test]

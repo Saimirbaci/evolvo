@@ -12,8 +12,16 @@ fn main() {
         std::process::exit(evolvo_desktop::validate_cli::main(&argv[2..]));
     }
 
+    let app_state = AppState::new();
+    // Crash recovery: jobs whose runner thread died with the previous
+    // process must not sit in `Implementing` forever.
+    let orphaned = evolvo_desktop::runner::reconcile_orphaned_jobs(&app_state.store());
+    if orphaned > 0 {
+        eprintln!("evolvo: marked {orphaned} orphaned lineage job(s) failed after restart");
+    }
+
     tauri::Builder::default()
-        .manage(AppState::new())
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
             commands::submit_feedback,

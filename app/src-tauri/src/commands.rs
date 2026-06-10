@@ -311,12 +311,24 @@ pub fn resume_lineage_job(
         .map_err(store_error)?
         .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
 
+    // Status guard: resuming a job whose runner is still alive would spawn
+    // a SECOND pipeline thread into the same worktree — two agents editing
+    // the same files. Only terminal-but-recoverable states may resume.
+    if matches!(
+        job.status,
+        LineageJobStatus::Implementing | LineageJobStatus::Promoted | LineageJobStatus::Merging
+    ) {
+        return Err(format!(
+            "cannot resume a job in status {:?} — wait for the current run to finish or fail",
+            job.status
+        ));
+    }
+
     // Flip to `Implementing` synchronously *before* spawning the resume
-    // thread so the UI sees the change immediately AND so the spawned
-    // thread's first writes (`append_note` + `force_status`) cannot race
-    // this status write — `save_lineage_job` is plain `fs::write`, no
-    // locking, so a write from main racing the thread's read-modify-write
-    // would silently clobber the resume note that the thread just appended.
+    // thread so the UI sees the change immediately. (Engine writes are
+    // additionally serialised by a per-job lock — see
+    // `lineage::job_write_lock` — so thread/main interleavings can no
+    // longer drop updates.)
     let updated = engine
         .force_status(&job.id, LineageJobStatus::Implementing)
         .map_err(store_error)?;

@@ -123,7 +123,7 @@ impl Store {
     pub fn save_feedback(&self, rec: &FeedbackRecord) -> Result<(), StoreError> {
         self.init_workspace()?;
         let json = serde_json::to_string_pretty(rec)?;
-        fs::write(self.feedback_path(&rec.id), json)?;
+        write_atomic(&self.feedback_path(&rec.id), json.as_bytes())?;
         Ok(())
     }
 
@@ -154,7 +154,7 @@ impl Store {
     pub fn save_lineage_job(&self, rec: &LineageJobRecord) -> Result<(), StoreError> {
         self.init_workspace()?;
         let json = serde_json::to_string_pretty(rec)?;
-        fs::write(self.lineage_job_path(&rec.id), json)?;
+        write_atomic(&self.lineage_job_path(&rec.id), json.as_bytes())?;
         Ok(())
     }
 
@@ -193,7 +193,7 @@ impl Store {
         };
         let next = current.saturating_add(1);
         let body = serde_json::json!({ "nextIteration": next });
-        fs::write(&path, serde_json::to_string_pretty(&body)?)?;
+        write_atomic(&path, serde_json::to_string_pretty(&body)?.as_bytes())?;
         Ok(current)
     }
 
@@ -211,7 +211,7 @@ impl Store {
             return Err("attachment filename cannot be empty".into());
         }
         let path = dir.join(&safe);
-        fs::write(&path, bytes)?;
+        write_atomic(&path, bytes)?;
         Ok(safe)
     }
 
@@ -230,6 +230,23 @@ impl Store {
         }
         Ok(Some(fs::read(&path)?))
     }
+}
+
+/// Write `bytes` to `path` atomically: same-directory `.tmp` file + rename.
+/// A crash mid-`fs::write` truncates the record, and a truncated record is
+/// silently skipped by `list_json_entities` — the job/feedback "vanishes"
+/// from the UI. Rename within one directory is atomic on every platform we
+/// target. The `.tmp` sibling never matches the `.json` extension filter,
+/// so a crash between write and rename leaves only harmless debris.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("atomic write: path has no filename")?;
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn list_json_entities<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<T>, StoreError> {
