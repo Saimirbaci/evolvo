@@ -51,6 +51,11 @@ pub fn FeedbackPanel(
     // their choice is sticky for the rest of this panel session.
     let auto_evolve = RwSignal::new(false);
     let auto_evolve_user_set = RwSignal::new(false);
+    // Plan-review gate: only meaningful for NewApp submissions (the
+    // multi-stage pipeline). Off by default — checking it makes the
+    // pipeline park in `Planned` after the backend plan validates so the
+    // user can read plan.json before implementation burns a worktree.
+    let pause_after_plan = RwSignal::new(false);
     Effect::new(move |_| {
         let ft = feedback_type.get();
         if !auto_evolve_user_set.get_untracked() {
@@ -152,6 +157,7 @@ pub fn FeedbackPanel(
             let feedback_type_v = feedback_type.get_untracked();
             let agent_v = agent.get_untracked();
             let auto_evolve_v = auto_evolve.get_untracked();
+            let pause_after_plan_v = pause_after_plan.get_untracked();
             // Snapshot delegate config at submit time. Only rides
             // through when the user explicitly toggled it on AND the
             // chip was actually live (probe ready, agent supports it).
@@ -208,6 +214,7 @@ pub fn FeedbackPanel(
                     window_height: win_h,
                     agent: Some(agent_v),
                     auto_evolve: auto_evolve_v,
+                    pause_after_plan: pause_after_plan_v,
                     local_delegate: delegate_v,
                 };
 
@@ -497,6 +504,20 @@ pub fn FeedbackPanel(
                         }
                     />
                     <span>"Start agent immediately"</span>
+                </label>
+                <label
+                    class="auto-evolve-toggle"
+                    title="NewApp builds only: pause after the backend plan is validated so you can review plan.json (and its open questions) on the Lineage tab before any code is written. Approve the job to continue."
+                >
+                    <input
+                        type="checkbox"
+                        prop:checked=move || pause_after_plan.get()
+                        on:change=move |ev| {
+                            let target = event_target::<HtmlInputElement>(&ev);
+                            pause_after_plan.set(target.checked());
+                        }
+                    />
+                    <span>"Review plan first"</span>
                 </label>
                 <button
                     class="primary-btn"

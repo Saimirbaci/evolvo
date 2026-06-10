@@ -403,6 +403,11 @@ pub struct SubmitFeedbackPayload {
     /// `submit_feedback` finishes persisting the record.
     #[serde(default)]
     pub auto_evolve: bool,
+    /// Plan-review gate: pause the NewApp pipeline after the backend plan
+    /// validates so the plan (and its open questions) can be reviewed
+    /// before implementation starts. Approving the Planned job resumes it.
+    #[serde(default)]
+    pub pause_after_plan: bool,
     /// Opt-in local-model worker. `None` keeps historical behaviour.
     #[serde(default)]
     pub local_delegate: Option<LocalDelegateConfig>,

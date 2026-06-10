@@ -368,6 +368,19 @@ pub struct LineageJobRecord {
     /// silently flips to Claude half-way through.
     #[serde(default)]
     pub agent: AgentKind,
+    /// Plan-review gate: when true, the multi-stage pipeline stops after
+    /// the BackendPlan stage validates green, flips the job to `Planned`,
+    /// and waits for the reviewer to approve (resume implementation) or
+    /// reject. Catching a wrong plan here costs a re-plan; catching it
+    /// after implementation costs the whole pipeline. Defaults to false —
+    /// the historical fire-and-forget behaviour.
+    #[serde(default)]
+    pub pause_after_plan: bool,
+    /// Unix-ms timestamp of the reviewer's plan approval. The pause above
+    /// only fires while this is `None`, so resuming an approved job never
+    /// re-pauses at BackendPlan.
+    #[serde(default)]
+    pub plan_approved_at_unix_ms: Option<u64>,
 }
 
 /// Which stage of the multi-stage NewApp pipeline a `StageState` represents.
@@ -555,6 +568,13 @@ pub struct SubmitFeedbackPayload {
     /// wants the agent to start immediately).
     #[serde(default)]
     pub auto_evolve: bool,
+    /// When true, the NewApp pipeline pauses after the backend plan
+    /// validates so the reviewer can read `plan.json` (including its
+    /// `openQuestions`) before any implementation runs. Approving the
+    /// `Planned` job resumes the pipeline. Defaults to false on the wire
+    /// so older UI builds keep behaving as before.
+    #[serde(default)]
+    pub pause_after_plan: bool,
 }
 
 /// Availability of a given agent CLI on the host. Returned by the

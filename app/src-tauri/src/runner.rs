@@ -1643,8 +1643,12 @@ pub fn launch_pipeline(
             &job_dir,
             &job_id,
         ) {
-            Ok(stages) => {
-                let all_green = stages.iter().all(|s| {
+            Ok(run) if run.paused_for_plan_review => {
+                // run_pipeline already flipped the job to Planned and left
+                // a note — nothing to do until the reviewer acts.
+            }
+            Ok(run) => {
+                let all_green = run.stages.iter().all(|s| {
                     matches!(
                         s.status,
                         crate::types::StageStatus::Green | crate::types::StageStatus::Skipped
@@ -1655,7 +1659,8 @@ pub fn launch_pipeline(
                         .append_note(&job_id, "pipeline: all stages green — marking build ready");
                     let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
                 } else {
-                    let first_red = stages
+                    let first_red = run
+                        .stages
                         .iter()
                         .find(|s| matches!(s.status, crate::types::StageStatus::Failed))
                         .map(|s| s.kind.slug())
@@ -1779,8 +1784,12 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
             &job_dir,
             &job_id,
         ) {
-            Ok(stages) => {
-                let all_green = stages.iter().all(|s| {
+            Ok(run) if run.paused_for_plan_review => {
+                // Job is back in Planned awaiting the reviewer; the note
+                // was appended by run_pipeline.
+            }
+            Ok(run) => {
+                let all_green = run.stages.iter().all(|s| {
                     matches!(
                         s.status,
                         crate::types::StageStatus::Green | crate::types::StageStatus::Skipped
@@ -1791,7 +1800,8 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
                         .append_note(&job_id, "resume: all stages green — marking build ready");
                     let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
                 } else {
-                    let first_red = stages
+                    let first_red = run
+                        .stages
                         .iter()
                         .find(|s| matches!(s.status, crate::types::StageStatus::Failed))
                         .map(|s| s.kind.slug())
@@ -1856,6 +1866,8 @@ mod tests {
             freedom: crate::types::FreedomLevel::Auto,
             stages: Vec::new(),
             agent: AgentKind::ClaudeCode,
+            pause_after_plan: false,
+            plan_approved_at_unix_ms: None,
         }
     }
 

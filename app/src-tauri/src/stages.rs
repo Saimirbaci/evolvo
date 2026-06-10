@@ -128,6 +128,7 @@ pub fn seed_plan_from_feedback(
         frontend: Default::default(),
         e2e: Default::default(),
         history: Vec::new(),
+        open_questions: Vec::new(),
     };
     save_plan(job_dir, &plan)?;
     Ok(plan)
@@ -574,6 +575,16 @@ fn advance_plan_stage(plan: &mut IterationPlan, finished: StageKind) {
 
 /// Run the full canonical pipeline, stopping at the first red stage.
 /// Returns the list of stages actually executed.
+/// Outcome of a full pipeline pass.
+pub struct PipelineRun {
+    pub stages: Vec<StageState>,
+    /// True when the pipeline intentionally stopped after BackendPlan
+    /// because the job requested a plan review — the job has been flipped
+    /// to `Planned` and waits for the reviewer to approve (resume) or
+    /// reject. NOT a failure; the caller must leave the status alone.
+    pub paused_for_plan_review: bool,
+}
+
 pub fn run_pipeline<D: StageDispatcher>(
     store: &Store,
     engine: &LineageEngine<'_>,
@@ -581,13 +592,23 @@ pub fn run_pipeline<D: StageDispatcher>(
     worktree: &Path,
     job_dir: &Path,
     job_id: &str,
-) -> Result<Vec<StageState>, String> {
+) -> Result<PipelineRun, String> {
     engine
         .seed_stages(job_id, StageKind::pipeline())
         .map_err(|e| format!("seed stages: {e}"))?;
+    let mut paused_for_plan_review = false;
     for stage in StageKind::pipeline().iter().copied() {
         let ok = run_stage(store, engine, dispatcher, stage, worktree, job_dir, job_id)?;
         if !ok {
+            break;
+        }
+        if stage == StageKind::BackendPlan && should_pause_for_plan_review(store, job_id) {
+            let _ = engine.append_note(
+                job_id,
+                "backend plan validated — pausing for plan review; check plan.json (incl. openQuestions), then Approve to start implementation or Reject",
+            );
+            let _ = engine.force_status(job_id, crate::types::LineageJobStatus::Planned);
+            paused_for_plan_review = true;
             break;
         }
     }
@@ -595,7 +616,22 @@ pub fn run_pipeline<D: StageDispatcher>(
         .load_lineage_job(job_id)
         .map_err(|e| format!("reload job: {e}"))?
         .ok_or_else(|| format!("job {job_id} vanished"))?;
-    Ok(job.stages)
+    Ok(PipelineRun {
+        stages: job.stages,
+        paused_for_plan_review,
+    })
+}
+
+/// The plan-review gate fires only while the job both requested it and has
+/// not been approved yet — so a resume after approval sails straight
+/// through BackendPlan's re-validation into implementation.
+fn should_pause_for_plan_review(store: &Store, job_id: &str) -> bool {
+    store
+        .load_lineage_job(job_id)
+        .ok()
+        .flatten()
+        .map(|j| j.pause_after_plan && j.plan_approved_at_unix_ms.is_none())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -963,6 +999,64 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("declared STAGE_RESULT: fail: canvas png unreadable")),
             "declared failure should be recorded as a lineage note"
+        );
+    }
+
+    #[test]
+    fn pipeline_pauses_after_backend_plan_and_resumes_after_approval() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+        engine.request_plan_review(&job_id).unwrap();
+
+        // Dispatcher produces a green backend plan on the first attempt.
+        let dispatcher = ScriptedDispatcher {
+            job_dir: job_dir.clone(),
+            fix_on_attempt: 1,
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let run = run_pipeline(&store, &engine, &dispatcher, &worktree, &job_dir, &job_id).unwrap();
+        assert!(run.paused_for_plan_review);
+        let job = store.load_lineage_job(&job_id).unwrap().unwrap();
+        assert_eq!(job.status, crate::types::LineageJobStatus::Planned);
+        let backend_impl = job
+            .stages
+            .iter()
+            .find(|s| s.kind == StageKind::BackendImpl)
+            .unwrap();
+        assert_eq!(
+            backend_impl.status,
+            StageStatus::Pending,
+            "implementation must not have started"
+        );
+        assert_eq!(
+            dispatcher.calls.borrow().len(),
+            1,
+            "only the BackendPlan stage dispatched"
+        );
+
+        // Approve → the gate never fires again; the pipeline proceeds into
+        // BackendImpl (which red-flags on the empty worktree — fine, the
+        // point is it RAN instead of re-pausing).
+        engine.mark_plan_approved(&job_id).unwrap();
+        let run = run_pipeline(&store, &engine, &dispatcher, &worktree, &job_dir, &job_id).unwrap();
+        assert!(
+            !run.paused_for_plan_review,
+            "approved job must not re-pause"
+        );
+        let job = store.load_lineage_job(&job_id).unwrap().unwrap();
+        let backend_impl = job
+            .stages
+            .iter()
+            .find(|s| s.kind == StageKind::BackendImpl)
+            .unwrap();
+        assert_ne!(
+            backend_impl.status,
+            StageStatus::Pending,
+            "BackendImpl must have been attempted after approval"
         );
     }
 

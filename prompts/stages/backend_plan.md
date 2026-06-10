@@ -505,6 +505,24 @@ materialises charges into transactions. **That's planning at the
 ceiling — every drawn element produces commands until the canvas is
 fully covered.**
 
+## Open questions — record your guesses
+
+Whenever the canvas / text / voice leave a real ambiguity and you had to
+guess, append a short question to the top-level `openQuestions` array in
+the plan (camelCase on wire):
+
+```json
+"openQuestions": [
+  "Should deleting a category cascade to its transactions, or block?",
+  "R3 shows a chart — monthly or weekly granularity? Assumed monthly."
+]
+```
+
+State the guess you made inside the question. The reviewer reads these at
+the plan-review pause; a wrong guess corrected here costs a re-plan, not a
+full implementation run. Do NOT pad the list — an empty array means
+"nothing was ambiguous" and that is a fine answer.
+
 ## When finished
 
 1. Save the plan to `{{PLAN_PATH}}` (your Edits already persist it).

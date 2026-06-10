@@ -96,6 +96,8 @@ impl<'a> LineageEngine<'a> {
             freedom: FreedomLevel::Auto,
             stages: Vec::new(),
             agent,
+            pause_after_plan: false,
+            plan_approved_at_unix_ms: None,
         };
         self.store.save_lineage_job(&job)?;
 
@@ -216,6 +218,34 @@ impl<'a> LineageEngine<'a> {
         if prev_status != slot.status {
             job.updated_at_unix_ms = now;
         }
+        self.store.save_lineage_job(&job)?;
+        Ok(job)
+    }
+
+    /// Arm the plan-review gate on a job: the pipeline will stop after the
+    /// BackendPlan stage validates and wait for reviewer approval.
+    pub fn request_plan_review(&self, job_id: &str) -> Result<LineageJobRecord, StoreError> {
+        let mut job = self
+            .store
+            .load_lineage_job(job_id)?
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+        job.pause_after_plan = true;
+        job.updated_at_unix_ms = current_time_unix_ms();
+        self.store.save_lineage_job(&job)?;
+        Ok(job)
+    }
+
+    /// Record the reviewer's approval of the backend plan. Once set, the
+    /// plan-review pause never fires again for this job, so resuming the
+    /// pipeline proceeds straight into implementation.
+    pub fn mark_plan_approved(&self, job_id: &str) -> Result<LineageJobRecord, StoreError> {
+        let mut job = self
+            .store
+            .load_lineage_job(job_id)?
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+        let now = current_time_unix_ms();
+        job.plan_approved_at_unix_ms = Some(now);
+        job.updated_at_unix_ms = now;
         self.store.save_lineage_job(&job)?;
         Ok(job)
     }

@@ -140,6 +140,13 @@ pub struct IterationPlan {
     /// to re-read logs. Never rewritten.
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    /// Ambiguities the planner had to guess on, written as short questions
+    /// ("Should deleting a project cascade to its tasks?"). Surfaced to the
+    /// reviewer at the plan-review pause so a wrong guess is corrected for
+    /// the cost of a re-plan instead of a full implementation run. Planners
+    /// append here; an empty list means "nothing was ambiguous".
+    #[serde(default)]
+    pub open_questions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

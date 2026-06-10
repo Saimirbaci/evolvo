@@ -133,6 +133,14 @@ pub fn submit_feedback(
         .enqueue_job_for_feedback(&mut record, agent)
         .map_err(store_error)?;
 
+    // Plan-review gate must be armed BEFORE any run fires — the pipeline
+    // reads the flag right after the BackendPlan stage validates.
+    let job = if payload.pause_after_plan {
+        engine.request_plan_review(&job.id).map_err(store_error)?
+    } else {
+        job
+    };
+
     // Auto-evolve: skip the manual "Evolve" click and fire the agent run
     // immediately. We swallow run-prep errors so the feedback record is
     // still reported as saved — the failure is recorded on the lineage
@@ -342,6 +350,22 @@ pub fn approve_lineage_job(
         .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
     match job.status {
         LineageJobStatus::Pending => start_implementation_run(&store, &engine, &job),
+        // Plan-review gate: a job parked in `Planned` by the pipeline
+        // resumes implementation on approval instead of jumping straight
+        // to Promoted. Only fires for jobs that requested the gate —
+        // legacy Planned jobs keep the historical approve semantics.
+        LineageJobStatus::Planned if job.pause_after_plan => {
+            engine.mark_plan_approved(&job.id).map_err(store_error)?;
+            let _ = engine.append_note(
+                &job.id,
+                "plan approved by reviewer — resuming pipeline into implementation",
+            );
+            let updated = engine
+                .force_status(&job.id, LineageJobStatus::Implementing)
+                .map_err(store_error)?;
+            runner::resume_pipeline(store.clone(), job.id.clone())?;
+            Ok(updated)
+        }
         _ => engine
             .transition(&payload.id, Transition::Approve)
             .map_err(store_error),
@@ -829,6 +853,7 @@ mod tests {
             window_height: 768,
             agent: None,
             auto_evolve: false,
+            pause_after_plan: false,
             local_delegate: None,
         }
     }
