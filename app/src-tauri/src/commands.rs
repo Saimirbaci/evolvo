@@ -18,14 +18,85 @@ use crate::types::{
 const APP_NAME: &str = "Evolvo";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Per-attachment decoded-byte ceiling. Kept in sync with
+/// `store::MAX_ATTACHMENT_BYTES` (the store enforces its own copy as
+/// defense in depth); this constant lets `submit_feedback` reject an
+/// oversized attachment before spending the cost of base64-decoding it.
+const MAX_ATTACHMENT_BYTES: usize = crate::store::MAX_ATTACHMENT_BYTES;
+/// Aggregate decoded-byte ceiling across every attachment in a single
+/// `SubmitFeedbackPayload` (screenshot + pasted images + voice). Bounds the
+/// total IPC payload / disk write a single submission can cost regardless
+/// of how the bytes are split across attachments.
+const MAX_TOTAL_ATTACHMENT_BYTES: usize = 32 * 1024 * 1024;
+
 fn store_error(err: StoreError) -> String {
     err.to_string()
 }
 
+/// Estimate the decoded byte length of a base64 string without decoding it,
+/// so oversized payloads can be rejected before paying the decode cost.
+/// Standard base64 (no line breaks) encodes every 4 input chars as 3 output
+/// bytes, minus 1 or 2 for `=` padding.
+fn estimated_decoded_len(b64: &str) -> usize {
+    let len = b64.len();
+    let padding = b64.chars().rev().take_while(|&c| c == '=').count();
+    (len / 4) * 3 - padding.min(len / 4 * 3)
+}
+
+/// Reject a base64 attachment before decoding if its estimated decoded size
+/// exceeds `MAX_ATTACHMENT_BYTES`. Cheap, and avoids allocating a
+/// multi-megabyte `Vec<u8>` for a payload we're going to reject anyway.
+fn check_encoded_size(name: &str, b64: &str) -> Result<(), String> {
+    let estimated = estimated_decoded_len(b64);
+    if estimated > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "attachment {name} is approximately {estimated} bytes, which exceeds the {MAX_ATTACHMENT_BYTES}-byte per-attachment limit"
+        ));
+    }
+    Ok(())
+}
+
 fn decode_base64(name: &str, value: &str) -> Result<Vec<u8>, String> {
-    STANDARD
+    check_encoded_size(name, value)?;
+    let bytes = STANDARD
         .decode(value)
-        .map_err(|e| format!("invalid base64 for {name}: {e}"))
+        .map_err(|e| format!("invalid base64 for {name}: {e}"))?;
+    // Double-check post-decode: the pre-decode estimate is a close but not
+    // exact bound (base64 implementations can differ at the margins), and
+    // this is the number that actually lands on disk.
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "attachment {name} is {} bytes, which exceeds the {MAX_ATTACHMENT_BYTES}-byte per-attachment limit",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Track and enforce the aggregate decoded-byte budget across every
+/// attachment in one `submit_feedback` call. Call `add` after each
+/// successful `decode_base64` so a submission with many attachments, each
+/// individually under the per-attachment cap, still can't blow past a
+/// sane total.
+struct AttachmentBudget {
+    used: usize,
+}
+
+impl AttachmentBudget {
+    fn new() -> Self {
+        Self { used: 0 }
+    }
+
+    fn add(&mut self, name: &str, len: usize) -> Result<(), String> {
+        self.used = self.used.saturating_add(len);
+        if self.used > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachment {name} pushed total attachment size to {} bytes, which exceeds the {MAX_TOTAL_ATTACHMENT_BYTES}-byte aggregate limit",
+                self.used
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn guess_voice_ext(mime: Option<&str>) -> &'static str {
@@ -61,9 +132,12 @@ pub fn submit_feedback(
     let now = current_time_unix_ms();
     let id = format!("fb-{now}");
 
+    let mut budget = AttachmentBudget::new();
+
     let screenshot_filename = match payload.screenshot_base64.as_deref() {
         Some(b64) if !b64.is_empty() => {
             let bytes = decode_base64("screenshot", b64)?;
+            budget.add("screenshot", bytes.len())?;
             Some(
                 store
                     .save_attachment(&id, "canvas.png", &bytes)
@@ -78,7 +152,9 @@ pub fn submit_feedback(
         if b64.is_empty() {
             continue;
         }
-        let bytes = decode_base64(&format!("pasted-image-{idx}"), b64)?;
+        let name = format!("pasted-image-{idx}");
+        let bytes = decode_base64(&name, b64)?;
+        budget.add(&name, bytes.len())?;
         let filename = format!("paste-{idx}.png");
         let saved = store
             .save_attachment(&id, &filename, &bytes)
@@ -89,6 +165,7 @@ pub fn submit_feedback(
     let voice_filename = match payload.voice_base64.as_deref() {
         Some(b64) if !b64.is_empty() => {
             let bytes = decode_base64("voice", b64)?;
+            budget.add("voice", bytes.len())?;
             let ext = guess_voice_ext(payload.voice_mime_type.as_deref());
             Some(
                 store
@@ -917,6 +994,175 @@ mod tests {
         let temp = tempdir().unwrap();
         let state = AppState::with_root(temp.path().to_path_buf());
         (temp, state)
+    }
+
+    #[test]
+    fn estimated_decoded_len_matches_actual_decode() {
+        for len in [0usize, 3, 8, 1024, 1_000_000] {
+            let bytes = vec![7u8; len];
+            let b64 = STANDARD.encode(&bytes);
+            let estimate = estimated_decoded_len(&b64);
+            // The pre-decode estimate must never be smaller than the real
+            // decoded size, or an attacker could sneak an oversized payload
+            // past the cheap check and force a large allocation anyway.
+            assert!(
+                estimate >= len,
+                "estimate {estimate} underestimated actual decoded len {len}"
+            );
+            // And it should be a tight bound, not wildly over.
+            assert!(
+                estimate - len <= 2,
+                "estimate {estimate} too loose for {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_encoded_size_rejects_before_decoding() {
+        let oversized = STANDARD.encode(vec![0u8; MAX_ATTACHMENT_BYTES + 1]);
+        let err = check_encoded_size("screenshot", &oversized).unwrap_err();
+        assert!(err.contains("screenshot"));
+        assert!(err.contains(&MAX_ATTACHMENT_BYTES.to_string()));
+
+        let ok = STANDARD.encode(vec![0u8; 1024]);
+        assert!(check_encoded_size("screenshot", &ok).is_ok());
+    }
+
+    #[test]
+    fn decode_base64_rejects_oversized_attachment() {
+        let oversized = STANDARD.encode(vec![0u8; MAX_ATTACHMENT_BYTES + 1]);
+        let err = decode_base64("voice", &oversized).unwrap_err();
+        assert!(err.contains("voice"));
+        assert!(err.to_lowercase().contains("exceeds"));
+    }
+
+    #[test]
+    fn attachment_budget_rejects_aggregate_over_cap() {
+        let mut budget = AttachmentBudget::new();
+        // Two attachments, each under the per-attachment cap, whose sum
+        // exceeds the aggregate cap.
+        let half = MAX_TOTAL_ATTACHMENT_BYTES / 2 + 1;
+        budget.add("first", half).unwrap();
+        let err = budget.add("second", half).unwrap_err();
+        assert!(err.contains("second"));
+        assert!(err.contains(&MAX_TOTAL_ATTACHMENT_BYTES.to_string()));
+    }
+
+    #[test]
+    fn attachment_budget_allows_normal_totals() {
+        let mut budget = AttachmentBudget::new();
+        budget.add("screenshot", 2 * 1024 * 1024).unwrap();
+        budget.add("pasted-image-0", 1024 * 1024).unwrap();
+        budget.add("voice", 512 * 1024).unwrap();
+    }
+
+    /// Replicates `submit_feedback`'s attachment pipeline (decode + budget +
+    /// `Store::save_attachment`) directly against a tempdir-backed `Store`,
+    /// since the `#[tauri::command]` shim needs a live `State<'_, AppState>`
+    /// that isn't practical to construct in a unit test (see the project's
+    /// "test the body, not the shim" convention).
+    fn run_attachment_pipeline(
+        store: &crate::store::Store,
+        id: &str,
+        payload: &SubmitFeedbackPayload,
+    ) -> Result<(Option<String>, Vec<String>, Option<String>), String> {
+        let mut budget = AttachmentBudget::new();
+
+        let screenshot_filename = match payload.screenshot_base64.as_deref() {
+            Some(b64) if !b64.is_empty() => {
+                let bytes = decode_base64("screenshot", b64)?;
+                budget.add("screenshot", bytes.len())?;
+                Some(
+                    store
+                        .save_attachment(id, "canvas.png", &bytes)
+                        .map_err(store_error)?,
+                )
+            }
+            _ => None,
+        };
+
+        let mut pasted_images = Vec::new();
+        for (idx, b64) in payload.pasted_images_base64.iter().enumerate() {
+            if b64.is_empty() {
+                continue;
+            }
+            let name = format!("pasted-image-{idx}");
+            let bytes = decode_base64(&name, b64)?;
+            budget.add(&name, bytes.len())?;
+            let filename = format!("paste-{idx}.png");
+            let saved = store
+                .save_attachment(id, &filename, &bytes)
+                .map_err(store_error)?;
+            pasted_images.push(saved);
+        }
+
+        let voice_filename = match payload.voice_base64.as_deref() {
+            Some(b64) if !b64.is_empty() => {
+                let bytes = decode_base64("voice", b64)?;
+                budget.add("voice", bytes.len())?;
+                Some(
+                    store
+                        .save_attachment(id, "voice.webm", &bytes)
+                        .map_err(store_error)?,
+                )
+            }
+            _ => None,
+        };
+
+        Ok((screenshot_filename, pasted_images, voice_filename))
+    }
+
+    #[test]
+    fn submit_feedback_pipeline_rejects_oversized_single_attachment() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+
+        let mut payload = mk_payload("hi", 0, false);
+        payload.screenshot_base64 = Some(STANDARD.encode(vec![0u8; MAX_ATTACHMENT_BYTES + 1]));
+
+        let err = run_attachment_pipeline(&store, "fb-oversize", &payload).unwrap_err();
+        assert!(err.contains("screenshot"));
+        assert!(store
+            .read_attachment("fb-oversize", "canvas.png")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn submit_feedback_pipeline_rejects_oversized_aggregate() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+
+        // Five pasted images, each safely under the 8 MiB per-attachment
+        // cap, but summing past the 32 MiB aggregate cap.
+        let chunk = 7 * 1024 * 1024;
+        assert!(chunk < MAX_ATTACHMENT_BYTES);
+        let mut payload = mk_payload("hi", 0, false);
+        payload.pasted_images_base64 = (0..5)
+            .map(|i| STANDARD.encode(vec![i as u8; chunk]))
+            .collect();
+
+        let err = run_attachment_pipeline(&store, "fb-aggregate", &payload).unwrap_err();
+        assert!(err.contains("exceeds"));
+        assert!(err.contains(&MAX_TOTAL_ATTACHMENT_BYTES.to_string()));
+    }
+
+    #[test]
+    fn submit_feedback_pipeline_succeeds_for_normal_sized_attachments() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+
+        let payload = mk_payload("hello world", 2, true);
+        let (screenshot, pasted, voice) =
+            run_attachment_pipeline(&store, "fb-normal", &payload).unwrap();
+
+        assert_eq!(screenshot.as_deref(), Some("canvas.png"));
+        assert_eq!(pasted.len(), 2);
+        assert!(voice.is_none());
+        assert!(store
+            .read_attachment("fb-normal", "canvas.png")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

@@ -10,11 +10,23 @@ const SANDBOX_JOBS_DIR: &str = "lineage_jobs";
 const ATTACHMENTS_DIR: &str = "attachments";
 const ITERATION_FILE: &str = "iteration.json";
 
+/// Hard ceiling on a single attachment's decoded byte size (canvas
+/// screenshot, one pasted image, or the voice recording). Enforced again
+/// here as defense in depth even though `commands::submit_feedback`
+/// rejects oversized payloads before decoding — nothing should reach
+/// `Store` without going through this check.
+pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 pub enum StoreError {
     Io(io::Error),
     Serde(serde_json::Error),
     Other(String),
+    AttachmentTooLarge {
+        filename: String,
+        size: usize,
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -23,6 +35,14 @@ impl std::fmt::Display for StoreError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Serde(e) => write!(f, "serde: {e}"),
             Self::Other(msg) => write!(f, "{msg}"),
+            Self::AttachmentTooLarge {
+                filename,
+                size,
+                limit,
+            } => write!(
+                f,
+                "attachment {filename} is {size} bytes, which exceeds the {limit}-byte limit"
+            ),
         }
     }
 }
@@ -203,6 +223,14 @@ impl Store {
         filename: &str,
         bytes: &[u8],
     ) -> Result<String, StoreError> {
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(StoreError::AttachmentTooLarge {
+                filename: filename.to_string(),
+                size: bytes.len(),
+                limit: MAX_ATTACHMENT_BYTES,
+            });
+        }
+
         let dir = self.layout.attachments_dir(feedback_id);
         fs::create_dir_all(&dir)?;
 
@@ -340,6 +368,27 @@ mod tests {
         assert!(store.delete_feedback("a").unwrap());
         assert!(store.load_feedback("a").unwrap().is_none());
         assert!(!store.delete_feedback("a").unwrap());
+    }
+
+    #[test]
+    fn save_attachment_rejects_oversized_bytes() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        let oversized = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+        let err = store
+            .save_attachment("fb-1", "huge.png", &oversized)
+            .unwrap_err();
+        match err {
+            StoreError::AttachmentTooLarge { filename, size, .. } => {
+                assert_eq!(filename, "huge.png");
+                assert_eq!(size, MAX_ATTACHMENT_BYTES + 1);
+            }
+            other => panic!("expected AttachmentTooLarge, got {other}"),
+        }
+        // Nothing should have been written to disk.
+        assert!(store.read_attachment("fb-1", "huge.png").unwrap().is_none());
     }
 
     #[test]
