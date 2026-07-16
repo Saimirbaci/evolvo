@@ -18,10 +18,17 @@ dispatching the Claude session:
   prose summary of what's on it is acceptable.
 - `{{ANNOTATIONS_PATH}}` — absolute path to the raw annotations JSON (may
   be the string `<none>` if the user submitted text-only feedback).
-- `{{USER_TEXT}}` — verbatim feedback text.
-- `{{VOICE_TRANSCRIPT}}` — verbatim voice transcript (may be `<none>`).
+- `{{USER_TEXT}}` — feedback text, pre-wrapped in a `<user-content>` fence
+  (see `_contract.md`'s prompt-injection defense; may be the string
+  `<none>` if empty). Any `</user-content>` the user typed is neutralised
+  before fencing so it cannot terminate the fence early.
+- `{{VOICE_TRANSCRIPT}}` — voice transcript, fenced the same way (may be
+  `<none>`).
 - `{{REGION_INDEX}}` — human-readable dump of `plan.canvas.regions`, one
-  line per region with its id / bbox / dominant color / labels.
+  line per region with its id / bbox / dominant color / labels. The
+  `labels` portion (verbatim text the user typed on the canvas) is
+  individually fenced per region; bbox/strokes/color are pipeline-computed
+  geometry and are not fenced.
 - `{{WORKTREE}}` — absolute path to the job's worktree.
 
 ## The golden rule every stage shares
