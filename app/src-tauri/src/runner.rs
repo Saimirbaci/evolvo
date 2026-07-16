@@ -978,6 +978,17 @@ pub fn prepare_run(
 pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun, agent: AgentKind) {
     std::thread::spawn(move || {
         let engine = LineageEngine::new(&store);
+
+        // Block until a global agent-session slot is free. Holds the guard
+        // for the rest of this closure so it releases on every exit path
+        // (success, early return, or panic unwinding through it).
+        let _slot = crate::concurrency::AgentSlot::acquire(|active| {
+            let _ = engine.append_note(
+                &job_id,
+                &format!("queued: waiting for an agent slot ({active} active)"),
+            );
+        });
+
         let backend = backend_for(agent);
 
         let log_handle = match fs::File::create(&prepared.log_file) {
@@ -1741,6 +1752,21 @@ pub fn launch_pipeline(
 ) {
     std::thread::spawn(move || {
         let engine = LineageEngine::new(&store);
+
+        // See `launch_agent_session` — same global slot, held for the
+        // duration of this thread. A multi-stage pipeline dispatches many
+        // agent sessions sequentially (one per stage) inside `run_pipeline`
+        // below, so one permit covers the whole job rather than one per
+        // stage. If the pipeline pauses for plan review, this thread (and
+        // its permit) exits; `resume_pipeline` acquires its own permit when
+        // the reviewer approves and a new thread resumes the job.
+        let _slot = crate::concurrency::AgentSlot::acquire(|active| {
+            let _ = engine.append_note(
+                &job_id,
+                &format!("queued: waiting for an agent slot ({active} active)"),
+            );
+        });
+
         let root = store.layout().root().to_path_buf();
         let job_dir = job_workspace_dir(&root, &job_id);
 
@@ -1961,6 +1987,18 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
 
     std::thread::spawn(move || {
         let engine = LineageEngine::new(&store);
+
+        // See `launch_agent_session` — same global slot. Resume gets its
+        // own permit since it runs on a fresh thread (the pipeline's
+        // original permit, if any, was released when the paused/failed run
+        // exited).
+        let _slot = crate::concurrency::AgentSlot::acquire(|active| {
+            let _ = engine.append_note(
+                &job_id,
+                &format!("queued: waiting for an agent slot ({active} active)"),
+            );
+        });
+
         // The caller (`commands::resume_lineage_job`) has already flipped
         // status to `Implementing` synchronously before spawning this
         // thread — don't re-flip it here, that would race with whatever

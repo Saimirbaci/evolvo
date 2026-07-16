@@ -118,6 +118,8 @@ pub fn app_health(state: State<'_, AppState>) -> Result<AppHealth, String> {
         app_version: APP_VERSION.into(),
         workspace_path: state.workspace_root_display(),
         launched_at_unix_ms: state.launched_at_unix_ms,
+        active_agent_sessions: crate::concurrency::active_count(),
+        max_concurrent_agent_sessions: crate::concurrency::cap(),
     })
 }
 

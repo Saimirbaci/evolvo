@@ -420,4 +420,10 @@ pub struct AppHealth {
     pub app_version: String,
     pub workspace_path: String,
     pub launched_at_unix_ms: u64,
+    /// Agent CLI sessions currently running, and the configured cap. Not
+    /// surfaced in the UI yet — mirrored here so the type round-trips.
+    #[serde(default)]
+    pub active_agent_sessions: u64,
+    #[serde(default)]
+    pub max_concurrent_agent_sessions: u64,
 }

@@ -644,6 +644,16 @@ pub struct AppHealth {
     pub app_version: String,
     pub workspace_path: String,
     pub launched_at_unix_ms: u64,
+    /// Number of agent CLI sessions (lineage jobs actively running an
+    /// agent) currently holding a concurrency slot. See `concurrency.rs`.
+    /// `#[serde(default)]` so older UI builds that don't send/expect this
+    /// field keep round-tripping.
+    #[serde(default)]
+    pub active_agent_sessions: usize,
+    /// The configured concurrency cap (`EVOLVO_MAX_CONCURRENT_JOBS`, or the
+    /// default). `#[serde(default)]` for the same forward-compat reason.
+    #[serde(default)]
+    pub max_concurrent_agent_sessions: usize,
 }
 
 #[cfg(test)]
