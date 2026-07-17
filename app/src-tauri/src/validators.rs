@@ -500,6 +500,218 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
 /// leaving room for legitimately-small redesigns that mostly reuse classes.
 pub const STYLES_MIN_GROWTH_BYTES: u64 = 50;
 
+/// Token names that must be defined in `app/ui/styles/tokens.css`. Values
+/// may change per-iteration (that's the creative dial); a missing NAME is a
+/// FAIL — code across the layered stylesheets (base.css, app.css) assumes
+/// these exist. Keep in lockstep with `app/ui/styles/tokens.css`.
+pub const REQUIRED_TOKEN_NAMES: &[&str] = &[
+    "--bg",
+    "--fg",
+    "--muted",
+    "--border",
+    "--panel-bg",
+    "--panel-shadow",
+    "--accent",
+    "--accent-fg",
+    "--accent-hover",
+    "--danger",
+    "--success",
+    "--radius",
+    "--tool-size",
+    "--space-1",
+    "--space-2",
+    "--space-3",
+    "--space-4",
+    "--space-5",
+    "--space-6",
+    "--space-7",
+    "--space-8",
+    "--text-xs",
+    "--text-sm",
+    "--text-base",
+    "--text-lg",
+    "--text-xl",
+    "--text-2xl",
+    "--weight-normal",
+    "--weight-medium",
+    "--weight-semibold",
+    "--weight-bold",
+    "--surface",
+    "--surface-raised",
+    "--surface-sunken",
+    "--fg-strong",
+    "--shadow-1",
+    "--shadow-2",
+    "--shadow-3",
+    "--transition-fast",
+    "--transition-base",
+    "--radius-sm",
+    "--radius-full",
+];
+
+/// Strip `/* ... */` CSS comments before scanning for lint violations, so a
+/// hex color or raw value mentioned only in prose (e.g. "// was #fff
+/// before") doesn't false-positive. Not a full CSS parser — good enough for
+/// grep-shaped checks over well-formed stylesheets.
+///
+/// Byte-level scanning is safe on UTF-8 here: `/`, `*`, and `\n` are all
+/// single-byte ASCII code points, and no multi-byte UTF-8 continuation byte
+/// can equal one of them, so slicing on their byte offsets never lands
+/// inside a multi-byte character.
+fn strip_css_comments(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut in_comment = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !in_comment && bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            in_comment = true;
+            i += 2;
+            continue;
+        }
+        if in_comment {
+            if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_comment = false;
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'\n' {
+                out.push('\n'); // keep line numbers aligned
+            }
+            i += 1;
+            continue;
+        }
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Length in bytes of the UTF-8 character starting with `lead_byte`.
+fn utf8_char_len(lead_byte: u8) -> usize {
+    if lead_byte & 0x80 == 0 {
+        1
+    } else if lead_byte & 0xE0 == 0xC0 {
+        2
+    } else if lead_byte & 0xF0 == 0xE0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// One lint finding: 1-based line number + human-readable detail.
+struct LintFinding {
+    line: usize,
+    detail: String,
+}
+
+/// Token lint over an iteration-owned stylesheet body (comments already
+/// stripped). Scans for `#RGB`/`#RGBA`/`#RRGGBB`/`#RRGGBBAA` value-position
+/// hex literals. No regex crate in this workspace's dependency set for host
+/// code, so this is a small manual scanner rather than pulling in a new
+/// dependency for one lint. Returns every violation found — callers turn an
+/// empty vec into a passing check.
+fn lint_hex_colors(body: &str) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    for (line_idx, line) in body.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'#' {
+                let start = i;
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_hexdigit() {
+                    j += 1;
+                }
+                let hex_len = j - start - 1;
+                if matches!(hex_len, 3 | 4 | 6 | 8) {
+                    out.push(LintFinding {
+                        line: line_idx + 1,
+                        detail: format!(
+                            "hex color literal `{}` — use var(--...) instead",
+                            &line[start..j]
+                        ),
+                    });
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn lint_color_functions(body: &str) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    for (line_idx, line) in body.lines().enumerate() {
+        for needle in ["rgb(", "rgba(", "hsl(", "hsla("] {
+            if line.contains(needle) {
+                out.push(LintFinding {
+                    line: line_idx + 1,
+                    detail: format!("`{needle}` literal — use var(--...) instead"),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn lint_font_size_declarations(body: &str) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    for (line_idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("font-size:") && !line.contains("var(--text-") {
+            out.push(LintFinding {
+                line: line_idx + 1,
+                detail: format!("`{}` must reference var(--text-*)", trimmed.trim()),
+            });
+        }
+    }
+    out
+}
+
+fn lint_box_shadow_declarations(body: &str) -> Vec<LintFinding> {
+    let mut out = Vec::new();
+    for (line_idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("box-shadow:")
+            && !line.contains("var(--shadow-")
+            && !trimmed.contains("none")
+        {
+            out.push(LintFinding {
+                line: line_idx + 1,
+                detail: format!(
+                    "`{}` must reference var(--shadow-*) (or be `none`)",
+                    trimmed.trim()
+                ),
+            });
+        }
+    }
+    out
+}
+
+fn push_lint_check(r: &mut StageReport, name: &str, findings: &[LintFinding]) {
+    if findings.is_empty() {
+        r.push(name, true, "ok");
+        return;
+    }
+    let detail = findings
+        .iter()
+        .take(10)
+        .map(|f| format!("line {}: {}", f.line, f.detail))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suffix = if findings.len() > 10 {
+        format!(" (+{} more)", findings.len() - 10)
+    } else {
+        String::new()
+    };
+    r.push(name, false, format!("{detail}{suffix}"));
+}
+
 pub fn validate_frontend_impl(
     plan: &IterationPlan,
     worktree: &Path,
@@ -536,20 +748,34 @@ pub fn validate_frontend_impl(
         "grep for TODO / unimplemented! / todo!()",
     );
 
-    // styles.css delta gate — the FrontendImpl stage must *add* CSS for the
-    // NewApp's new components / routes. A previous iteration shipped a
-    // behaviourally-correct app with zero styling because the model never
-    // touched `app/ui/styles.css`. The snapshot taken at pipeline start lives
-    // at `<job_dir>/inputs/styles.baseline.css`; we require the current file
-    // to exist and to have grown by at least `STYLES_MIN_GROWTH_BYTES`.
-    let styles_path = worktree.join("app/ui/styles.css");
+    // Iteration-owned stylesheet delta gate — the FrontendImpl stage must
+    // *add* CSS for the NewApp's new components / routes. A previous
+    // iteration shipped a behaviourally-correct app with zero styling
+    // because the model never touched the stylesheet. The snapshot taken
+    // at pipeline start lives at `<job_dir>/inputs/styles.baseline.css`;
+    // we require the current file to exist and to have grown by at least
+    // `STYLES_MIN_GROWTH_BYTES`.
+    //
+    // BACKWARD COMPAT: `app/ui/styles/app.css` is the growth target when
+    // present (current layered layout). A worktree cloned from before the
+    // tokens/base/app split has no `styles/app.css` at all — in that case
+    // `iteration_styles_path` falls back to the legacy monolithic
+    // `app/ui/styles.css`, and the snapshot taken at pipeline start will
+    // have targeted the same fallback (see `stages::snapshot_styles_baseline`),
+    // so the delta comparison stays apples-to-apples either way.
+    let styles_path = crate::stages::iteration_styles_path(worktree);
+    let styles_rel_display = styles_path
+        .strip_prefix(worktree)
+        .unwrap_or(&styles_path)
+        .display()
+        .to_string();
     let baseline_path = job_dir
         .join("inputs")
         .join(crate::stages::STYLES_BASELINE_FILENAME);
     let styles_len = std::fs::metadata(&styles_path).map(|m| m.len()).ok();
     let baseline_len = std::fs::metadata(&baseline_path).map(|m| m.len()).ok();
     r.push(
-        "app/ui/styles.css exists",
+        &format!("{styles_rel_display} exists"),
         styles_len.is_some(),
         styles_path.display().to_string(),
     );
@@ -557,7 +783,7 @@ pub fn validate_frontend_impl(
         (Some(now), Some(base)) => {
             let grew_by = now.saturating_sub(base);
             r.push(
-                "app/ui/styles.css grew vs baseline",
+                &format!("{styles_rel_display} grew vs baseline"),
                 grew_by >= STYLES_MIN_GROWTH_BYTES,
                 format!(
                     "baseline={}B, current={}B, delta={}B (min {}B)",
@@ -569,12 +795,76 @@ pub fn validate_frontend_impl(
             // No baseline means the pipeline was launched before this gate
             // existed; skip the delta check rather than failing legacy jobs.
             r.push(
-                "app/ui/styles.css grew vs baseline",
+                &format!("{styles_rel_display} grew vs baseline"),
                 true,
                 "no baseline snapshot — skipped",
             );
         }
         _ => { /* first check already reported the missing file */ }
+    }
+
+    // Token lint — only runs against the layered `styles/app.css` file
+    // (legacy worktrees with no split have no tokens.css to lint against
+    // either, so they're exempt from here on down).
+    let app_css_path = worktree.join("app/ui/styles/app.css");
+    if app_css_path.exists() {
+        let raw = read(&app_css_path);
+        let body = strip_css_comments(&raw);
+
+        push_lint_check(
+            &mut r,
+            "styles/app.css: no hex color literals",
+            &lint_hex_colors(&body),
+        );
+        push_lint_check(
+            &mut r,
+            "styles/app.css: no rgb()/rgba()/hsl() literals",
+            &lint_color_functions(&body),
+        );
+        push_lint_check(
+            &mut r,
+            "styles/app.css: font-size uses var(--text-*)",
+            &lint_font_size_declarations(&body),
+        );
+        push_lint_check(
+            &mut r,
+            "styles/app.css: box-shadow uses var(--shadow-*)",
+            &lint_box_shadow_declarations(&body),
+        );
+        r.push(
+            "styles/app.css: has a :hover rule",
+            body.contains(":hover"),
+            "at least one interactive :hover state is required",
+        );
+        r.push(
+            "styles/app.css: has a :focus-visible rule",
+            body.contains(":focus-visible"),
+            "at least one interactive :focus-visible state is required",
+        );
+
+        // Token integrity gate — tokens.css must exist and define every
+        // required token NAME (values are free to change per-iteration).
+        let tokens_path = worktree.join("app/ui/styles/tokens.css");
+        let tokens_body = read(&tokens_path);
+        r.push(
+            "styles/tokens.css exists",
+            tokens_path.exists(),
+            tokens_path.display().to_string(),
+        );
+        let missing_tokens: Vec<&str> = REQUIRED_TOKEN_NAMES
+            .iter()
+            .filter(|name| !tokens_body.contains(*name))
+            .copied()
+            .collect();
+        r.push(
+            "styles/tokens.css defines every required token",
+            missing_tokens.is_empty(),
+            if missing_tokens.is_empty() {
+                "ok".to_string()
+            } else {
+                format!("missing: {}", missing_tokens.join(", "))
+            },
+        );
     }
 
     push_tool_gate(
@@ -697,6 +987,30 @@ pub fn validate_final(plan: &IterationPlan, worktree: &Path) -> StageReport {
             styles_body.contains(".canvas-overlay"),
             "canvas overlay CSS removed — the per-page annotation overlay would not render",
         );
+
+        // Design token vocabulary is protected chrome too: base.css and
+        // app.css both assume every token name in REQUIRED_TOKEN_NAMES
+        // resolves. Only enforced when the layered stylesheet layout is
+        // present — a worktree that predates the split (or a stack that
+        // deliberately rewrote the whole styling story) is out of scope.
+        let tokens_path = worktree.join("app/ui/styles/tokens.css");
+        if tokens_path.exists() {
+            let tokens_body = read(&tokens_path);
+            let missing_tokens: Vec<&str> = REQUIRED_TOKEN_NAMES
+                .iter()
+                .filter(|name| !tokens_body.contains(*name))
+                .copied()
+                .collect();
+            r.push(
+                "styles/tokens.css defines every required token",
+                missing_tokens.is_empty(),
+                if missing_tokens.is_empty() {
+                    "ok".to_string()
+                } else {
+                    format!("missing: {}", missing_tokens.join(", "))
+                },
+            );
+        }
     } else {
         r.push(
             "shell invariants (I-P1..I-P3b)",
@@ -1885,6 +2199,301 @@ mod tests {
             "grown styles.css must pass the delta gate: {:?}",
             styles_check
         );
+    }
+
+    /// Minimal tokens.css body containing every REQUIRED_TOKEN_NAMES entry
+    /// once, so lint tests that only care about app.css don't also trip
+    /// the token-integrity gate.
+    fn full_tokens_css() -> String {
+        REQUIRED_TOKEN_NAMES
+            .iter()
+            .map(|name| format!("{name}: red;\n"))
+            .collect::<String>()
+    }
+
+    /// Sets up `app/ui/styles/tokens.css` (complete) and
+    /// `app/ui/styles/app.css` (given body) under a fresh worktree, plus
+    /// the minimal interop/app.rs scaffolding `validate_frontend_impl`
+    /// expects. Returns (worktree, job_dir) — job_dir has no baseline
+    /// snapshot, so the growth gate reports "skipped".
+    fn layered_worktree(app_css_body: &str) -> (tempfile::TempDir, IterationPlan) {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("wt");
+        let ui_src = worktree.join("app/ui/src");
+        std::fs::create_dir_all(&ui_src).unwrap();
+        std::fs::write(ui_src.join("interop.rs"), "").unwrap();
+        std::fs::write(ui_src.join("app.rs"), "fn Home() {}\n").unwrap();
+
+        let styles_dir = worktree.join("app/ui/styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        std::fs::write(styles_dir.join("tokens.css"), full_tokens_css()).unwrap();
+        std::fs::write(styles_dir.join("app.css"), app_css_body).unwrap();
+
+        let plan = seed_plan();
+        (tmp, plan)
+    }
+
+    #[test]
+    fn app_css_lint_rejects_hex_color_with_line_number() {
+        let (tmp, plan) =
+            layered_worktree(".widget {\n  color: #ff00aa;\n  font-size: var(--text-sm);\n}\n");
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: no hex color literals")
+            .expect("hex lint check present");
+        assert!(!check.passed);
+        assert!(
+            check.detail.contains("line 2"),
+            "detail should cite the line number: {}",
+            check.detail
+        );
+        assert!(check.detail.contains("#ff00aa"), "{}", check.detail);
+    }
+
+    #[test]
+    fn app_css_lint_rejects_rgb_literal() {
+        let (tmp, plan) = layered_worktree(
+            ".widget {\n  background: rgba(255, 0, 0, 0.5);\n  font-size: var(--text-sm);\n}\n",
+        );
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: no rgb()/rgba()/hsl() literals")
+            .expect("color-function lint check present");
+        assert!(!check.passed);
+        assert!(check.detail.contains("line 2"), "{}", check.detail);
+    }
+
+    #[test]
+    fn app_css_lint_rejects_untokened_font_size() {
+        let (tmp, plan) = layered_worktree(".widget {\n  font-size: 14px;\n}\n");
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: font-size uses var(--text-*)")
+            .expect("font-size lint check present");
+        assert!(!check.passed);
+        assert!(check.detail.contains("line 2"), "{}", check.detail);
+
+        // A tokened font-size passes.
+        let (tmp2, plan2) = layered_worktree(".widget {\n  font-size: var(--text-sm);\n}\n");
+        let worktree2 = tmp2.path().join("wt");
+        let job_dir2 = tmp2.path().join("job");
+        let report2 = validate_frontend_impl(&plan2, &worktree2, &job_dir2);
+        let check2 = report2
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: font-size uses var(--text-*)")
+            .expect("font-size lint check present");
+        assert!(check2.passed, "{:?}", check2);
+    }
+
+    #[test]
+    fn app_css_lint_requires_focus_visible_rule() {
+        let (tmp, plan) = layered_worktree(
+            ".widget {\n  font-size: var(--text-sm);\n}\n.widget:hover {\n  color: var(--accent);\n}\n",
+        );
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let hover_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: has a :hover rule")
+            .expect(":hover check present");
+        assert!(hover_check.passed);
+        let focus_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: has a :focus-visible rule")
+            .expect(":focus-visible check present");
+        assert!(
+            !focus_check.passed,
+            "no :focus-visible rule should fail the floor"
+        );
+    }
+
+    #[test]
+    fn app_css_lint_ignores_hex_colors_inside_comments() {
+        let (tmp, plan) = layered_worktree(
+            "/* old color was #ff00aa, now tokenised */\n.widget {\n  color: var(--fg);\n  font-size: var(--text-sm);\n}\n.widget:hover { color: var(--accent); }\n.widget:focus-visible { outline: 2px solid var(--accent); }\n",
+        );
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: no hex color literals")
+            .expect("hex lint check present");
+        assert!(
+            check.passed,
+            "hex literal inside a comment must not trip the lint: {:?}",
+            check
+        );
+    }
+
+    #[test]
+    fn app_css_lint_full_pass_on_clean_stylesheet() {
+        let (tmp, plan) = layered_worktree(
+            ".widget {\n  color: var(--fg);\n  font-size: var(--text-sm);\n  box-shadow: var(--shadow-1);\n}\n.widget:hover { color: var(--accent); }\n.widget:focus-visible { outline: 2px solid var(--accent); }\n",
+        );
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        for name in [
+            "styles/app.css: no hex color literals",
+            "styles/app.css: no rgb()/rgba()/hsl() literals",
+            "styles/app.css: font-size uses var(--text-*)",
+            "styles/app.css: box-shadow uses var(--shadow-*)",
+            "styles/app.css: has a :hover rule",
+            "styles/app.css: has a :focus-visible rule",
+            "styles/tokens.css exists",
+            "styles/tokens.css defines every required token",
+        ] {
+            let check = report
+                .checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing check {name}"));
+            assert!(check.passed, "{name} should pass: {:?}", check);
+        }
+    }
+
+    #[test]
+    fn tokens_css_missing_required_name_fails_integrity_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("wt");
+        let ui_src = worktree.join("app/ui/src");
+        std::fs::create_dir_all(&ui_src).unwrap();
+        std::fs::write(ui_src.join("interop.rs"), "").unwrap();
+        std::fs::write(ui_src.join("app.rs"), "fn Home() {}\n").unwrap();
+
+        let styles_dir = worktree.join("app/ui/styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        // Drop --shadow-2 from an otherwise-complete tokens file.
+        let incomplete: String = REQUIRED_TOKEN_NAMES
+            .iter()
+            .filter(|n| **n != "--shadow-2")
+            .map(|name| format!("{name}: red;\n"))
+            .collect();
+        std::fs::write(styles_dir.join("tokens.css"), incomplete).unwrap();
+        std::fs::write(
+            styles_dir.join("app.css"),
+            ".widget:hover{} .widget:focus-visible{}",
+        )
+        .unwrap();
+
+        let plan = seed_plan();
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/tokens.css defines every required token")
+            .expect("token integrity check present");
+        assert!(!check.passed);
+        assert!(check.detail.contains("--shadow-2"), "{}", check.detail);
+    }
+
+    #[test]
+    fn frontend_impl_legacy_worktree_without_app_css_skips_token_lint() {
+        // No app/ui/styles/app.css and no app/ui/styles/tokens.css — the
+        // pre-split legacy layout. The token lint block must not fire at
+        // all (no checks with the "styles/app.css:" or "styles/tokens.css"
+        // prefixes), and the growth gate must fall back to the monolithic
+        // styles.css, which `frontend_impl_accepts_grown_styles` already
+        // covers for the passing case.
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("wt");
+        let ui_src = worktree.join("app/ui/src");
+        std::fs::create_dir_all(&ui_src).unwrap();
+        std::fs::write(ui_src.join("interop.rs"), "").unwrap();
+        std::fs::write(ui_src.join("app.rs"), "fn Home() {}\n").unwrap();
+        std::fs::write(
+            worktree.join("app/ui/styles.css"),
+            "body { color: black; }\n",
+        )
+        .unwrap();
+
+        let plan = seed_plan();
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.name.starts_with("styles/app.css")
+                    || c.name.starts_with("styles/tokens.css")),
+            "legacy worktree must not run the layered token lint: {:?}",
+            report.checks
+        );
+        let exists_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "app/ui/styles.css exists")
+            .expect("legacy exists check present");
+        assert!(exists_check.passed);
+    }
+
+    #[test]
+    fn final_review_requires_tokens_css_and_required_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        let ui_dir = worktree.join("app/ui/src");
+        std::fs::create_dir_all(&ui_dir).unwrap();
+        std::fs::write(
+            ui_dir.join("shell.rs"),
+            "pub fn Shell() { let panel_open = RwSignal::new(false); FeedbackFab(); }",
+        )
+        .unwrap();
+        std::fs::write(ui_dir.join("app.rs"), "view! { <Shell>..</Shell> }").unwrap();
+        std::fs::write(
+            worktree.join("app/ui/styles.css"),
+            ".canvas-overlay { background: transparent; }",
+        )
+        .unwrap();
+        let styles_dir = worktree.join("app/ui/styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        // Incomplete tokens.css — missing --radius-full.
+        let incomplete: String = REQUIRED_TOKEN_NAMES
+            .iter()
+            .filter(|n| **n != "--radius-full")
+            .map(|name| format!("{name}: 1px;\n"))
+            .collect();
+        std::fs::write(styles_dir.join("tokens.css"), incomplete).unwrap();
+
+        let mut plan = crate::plan::IterationPlan::default();
+        plan.app.iteration = 2;
+        plan.stage = crate::plan::PlanStage::E2EImplemented;
+        let report = validate_final(&plan, worktree);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/tokens.css defines every required token")
+            .expect("final review must check token integrity");
+        assert!(!check.passed);
+        assert!(check.detail.contains("--radius-full"), "{}", check.detail);
+
+        // Complete tokens.css → green.
+        std::fs::write(styles_dir.join("tokens.css"), full_tokens_css()).unwrap();
+        let report = validate_final(&plan, worktree);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/tokens.css defines every required token")
+            .expect("final review must check token integrity");
+        assert!(check.passed, "{:?}", check);
     }
 
     #[test]

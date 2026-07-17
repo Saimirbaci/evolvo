@@ -173,15 +173,33 @@ fn stage_annotations(
 /// stage actually added CSS rules for the NewApp components (a regression
 /// Claude has shipped more than once — a behaviourally-correct but
 /// unstyled app).
+///
+/// Legacy name, legacy meaning: this snapshot now targets whichever file is
+/// the iteration-owned stylesheet in this worktree — `app/ui/styles/app.css`
+/// if it exists (the current layered layout), else `app/ui/styles.css` (a
+/// worktree cloned from before the tokens/base/app split).
 pub const STYLES_BASELINE_FILENAME: &str = "styles.baseline.css";
 
-/// Copy `<worktree>/app/ui/styles.css` into
-/// `<job_dir>/inputs/styles.baseline.css` the first time the pipeline runs
-/// in this worktree. Idempotent — if the snapshot already exists (resume
-/// path) the existing baseline is kept so size comparisons stay stable
-/// across retries.
+/// Path to the iteration-owned stylesheet in `worktree`: the layered
+/// `app/ui/styles/app.css` when present, else the legacy monolithic
+/// `app/ui/styles.css`. Centralised here so the snapshot step and the
+/// validator agree on which file is "the" NewApp stylesheet.
+pub fn iteration_styles_path(worktree: &Path) -> PathBuf {
+    let layered = worktree.join("app/ui/styles/app.css");
+    if layered.exists() {
+        layered
+    } else {
+        worktree.join("app/ui/styles.css")
+    }
+}
+
+/// Copy the worktree's iteration-owned stylesheet (see
+/// [`iteration_styles_path`]) into `<job_dir>/inputs/styles.baseline.css`
+/// the first time the pipeline runs in this worktree. Idempotent — if the
+/// snapshot already exists (resume path) the existing baseline is kept so
+/// size comparisons stay stable across retries.
 pub fn snapshot_styles_baseline(worktree: &Path, job_dir: &Path) -> std::io::Result<()> {
-    let src = worktree.join("app/ui/styles.css");
+    let src = iteration_styles_path(worktree);
     if !src.exists() {
         return Ok(());
     }

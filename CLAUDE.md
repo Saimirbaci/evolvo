@@ -131,6 +131,17 @@ The UI is split into two layers:
 
 Shell exposes `PanelOpen` via `provide_context` so NewApp content can read the Canvas/Feedback open state (e.g. to hide copy from the submission screenshot) without re-implementing the FAB.
 
+## Stylesheet layers — tokens / shell / base / app
+
+Trunk loads four stylesheets in cascade order (`app/ui/index.html`):
+
+1. **`app/ui/styles/tokens.css`** (protected) — the design vocabulary: every CSS custom property (`--bg`, `--accent`, `--space-*`, `--text-*`, `--shadow-*`, …). Iterations may change token *values* for a new visual identity but must never delete or rename a token — `validate_frontend_impl` / `validate_final` grep for the full name list.
+2. **`app/ui/styles.css`** (protected shell layer) — app bar, canvas overlay, feedback panel, toolbar, lineage pages, evolve modal, feedback FAB. Do not add NewApp-specific rules here.
+3. **`app/ui/styles/base.css`** (protected, append-only) — reusable component primitives built only from tokens: `.btn`/`.btn-primary`/`.btn-danger`/`.btn-ghost`, `.card`, `.input`, `.field`, `.empty-state`, `.badge`. Extending with new primitives is fine; deleting or modifying an existing one is not.
+4. **`app/ui/styles/app.css`** (iteration-owned) — the only stylesheet the FrontendImpl stage may edit. Must use `var(--...)` tokens for colors/font-size/box-shadow — no raw hex/rgb/hsl. The growth gate (`STYLES_MIN_GROWTH_BYTES`, `app/src-tauri/src/validators.rs`) and the design lint both target this file; legacy worktrees without `styles/app.css` fall back to treating `app/ui/styles.css` as the growth target.
+
+See `prompts/stages/frontend_impl.md` for the exact lint rules an agent implementing a NewApp must satisfy.
+
 ## Canvas + Feedback overlay rules (load-bearing, easy to regress)
 
 These concrete rules are what make I-P2 / I-P3 actually work. Previous
