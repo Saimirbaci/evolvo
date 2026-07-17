@@ -620,15 +620,15 @@ pub fn load_plan(job_dir: &Path) -> Result<Option<IterationPlan>, StoreError> {
     Ok(Some(plan))
 }
 
-/// Atomically write the plan to disk (tmp + rename) so a crash mid-write
-/// can't leave a half-written JSON behind.
+/// Atomically write the plan to disk (tmp + rename, via
+/// `fsutil::write_atomic`) so a crash mid-write can't leave a half-written
+/// JSON behind — the same primitive `store.rs` uses for feedback/lineage
+/// job records.
 pub fn save_plan(job_dir: &Path, plan: &IterationPlan) -> Result<PathBuf, StoreError> {
     std::fs::create_dir_all(job_dir)?;
     let final_path = job_dir.join(PLAN_FILENAME);
-    let tmp_path = job_dir.join(format!("{PLAN_FILENAME}.tmp"));
     let json = serde_json::to_string_pretty(plan)?;
-    std::fs::write(&tmp_path, json)?;
-    std::fs::rename(&tmp_path, &final_path)?;
+    crate::fsutil::write_atomic(&final_path, json.as_bytes())?;
     Ok(final_path)
 }
 

@@ -32,7 +32,7 @@ pub struct LineageEngine<'a> {
 /// `commands::resume_lineage_job`). Process-wide because engines are
 /// constructed ad-hoc per call; atomic file writes alone cannot fix this,
 /// only serialise the torn file, so the lock is load-bearing.
-fn job_write_lock(job_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+pub(crate) fn job_write_lock(job_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -42,6 +42,62 @@ fn job_write_lock(job_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.entry(job_id.to_string()).or_default().clone()
+}
+
+/// Serialises the *decision + worktree mutation* phase of
+/// `commands::retry_lineage_job` per job id. Deliberately a **separate**
+/// lock map from [`job_write_lock`]: the retry flow calls
+/// `LineageEngine::append_note` / `force_status` internally while this
+/// lock is held, and those methods take `job_write_lock` themselves —
+/// reusing the same map would self-deadlock (`std::sync::Mutex` is not
+/// reentrant). This lock only ever guards
+/// check-worktree-then-reset-or-teardown, never a call back into
+/// `LineageEngine`.
+pub(crate) fn job_retry_lock(job_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.entry(job_id.to_string()).or_default().clone()
+}
+
+/// Retrying wrapper around `LineageEngine::force_status` for **failure
+/// paths** on background threads (runner/promotion). A job's terminal
+/// status write is not advisory the way a note is — if it silently fails
+/// (e.g. a transient `StoreError::Io` from a momentarily-locked file,
+/// full disk, etc.) the job is stuck saying `Implementing`/`Merging`
+/// forever with nothing left alive to retry it, since the thread that
+/// would have written the failure is about to exit. Retries a few times
+/// with a short backoff (acceptable here — these are already
+/// failure-path calls on background threads, not the interactive path)
+/// and logs loudly with the job id if every attempt fails, so the
+/// failure is at least visible in the process log even though the UI
+/// won't reflect it.
+///
+/// Note-append calls remain best-effort `let _ = engine.append_note(...)`
+/// — notes are informational; only the terminal status write gets this
+/// treatment.
+pub fn force_status_with_retry(engine: &LineageEngine<'_>, job_id: &str, status: LineageJobStatus) {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match engine.force_status(job_id, status) {
+            Ok(_) => return,
+            Err(e) => {
+                if attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(BACKOFF);
+                } else {
+                    eprintln!(
+                        "evolvo: job {job_id} failed to write status {status:?} after {MAX_ATTEMPTS} attempts — job may be stuck; last error: {e}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,5 +636,52 @@ mod tests {
         assert_eq!(j2.notes, vec!["needs more detail"]);
         let j3 = engine.append_note(&job.id, "   ").unwrap();
         assert_eq!(j3.notes.len(), 1);
+    }
+
+    #[test]
+    fn force_status_with_retry_succeeds_on_first_try_for_a_real_job() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = mk_feedback("fb-1");
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
+
+        force_status_with_retry(&engine, &job.id, LineageJobStatus::Failed);
+
+        let back = store.load_lineage_job(&job.id).unwrap().unwrap();
+        assert_eq!(back.status, LineageJobStatus::Failed);
+    }
+
+    #[test]
+    fn force_status_with_retry_gives_up_after_max_attempts_without_panicking() {
+        // A job id with no backing record on disk means every
+        // `force_status` attempt returns Err. This must exhaust its
+        // retries and return quietly (logging to stderr) rather than
+        // panicking or looping forever.
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+
+        force_status_with_retry(&engine, "job-does-not-exist", LineageJobStatus::Failed);
+        // Reaching this line without panicking/hanging is the assertion.
+    }
+
+    #[test]
+    fn job_retry_lock_is_distinct_from_job_write_lock() {
+        // Regression guard for the self-deadlock this module documents:
+        // `job_retry_lock` and `job_write_lock` must never resolve to the
+        // same underlying Mutex for the same job id, or a caller that
+        // holds the retry lock while calling into `LineageEngine` (which
+        // takes the write lock internally) would deadlock.
+        let retry = job_retry_lock("job-x");
+        let write = job_write_lock("job-x");
+        assert!(
+            !std::sync::Arc::ptr_eq(&retry, &write),
+            "job_retry_lock and job_write_lock must be backed by separate mutexes"
+        );
     }
 }

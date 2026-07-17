@@ -120,6 +120,7 @@ pub fn app_health(state: State<'_, AppState>) -> Result<AppHealth, String> {
         launched_at_unix_ms: state.launched_at_unix_ms,
         active_agent_sessions: crate::concurrency::active_count(),
         max_concurrent_agent_sessions: crate::concurrency::cap(),
+        corrupted_entity_count: store.count_quarantined_entities(),
     })
 }
 
@@ -130,6 +131,10 @@ pub fn submit_feedback(
 ) -> Result<FeedbackRecord, String> {
     let store = state.store();
     store.init_workspace().map_err(store_error)?;
+
+    if let Some(cfg) = payload.local_delegate.as_ref() {
+        cfg.validate()?;
+    }
 
     let now = current_time_unix_ms();
     let id = format!("fb-{now}");
@@ -490,7 +495,7 @@ fn start_implementation_run(
         // happened, then surface the error to the frontend.
         let msg = store_error(e);
         let _ = engine.append_note(&job.id, &format!("failed to prepare run: {msg}"));
-        let _ = engine.force_status(&job.id, LineageJobStatus::Failed);
+        crate::lineage::force_status_with_retry(engine, &job.id, LineageJobStatus::Failed);
         msg
     })?;
 
@@ -542,6 +547,26 @@ pub fn retry_lineage_job(
 ) -> Result<LineageJobRecord, String> {
     let store = state.store();
     let engine = LineageEngine::new(&store);
+
+    // Serialize the whole soft-retry decision (checkpoint lookup, worktree
+    // reset/teardown, status flip) per job id. Without this, two
+    // concurrent retry calls on the same job (e.g. a double click, or a
+    // UI retry racing a background reconciler) can both read the same
+    // `can_retry()`-eligible status, then interleave their worktree
+    // resets/teardowns — one retry's `reset_worktree_to` can run against
+    // a worktree the other retry's `cleanup_previous_run` just deleted
+    // (TOCTOU between the `.exists()` filter below and the actual git
+    // operations a few lines later). Holding this lock for the duration
+    // turns that race into a clean second-caller failure (`can_retry()`
+    // false, or a "no longer exists" error from `reset_worktree_to`)
+    // instead of undefined worktree state.
+    //
+    // This is `job_retry_lock`, NOT `job_write_lock` — this function calls
+    // `engine.append_note` / `engine.force_status` below, which internally
+    // take `job_write_lock`; reusing that lock here would self-deadlock
+    // since `std::sync::Mutex` isn't reentrant.
+    let _retry_guard = crate::lineage::job_retry_lock(&payload.id);
+    let _retry_guard = _retry_guard.lock().unwrap_or_else(|p| p.into_inner());
 
     let job = store
         .load_lineage_job(&payload.id)

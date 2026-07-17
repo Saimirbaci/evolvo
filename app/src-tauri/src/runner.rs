@@ -341,7 +341,7 @@ pub fn stage_attachments(
     feedback: &FeedbackRecord,
     inputs_dir: &Path,
 ) -> Result<Vec<StagedAttachment>, StoreError> {
-    fs::create_dir_all(inputs_dir)?;
+    crate::fsutil::create_dir_all_private(inputs_dir)?;
     let mut staged = Vec::new();
 
     let mut copy = |role: &str, filename: &str| -> Result<(), StoreError> {
@@ -854,6 +854,14 @@ pub fn resolve_delegate(
     job_dir: &Path,
 ) -> Option<PreparedDelegate> {
     let cfg = feedback.local_delegate.as_ref()?;
+    // Defense in depth: `submit_feedback` already validates this at the
+    // IPC boundary, but resume/retry paths reload the feedback record
+    // from disk, which could in principle have been hand-edited or
+    // written by an older/different version of the app. Never splice an
+    // unvalidated provider/model into the child env below.
+    if cfg.validate().is_err() {
+        return None;
+    }
     let wrapper = source_repo.join("scripts").join("evolvo-delegate.sh");
     if !wrapper.is_file() {
         return None;
@@ -916,7 +924,11 @@ pub fn prepare_run(
 
     let root = store.layout().root().to_path_buf();
     let job_dir = job_workspace_dir(&root, &job.id);
-    fs::create_dir_all(&job_dir)?;
+    // Lineage workspaces hold a full source-repo worktree, agent
+    // transcripts, and (when delegation is on) provider config — owner-
+    // only on Unix, same rationale as the top-level workspace dirs in
+    // `store::init_workspace`.
+    crate::fsutil::create_dir_all_private(&job_dir)?;
 
     let worktree = worktree_path(&root, &job.id);
     let inputs_dir = inputs_path(&root, &job.id);
@@ -1036,7 +1048,7 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                     &job_id,
                     &format!("failed to open log {}: {e}", prepared.log_file.display()),
                 );
-                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
                 return;
             }
         };
@@ -1044,7 +1056,7 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
             Ok(f) => f,
             Err(e) => {
                 let _ = engine.append_note(&job_id, &format!("failed to clone log handle: {e}"));
-                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
                 return;
             }
         };
@@ -1101,7 +1113,7 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                         prepared.log_file.display()
                     ),
                 );
-                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
                 return;
             }
             Err(e) => Err(e),
@@ -1122,7 +1134,11 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                             prepared.log_file.display()
                         ),
                     );
-                    let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                    crate::lineage::force_status_with_retry(
+                        &engine,
+                        &job_id,
+                        LineageJobStatus::Failed,
+                    );
                     return;
                 }
 
@@ -1146,7 +1162,11 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                             gates.failure_block()
                         ),
                     );
-                    let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                    crate::lineage::force_status_with_retry(
+                        &engine,
+                        &job_id,
+                        LineageJobStatus::Failed,
+                    );
                 }
             }
             Ok(s) => {
@@ -1163,7 +1183,7 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                         prepared.log_file.display()
                     ),
                 );
-                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
             }
             Err(e) => {
                 let _ = engine.append_note(
@@ -1174,7 +1194,7 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                         backend.binary(),
                     ),
                 );
-                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
             }
         }
     });
@@ -1839,7 +1859,7 @@ pub fn launch_pipeline(
             job.iteration,
         ) {
             let _ = engine.append_note(&job_id, &format!("pipeline: seed plan failed — {e}"));
-            let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+            crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
             return;
         }
 
@@ -1900,12 +1920,16 @@ pub fn launch_pipeline(
                         &job_id,
                         &format!("pipeline: stopped at {first_red} — marking failed"),
                     );
-                    let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                    crate::lineage::force_status_with_retry(
+                        &engine,
+                        &job_id,
+                        LineageJobStatus::Failed,
+                    );
                 }
             }
             Err(e) => {
                 let _ = engine.append_note(&job_id, &format!("pipeline: dispatcher error — {e}"));
-                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
             }
         }
     });
@@ -1915,7 +1939,20 @@ pub fn launch_pipeline(
 /// Checkpoints are written by `stages::checkpoint_worktree` with the
 /// message `stage(<slug>): green checkpoint — job <id>` after each stage
 /// validates green.
+///
+/// Explicit existence check up front: `git -C <missing-dir>` already fails
+/// gracefully (non-zero exit, caught below and mapped to `None`), so this
+/// isn't required for correctness, but it avoids spawning a doomed `git`
+/// process in the common TOCTOU case where the worktree vanished between
+/// a caller's `.exists()` check and this call (e.g. a concurrent retry's
+/// teardown racing this one — see `commands::retry_lineage_job`, which now
+/// takes the job write lock around the whole soft-retry decision to close
+/// that race at the source, but this guard is cheap defense in depth for
+/// any other caller).
 pub fn last_green_checkpoint(worktree: &Path) -> Option<String> {
+    if !worktree.exists() {
+        return None;
+    }
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(worktree)
@@ -1940,7 +1977,18 @@ pub fn last_green_checkpoint(worktree: &Path) -> Option<String> {
 /// (including untracked files a failed stage left behind). Used by the
 /// soft-retry path so a retry restarts from the last green stage instead
 /// of throwing the whole worktree away.
+///
+/// Returns a clear error (rather than letting `git reset` fail with a
+/// confusing message) if the worktree vanished between a caller's
+/// existence check and this call — see the TOCTOU note on
+/// `last_green_checkpoint`.
 pub fn reset_worktree_to(worktree: &Path, sha: &str) -> Result<(), String> {
+    if !worktree.exists() {
+        return Err(format!(
+            "worktree {} no longer exists — cannot reset",
+            worktree.display()
+        ));
+    }
     let run = |args: &[&str]| -> Result<(), String> {
         let st = std::process::Command::new("git")
             .arg("-C")
@@ -1982,7 +2030,7 @@ pub fn reconcile_orphaned_jobs(store: &Store) -> usize {
                 &job.id,
                 "host restarted while this job was Implementing — its runner is gone; marked failed (Resume continues from the last green stage, Retry starts over)",
             );
-            let _ = engine.force_status(&job.id, LineageJobStatus::Failed);
+            crate::lineage::force_status_with_retry(&engine, &job.id, LineageJobStatus::Failed);
             reconciled += 1;
         } else if matches!(job.status, LineageJobStatus::Merging) {
             reconcile_orphaned_merge(&engine, &job);
@@ -1990,6 +2038,144 @@ pub fn reconcile_orphaned_jobs(store: &Store) -> usize {
         }
     }
     reconciled
+}
+
+/// Default retention window (days) for lineage workspaces belonging to
+/// terminal `Failed`/`Rejected` jobs, overridable via
+/// `EVOLVO_WORKSPACE_RETENTION_DAYS`. `0` disables cleanup entirely — the
+/// env var is the escape hatch for a reviewer who wants to keep every
+/// worktree around for post-mortem debugging.
+const DEFAULT_WORKSPACE_RETENTION_DAYS: u64 = 30;
+
+pub fn workspace_retention_days() -> u64 {
+    std::env::var("EVOLVO_WORKSPACE_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WORKSPACE_RETENTION_DAYS)
+}
+
+/// Outcome tally for one `cleanup_old_workspaces` pass, logged as a
+/// one-line summary on startup.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceCleanupSummary {
+    pub removed: usize,
+    pub quarantined: usize,
+    pub kept: usize,
+}
+
+/// Remove `lineage_workspaces/<job-id>/` directories that are safe to
+/// reclaim: the job is in a terminal `Failed` or `Rejected` state AND its
+/// `updated_at_unix_ms` is older than `max_age_days`. Never touches a
+/// workspace for `Promoted`, `BuildReady`, or any other (non-terminal)
+/// status — those are either the durable record of a shipped change or
+/// still potentially actionable (Retry/Resume/Approve).
+///
+/// A directory with **no matching job record** is never deleted outright
+/// — it might belong to a job whose record was itself lost (e.g. a
+/// corrupted-and-quarantined `lineage_jobs/<id>.json`, or a partial write
+/// from a crash). Instead it's moved into `lineage_workspaces/.orphaned/`
+/// so the bytes are recoverable, and counted separately from `removed`.
+///
+/// `max_age_days == 0` disables cleanup entirely (returns immediately with
+/// an all-zero summary) — see `EVOLVO_WORKSPACE_RETENTION_DAYS`.
+pub fn cleanup_old_workspaces(store: &Store, max_age_days: u64) -> WorkspaceCleanupSummary {
+    let mut summary = WorkspaceCleanupSummary::default();
+    if max_age_days == 0 {
+        return summary;
+    }
+
+    let root = lineage_workspaces_root(store.layout().root());
+    let Ok(entries) = fs::read_dir(&root) else {
+        return summary;
+    };
+
+    let jobs: std::collections::HashMap<String, LineageJobRecord> = store
+        .list_lineage_jobs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|j| (j.id.clone(), j))
+        .collect();
+
+    let now = crate::types::current_time_unix_ms();
+    let cutoff_ms = max_age_days.saturating_mul(24 * 60 * 60 * 1000);
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Never walk into the orphan quarantine dir itself, and skip
+        // anything that isn't a plain job-id directory.
+        if dir_name == ORPHANED_WORKSPACES_DIR {
+            continue;
+        }
+
+        match jobs.get(dir_name) {
+            None => {
+                quarantine_orphan_workspace(&root, &path, dir_name);
+                summary.quarantined += 1;
+            }
+            Some(job) => {
+                let is_terminal_reclaimable = matches!(
+                    job.status,
+                    LineageJobStatus::Failed | LineageJobStatus::Rejected
+                );
+                let age_ms = now.saturating_sub(job.updated_at_unix_ms);
+                if is_terminal_reclaimable && age_ms >= cutoff_ms {
+                    if fs::remove_dir_all(&path).is_ok() {
+                        prune_worktree_best_effort(job);
+                        summary.removed += 1;
+                    } else {
+                        summary.kept += 1;
+                    }
+                } else {
+                    summary.kept += 1;
+                }
+            }
+        }
+    }
+
+    summary
+}
+
+const ORPHANED_WORKSPACES_DIR: &str = ".orphaned";
+
+/// Move a lineage-workspace directory with no matching job record into
+/// `lineage_workspaces/.orphaned/<dir_name>` (appending a unix-ms suffix
+/// on a name collision) instead of deleting it. Best-effort: if the move
+/// fails, the directory is simply left where it was — never lost.
+fn quarantine_orphan_workspace(root: &Path, path: &Path, dir_name: &str) {
+    let orphan_root = root.join(ORPHANED_WORKSPACES_DIR);
+    if fs::create_dir_all(&orphan_root).is_err() {
+        return;
+    }
+    let mut dest = orphan_root.join(dir_name);
+    if dest.exists() {
+        let now = crate::types::current_time_unix_ms();
+        dest = orphan_root.join(format!("{dir_name}.{now}"));
+    }
+    let _ = fs::rename(path, &dest);
+}
+
+/// Best-effort `git worktree prune` in the job's source repo after its
+/// lineage workspace directory (and the worktree inside it) is deleted.
+/// Without this, the source repo's `.git/worktrees/<name>` metadata keeps
+/// pointing at a now-missing directory, and `git worktree list` in the
+/// source repo shows a stale "prunable" entry forever. Ignores every
+/// failure — this is bookkeeping hygiene in the *source* repo, never
+/// allowed to block or fail the workspace cleanup itself.
+fn prune_worktree_best_effort(job: &LineageJobRecord) {
+    let Some(repo) = job.source_repo.as_deref() else {
+        return;
+    };
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output();
 }
 
 /// Decide the terminal state for a job the host crashed while promoting
@@ -2179,7 +2365,7 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
             job.iteration,
         ) {
             let _ = engine.append_note(&job_id, &format!("resume: seed plan failed — {e}"));
-            let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+            crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
             return;
         }
 
@@ -2235,12 +2421,16 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
                         &job_id,
                         &format!("resume: stopped at {first_red} — marking failed"),
                     );
-                    let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                    crate::lineage::force_status_with_retry(
+                        &engine,
+                        &job_id,
+                        LineageJobStatus::Failed,
+                    );
                 }
             }
             Err(e) => {
                 let _ = engine.append_note(&job_id, &format!("resume: dispatcher error — {e}"));
-                let _ = engine.force_status(&job_id, LineageJobStatus::Failed);
+                crate::lineage::force_status_with_retry(&engine, &job_id, LineageJobStatus::Failed);
             }
         }
     });
@@ -2885,6 +3075,27 @@ mod tests {
     }
 
     #[test]
+    fn last_green_checkpoint_returns_none_for_missing_worktree() {
+        // TOCTOU guard: a worktree that vanished between a caller's
+        // `.exists()` check and this call must not panic or spawn a
+        // doomed `git` process — just report "no checkpoint found".
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(last_green_checkpoint(&missing), None);
+    }
+
+    #[test]
+    fn reset_worktree_to_errors_clearly_for_missing_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = reset_worktree_to(&missing, "deadbeef").unwrap_err();
+        assert!(
+            err.contains("no longer exists"),
+            "error should explain the worktree vanished: {err}"
+        );
+    }
+
+    #[test]
     fn reconcile_orphans_flips_only_implementing_jobs() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::new(temp.path().to_path_buf());
@@ -2911,6 +3122,150 @@ mod tests {
         );
         let healthy = store.load_lineage_job("job-healthy").unwrap().unwrap();
         assert_eq!(healthy.status, LineageJobStatus::BuildReady, "untouched");
+    }
+
+    /// Milliseconds-since-epoch far enough in the past that any
+    /// `max_age_days` cutoff used in these tests treats it as old.
+    fn long_ago_unix_ms() -> u64 {
+        crate::types::current_time_unix_ms().saturating_sub(90 * 24 * 60 * 60 * 1000)
+    }
+
+    #[test]
+    fn cleanup_old_workspaces_removes_old_failed_job_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        let mut job = mk_job();
+        job.id = "job-old-failed".into();
+        job.status = LineageJobStatus::Failed;
+        job.updated_at_unix_ms = long_ago_unix_ms();
+        store.save_lineage_job(&job).unwrap();
+
+        let dir = job_workspace_dir(store.layout().root(), &job.id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("marker.txt"), "x").unwrap();
+
+        let summary = cleanup_old_workspaces(&store, 30);
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.quarantined, 0);
+        assert!(!dir.exists(), "old failed job's workspace must be removed");
+    }
+
+    #[test]
+    fn cleanup_old_workspaces_never_removes_promoted_job_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        let mut job = mk_job();
+        job.id = "job-old-promoted".into();
+        job.status = LineageJobStatus::Promoted;
+        job.updated_at_unix_ms = long_ago_unix_ms();
+        store.save_lineage_job(&job).unwrap();
+
+        let dir = job_workspace_dir(store.layout().root(), &job.id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let summary = cleanup_old_workspaces(&store, 30);
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.kept, 1);
+        assert!(dir.exists(), "Promoted workspaces are never reclaimed");
+    }
+
+    #[test]
+    fn cleanup_old_workspaces_never_removes_build_ready_job_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        let mut job = mk_job();
+        job.id = "job-old-buildready".into();
+        job.status = LineageJobStatus::BuildReady;
+        job.updated_at_unix_ms = long_ago_unix_ms();
+        store.save_lineage_job(&job).unwrap();
+
+        let dir = job_workspace_dir(store.layout().root(), &job.id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let summary = cleanup_old_workspaces(&store, 30);
+        assert_eq!(summary.removed, 0);
+        assert!(dir.exists(), "BuildReady workspaces are never reclaimed");
+    }
+
+    #[test]
+    fn cleanup_old_workspaces_keeps_recent_failed_job_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        let mut job = mk_job();
+        job.id = "job-recent-failed".into();
+        job.status = LineageJobStatus::Failed;
+        job.updated_at_unix_ms = crate::types::current_time_unix_ms(); // just now
+        store.save_lineage_job(&job).unwrap();
+
+        let dir = job_workspace_dir(store.layout().root(), &job.id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let summary = cleanup_old_workspaces(&store, 30);
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.kept, 1);
+        assert!(
+            dir.exists(),
+            "a recently-failed job is still within the retention window"
+        );
+    }
+
+    #[test]
+    fn cleanup_old_workspaces_quarantines_recordless_dir_instead_of_deleting() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        // No matching lineage_jobs/<id>.json at all — simulates a job
+        // record that was lost (crash, corruption) while its workspace
+        // directory survived.
+        let dir = job_workspace_dir(store.layout().root(), "job-recordless");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("marker.txt"), "x").unwrap();
+
+        let summary = cleanup_old_workspaces(&store, 30);
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.quarantined, 1);
+        assert!(
+            !dir.exists(),
+            "recordless dir must be moved, not left in place"
+        );
+
+        let quarantined = lineage_workspaces_root(store.layout().root())
+            .join(ORPHANED_WORKSPACES_DIR)
+            .join("job-recordless");
+        assert!(
+            quarantined.exists(),
+            "recordless dir must survive under .orphaned/"
+        );
+        assert!(quarantined.join("marker.txt").exists());
+    }
+
+    #[test]
+    fn cleanup_old_workspaces_disabled_when_max_age_is_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        let mut job = mk_job();
+        job.id = "job-old-failed".into();
+        job.status = LineageJobStatus::Failed;
+        job.updated_at_unix_ms = long_ago_unix_ms();
+        store.save_lineage_job(&job).unwrap();
+
+        let dir = job_workspace_dir(store.layout().root(), &job.id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let summary = cleanup_old_workspaces(&store, 0);
+        assert_eq!(summary, WorkspaceCleanupSummary::default());
+        assert!(dir.exists(), "max_age_days=0 must disable cleanup entirely");
     }
 
     #[test]

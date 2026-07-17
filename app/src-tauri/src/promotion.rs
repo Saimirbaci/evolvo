@@ -389,7 +389,7 @@ pub fn promote_job_with_gates(store: &Store, job_id: &str, gates: &[Gate]) -> Pr
     ) else {
         let note = "job is missing source_repo/branch_name/worktree_path — cannot promote (was Advance ever run?)".to_string();
         let _ = engine.append_note(job_id, &note);
-        let _ = engine.force_status(job_id, LineageJobStatus::BuildReady);
+        crate::lineage::force_status_with_retry(&engine, job_id, LineageJobStatus::BuildReady);
         return PromotionOutcome::Refused(note);
     };
     let repo = PathBuf::from(&source_repo);
@@ -399,7 +399,7 @@ pub fn promote_job_with_gates(store: &Store, job_id: &str, gates: &[Gate]) -> Pr
         check_preconditions(&repo, &branch, job.base_branch.as_deref(), &worktree_path)
     {
         let _ = engine.append_note(job_id, &format!("promotion refused: {reason}"));
-        let _ = engine.force_status(job_id, LineageJobStatus::BuildReady);
+        crate::lineage::force_status_with_retry(&engine, job_id, LineageJobStatus::BuildReady);
         return PromotionOutcome::Refused(reason);
     }
 
@@ -411,7 +411,7 @@ pub fn promote_job_with_gates(store: &Store, job_id: &str, gates: &[Gate]) -> Pr
         Err(e) => {
             let note = format!("failed to read source repo HEAD before merge: {e}");
             let _ = engine.append_note(job_id, &note);
-            let _ = engine.force_status(job_id, LineageJobStatus::BuildReady);
+            crate::lineage::force_status_with_retry(&engine, job_id, LineageJobStatus::BuildReady);
             return PromotionOutcome::Refused(note);
         }
     };
@@ -433,7 +433,7 @@ pub fn promote_job_with_gates(store: &Store, job_id: &str, gates: &[Gate]) -> Pr
             let _ = git_ok(&repo, &["merge", "--abort"]);
             let note = format!("promotion machinery failed during merge: {e}");
             let _ = engine.append_note(job_id, &note);
-            let _ = engine.force_status(job_id, LineageJobStatus::BuildReady);
+            crate::lineage::force_status_with_retry(&engine, job_id, LineageJobStatus::BuildReady);
             return PromotionOutcome::Refused(note);
         }
     };
@@ -450,7 +450,7 @@ pub fn promote_job_with_gates(store: &Store, job_id: &str, gates: &[Gate]) -> Pr
                 )
             };
             let _ = engine.append_note(job_id, &note);
-            let _ = engine.force_status(job_id, LineageJobStatus::BuildReady);
+            crate::lineage::force_status_with_retry(&engine, job_id, LineageJobStatus::BuildReady);
             return PromotionOutcome::Refused(note);
         }
         MergeStep::FastForward { new_head } => {
@@ -478,7 +478,7 @@ pub fn promote_job_with_gates(store: &Store, job_id: &str, gates: &[Gate]) -> Pr
                 short(&pre_merge_sha)
             );
             let _ = engine.append_note(job_id, &note);
-            let _ = engine.force_status(job_id, LineageJobStatus::BuildReady);
+            crate::lineage::force_status_with_retry(&engine, job_id, LineageJobStatus::BuildReady);
             return PromotionOutcome::Refused(note);
         }
     }
@@ -531,7 +531,11 @@ pub fn start_promotion(store: Store, job_id: String) {
                     &job_id,
                     "another promotion is already in progress — retry shortly",
                 );
-                let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
+                crate::lineage::force_status_with_retry(
+                    &engine,
+                    &job_id,
+                    LineageJobStatus::BuildReady,
+                );
                 return;
             }
         };

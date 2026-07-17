@@ -418,7 +418,7 @@ pub fn run_stage<D: StageDispatcher>(
                 &format!("plan.json failed to parse: {e}"),
             ),
         };
-        persist_stage_outcome(store, engine, job_id, job_dir, stage, &report)?;
+        let report = persist_stage_outcome(store, engine, job_id, job_dir, stage, report)?;
 
         if report.passed {
             if let Some(sha) = checkpoint_worktree(worktree, stage, job_id) {
@@ -531,14 +531,76 @@ pub fn run_validator(
     }
 }
 
+/// Persist a stage's outcome onto the job record and (when the stage
+/// passed) advance `plan.stage` on disk. Returns the report that was
+/// actually recorded — which may be a **demoted** version of the input
+/// when `report.passed` was true but the plan could not be reloaded and
+/// re-persisted with the advanced stage marker.
+///
+/// This demotion matters: a stage must never be reported `Green` while
+/// `plan.stage` silently fails to advance. Before this fix, a corrupted
+/// `plan.json` after an otherwise-passing validator run would leave the
+/// job record saying `Green` (the caller only looked at the *input*
+/// `report.passed`) while `plan.stage` stayed frozen — the next stage's
+/// `stage_already_done` / resume logic would then desync from the job
+/// record's idea of progress. Now a load/save failure on the green path
+/// is treated as a failed attempt, with the parse/write error rendered
+/// into the failure detail so Reflexion retries see it.
 fn persist_stage_outcome(
     _store: &Store,
     engine: &LineageEngine<'_>,
     job_id: &str,
     job_dir: &Path,
     stage: StageKind,
-    report: &StageReport,
-) -> Result<(), String> {
+    report: StageReport,
+) -> Result<StageReport, String> {
+    let report = if report.passed {
+        match load_plan(job_dir) {
+            Ok(Some(mut plan)) => {
+                let _ = append_history(
+                    job_dir,
+                    &mut plan,
+                    stage.slug(),
+                    HistoryKind::Validated,
+                    &report.headline,
+                );
+                advance_plan_stage(&mut plan, stage);
+                match save_plan(job_dir, &plan) {
+                    Ok(_) => report,
+                    Err(e) => crate::validators::report_failure(
+                        stage.slug(),
+                        "plan.json re-persisted after stage advanced",
+                        &format!("stage validated but failed to save plan.json: {e}"),
+                    ),
+                }
+            }
+            Ok(None) => crate::validators::report_failure(
+                stage.slug(),
+                "plan.json exists after stage validated",
+                "stage validated but plan.json is missing — cannot advance plan.stage",
+            ),
+            Err(e) => crate::validators::report_failure(
+                stage.slug(),
+                "plan.json parses after stage validated",
+                &format!("stage validated but plan.json failed to reload: {e}"),
+            ),
+        }
+    } else {
+        // Failure path: best-effort history entry, never promoted to a
+        // hard error — the pipeline already treats this attempt as
+        // failed regardless of whether the history append lands.
+        if let Ok(Some(mut plan)) = load_plan(job_dir) {
+            let _ = append_history(
+                job_dir,
+                &mut plan,
+                stage.slug(),
+                HistoryKind::Rejected,
+                &report.headline,
+            );
+        }
+        report
+    };
+
     let report_json = report.to_json();
     let headline = report.headline.clone();
     let passed = report.passed;
@@ -554,19 +616,7 @@ fn persist_stage_outcome(
         })
         .map_err(|e| format!("persist stage outcome: {e}"))?;
 
-    if let Ok(Some(mut plan)) = load_plan(job_dir) {
-        let kind = if passed {
-            HistoryKind::Validated
-        } else {
-            HistoryKind::Rejected
-        };
-        let _ = append_history(job_dir, &mut plan, stage.slug(), kind, &report.headline);
-        if passed {
-            advance_plan_stage(&mut plan, stage);
-            let _ = save_plan(job_dir, &plan);
-        }
-    }
-    Ok(())
+    Ok(report)
 }
 
 /// Advance `plan.stage` monotonically. During resume the pipeline re-runs
@@ -963,6 +1013,69 @@ mod tests {
             second.contains("failed to parse"),
             "parse error is fed back to the retry: {second}"
         );
+    }
+
+    #[test]
+    fn persist_stage_outcome_demotes_passed_report_when_plan_json_is_corrupt() {
+        // Regression test for the `persist_stage_outcome` fix: a validator
+        // can report `passed: true` (e.g. because `run_stage` already
+        // loaded a good plan for `run_validator`), but if `plan.json` is
+        // unreadable by the time `persist_stage_outcome` tries to reload
+        // it to advance `plan.stage`, the stage must NOT be recorded
+        // green — it must be demoted to failed with the reload error in
+        // the detail, not silently marked Green with a frozen
+        // `plan.stage`.
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+
+        // Corrupt plan.json out from under persist_stage_outcome.
+        std::fs::write(job_dir.join(crate::plan::PLAN_FILENAME), "{not json").unwrap();
+
+        let passing_report = crate::validators::StageReport {
+            stage: StageKind::BackendPlan.slug().to_string(),
+            passed: true,
+            headline: "1 checks passed (1/1)".to_string(),
+            checks: vec![crate::validators::CheckResult {
+                name: "stub check".into(),
+                passed: true,
+                detail: String::new(),
+            }],
+            ran_at_unix_ms: 0,
+        };
+
+        let outcome = persist_stage_outcome(
+            &store,
+            &engine,
+            &job_id,
+            &job_dir,
+            StageKind::BackendPlan,
+            passing_report,
+        )
+        .unwrap();
+
+        assert!(
+            !outcome.passed,
+            "a passing report must be demoted when plan.json can't be reloaded"
+        );
+        assert!(
+            outcome
+                .checks
+                .iter()
+                .any(|c| !c.passed && c.detail.contains("failed to reload")),
+            "demotion reason should mention the reload failure: {:?}",
+            outcome.checks
+        );
+
+        // The job record must reflect the demotion too — never left
+        // saying Green while plan.stage silently failed to advance.
+        let job = store.load_lineage_job(&job_id).unwrap().unwrap();
+        let stage = job
+            .stages
+            .iter()
+            .find(|s| s.kind == StageKind::BackendPlan)
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Failed);
     }
 
     #[test]
