@@ -120,6 +120,34 @@ Walk the existing specialist agents. For each:
 Same treatment: update bodies, prune what no longer applies, add what
 the new app needs.
 
+### `DESIGN.md` (worktree root)
+
+Bring it up to date with what actually shipped this iteration — this is
+design memory for the *next* iteration's `frontend_plan`/`frontend_impl`
+stages, which read this file before touching CSS. Do not just append:
+
+1. **Layout pattern** — if `plan.frontend.design.layoutPattern` is set and
+   differs from what DESIGN.md currently documents, update the "Layout
+   pattern" section to describe the shape you actually built (reference
+   the real component/route names from `plan.frontend`).
+2. **Token values** — if `plan.frontend.design.themeOverrides` is
+   non-empty, update the token vocabulary table's "current values" column
+   for every overridden token.
+3. **base.css inventory** — if this iteration added a new primitive to
+   `base.css` (allowed: append-only), add it to the primitive inventory
+   list.
+4. **`## Design decisions` log** — append one dated entry (use today's
+   date) summarising what changed and why, especially any `visualNotes`
+   interpretation calls made on ambiguous canvas marks and any
+   `openQuestions` a reviewer resolved. Keep entries terse — one to three
+   sentences.
+
+If the iteration made no visual changes (pure backend/logic fix), it is
+fine to leave DESIGN.md untouched — do not manufacture a decision that
+didn't happen. The validator only requires the file to exist, be
+non-trivial, and retain the `## Design decisions` section header; it does
+not require a new entry on every iteration.
+
 ### Concrete success bar
 
 After your rewrite, a fresh reader of `CLAUDE.md` who has never seen
@@ -150,7 +178,8 @@ that uses canvas feedback to evolve itself", you didn't rewrite.
 
 Reply per the Operating contract. Include `port: {{PORT}}` in your
 summary AND a one-line confirmation that you rewrote `CLAUDE.md`,
-`.claude/agents/*`, and `.claude/skills/*` for the new app. The final
+`.claude/agents/*`, `.claude/skills/*`, and (if this iteration changed
+anything visual) `DESIGN.md`'s decision log, for the new app. The final
 line must be `STAGE_RESULT: ok` (or `STAGE_RESULT: fail: <reason>` if
 any of the four invariants regressed, any check failed, OR you could
 not honestly rewrite the context files — the runner will roll the

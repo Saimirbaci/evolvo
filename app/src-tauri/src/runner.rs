@@ -415,6 +415,13 @@ const EMBEDDED_STAGE_FINAL_REVIEW: &str = include_str!("../../../prompts/stages/
 /// from inside the session and iterate until it passes.
 const EMBEDDED_STAGE_SELF_VALIDATE: &str =
     include_str!("../../../prompts/stages/_self_validate.md");
+/// Design guidelines injected into the FrontendPlan / FrontendImpl stage
+/// prompts only: how to read `DESIGN.md` for continuity, the baseline
+/// visual quality bar, and how to interpret ambiguous canvas marks
+/// (emphasis vs. literal color request) into `themeOverrides` /
+/// `visualNotes` instead of hard-coded CSS. See `build_stage_prompt`.
+const EMBEDDED_DESIGN_GUIDELINES: &str =
+    include_str!("../../../prompts/stages/_design_guidelines.md");
 /// Local-model delegation rules. Appended to the supervisor prompt when
 /// the user opted into pi+Ollama delegation on the feedback record.
 const EMBEDDED_DELEGATE_RULES: &str = include_str!("../../../prompts/pi.md");
@@ -1485,6 +1492,21 @@ pub fn build_stage_prompt(
 ) -> String {
     let template = stage_prompt_template(stage);
     let mut prompt = render_stage_prompt(&template, plan, worktree, plan_path, job_id);
+
+    // Design continuity + guidelines: only the two stages that touch
+    // visual intent (planning and implementing the frontend) need this —
+    // injecting it into backend/e2e stages would just be prompt noise.
+    if matches!(
+        stage,
+        crate::types::StageKind::FrontendPlan | crate::types::StageKind::FrontendImpl
+    ) {
+        let design_guidelines = trim_trailing_newline(load_prompt(
+            "stages/_design_guidelines.md",
+            EMBEDDED_DESIGN_GUIDELINES,
+        ));
+        prompt.push_str("\n\n---\n\n");
+        prompt.push_str(&design_guidelines);
+    }
 
     if let Some(failure) = previous_failure {
         prompt.push_str(&format!(
@@ -2834,6 +2856,61 @@ mod tests {
             !prompt.contains("Previous attempt failed validation"),
             "first attempt must not carry a failure block"
         );
+    }
+
+    #[test]
+    fn build_stage_prompt_injects_design_guidelines_only_for_frontend_stages() {
+        use crate::plan::IterationPlan;
+        let mut plan = IterationPlan::default();
+        plan.app.name = "test-app".into();
+        plan.app.iteration = 1;
+
+        for kind in [
+            crate::types::StageKind::FrontendPlan,
+            crate::types::StageKind::FrontendImpl,
+        ] {
+            let prompt = build_stage_prompt(
+                kind,
+                &plan,
+                Path::new("/tmp/wt"),
+                Path::new("/tmp/job/plan.json"),
+                Path::new("/tmp/job"),
+                "job-x",
+                1,
+                None,
+            );
+            assert!(
+                prompt.contains("Design guidelines"),
+                "{kind:?} must carry the design guidelines block"
+            );
+            assert!(
+                prompt.contains("DESIGN.md"),
+                "{kind:?} must instruct the agent to read DESIGN.md"
+            );
+        }
+
+        for kind in [
+            crate::types::StageKind::BackendPlan,
+            crate::types::StageKind::BackendImpl,
+            crate::types::StageKind::E2EPlan,
+            crate::types::StageKind::E2EImpl,
+            crate::types::StageKind::FinalReview,
+        ] {
+            let prompt = build_stage_prompt(
+                kind,
+                &plan,
+                Path::new("/tmp/wt"),
+                Path::new("/tmp/job/plan.json"),
+                Path::new("/tmp/job"),
+                "job-x",
+                1,
+                None,
+            );
+            assert!(
+                !prompt.contains("Design guidelines"),
+                "{kind:?} must not carry the frontend-only design guidelines block"
+            );
+        }
     }
 
     #[test]
