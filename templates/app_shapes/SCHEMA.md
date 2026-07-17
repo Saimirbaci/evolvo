@@ -15,7 +15,9 @@ templates/app_shapes/<name>/
 ├── ui_app.rs              # the NewApp content area (mounts inside <Shell>)
 ├── ui_modules/            # OPTIONAL: additional Leptos modules
 │   └── *.rs
-├── styles.css             # CSS to append to app/ui/styles.css
+├── styles.css             # CSS to append to app/ui/styles/app.css — must
+│                          #   use var(--...) tokens from styles/tokens.css,
+│                          #   no raw hex/rgb/hsl (see design lint below)
 └── deps.toml              # Cargo dependencies to merge
 ```
 
@@ -38,7 +40,9 @@ ui_modules  = [                                    # additional UI files
   "app/ui/src/markdown_editor_doc_list.rs",
   "app/ui/src/markdown_editor_preview.rs",
 ]
-styles_file = "app/ui/styles.css"                  # appended, not replaced
+styles_file = "app/ui/styles/app.css"              # appended, not replaced —
+                                                    # the iteration-owned layer;
+                                                    # see styles/tokens.css
 
 # The scaffold's data interface. The planner uses this to know what the
 # scaffold persists; the implementer renders these as the entities and
@@ -139,6 +143,12 @@ In this exact order:
 - The scaffold's UI files MUST NOT touch `shell.rs`, `canvas.rs`,
   `feedback_panel.rs`, `voice.rs`, or `toolbar.rs`. Those belong to the
   invariant chrome.
+- The scaffold's `styles.css` MUST use `var(--...)` tokens from
+  `app/ui/styles/tokens.css` for every color, font size, and shadow — no
+  raw hex/rgb/hsl literals, and `font-size:`/`box-shadow:` declarations
+  must reference `var(--text-*)` / `var(--shadow-*)`. `validate_frontend_impl`
+  lints the merged `app/ui/styles/app.css` for exactly these rules; a
+  scaffold that fails the lint blocks every iteration that picks it.
 
 ## Forward compatibility
 

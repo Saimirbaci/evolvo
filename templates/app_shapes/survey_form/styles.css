@@ -1,64 +1,65 @@
-/* survey_form — append to app/ui/styles.css. ~80 lines. */
+/* survey_form — append to app/ui/styles/app.css. ~80 lines.
+   Uses var(--...) tokens from app/ui/styles/tokens.css — no raw hex/rgb. */
 
 .survey-page {
   display: flex;
   flex-direction: column;
   height: calc(100vh - 56px);
-  background: var(--bg, #ffffff);
-  color: var(--fg, #111827);
+  background: var(--bg);
+  color: var(--fg);
   overflow-y: auto;
 }
 
 .survey-tabs {
   display: flex;
   gap: 0;
-  border-bottom: 1px solid var(--border, #e5e7eb);
+  border-bottom: 1px solid var(--border);
 }
 
 .survey-tab {
   background: transparent;
   border: 0;
-  padding: 12px 20px;
-  font-size: 13px;
+  padding: var(--space-3) var(--space-5);
+  font-size: var(--text-sm);
   cursor: pointer;
-  color: var(--muted, #6b7280);
+  color: var(--muted);
   border-bottom: 2px solid transparent;
 }
 
 .survey-tab.active {
-  color: var(--fg, #111827);
-  border-bottom-color: var(--primary, #3b82f6);
-  font-weight: 600;
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+  font-weight: var(--weight-semibold);
 }
 
 .survey-error {
-  margin: 16px;
-  padding: 8px 12px;
-  background: rgba(220, 38, 38, 0.08);
-  color: #dc2626;
-  border-radius: 6px;
-  font-size: 13px;
+  margin: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
 }
 
 .survey-form {
   max-width: 560px;
-  margin: 24px auto;
-  padding: 0 16px;
+  margin: var(--space-6) auto;
+  padding: 0 var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 .survey-field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .survey-field-checkbox {
   flex-direction: row;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .survey-field-radio {
@@ -67,27 +68,27 @@
   margin: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .survey-radio-option {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 13px;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
 }
 
 .survey-field-label {
-  font-size: 13px;
-  font-weight: 500;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
 }
 
 .survey-input,
 .survey-textarea {
-  padding: 8px 10px;
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 6px;
-  font-size: 14px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-base);
   background: transparent;
   color: inherit;
   font-family: inherit;
@@ -101,22 +102,22 @@
 .survey-actions {
   display: flex;
   justify-content: flex-end;
-  margin-top: 8px;
+  margin-top: var(--space-2);
 }
 
 .survey-success {
-  padding: 12px;
-  background: rgba(22, 163, 74, 0.08);
-  color: #16a34a;
-  border: 1px solid rgba(22, 163, 74, 0.2);
-  border-radius: 6px;
-  font-size: 13px;
+  padding: var(--space-3);
+  background: color-mix(in srgb, var(--success) 8%, transparent);
+  color: var(--success);
+  border: 1px solid color-mix(in srgb, var(--success) 20%, transparent);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
 }
 
 .survey-review {
   max-width: 800px;
-  margin: 24px auto;
-  padding: 0 16px;
+  margin: var(--space-6) auto;
+  padding: 0 var(--space-4);
 }
 
 .survey-review-list {
@@ -125,29 +126,29 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .survey-review-item {
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 8px;
-  background: var(--bg-subtle, #fafafa);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
 }
 
 .survey-review-item header {
   display: flex;
   justify-content: space-between;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border, #e5e7eb);
-  font-size: 12px;
-  color: var(--muted, #6b7280);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-xs);
+  color: var(--muted);
 }
 
 .survey-review-values {
   margin: 0;
-  padding: 12px;
+  padding: var(--space-3);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--text-xs);
   white-space: pre-wrap;
   word-break: break-word;
 }

@@ -14,7 +14,8 @@ Tauri + Leptos NewApp body that mounts inside the invariant `<Shell>`
   implementation that uses the existing host `Store`),
 - one or more UI files (`ui_app.rs` + supporting `.rs` modules) the
   implementer copies into `app/ui/src/`,
-- `styles.css` deltas to append to `app/ui/styles.css`,
+- `styles.css` deltas to append to `app/ui/styles/app.css` (tokened
+  against `app/ui/styles/tokens.css`),
 - `deps.toml` with any new Cargo dependencies to merge.
 
 This sits **next to**, not instead of, `templates/integrations/`. App-shape
@@ -62,7 +63,9 @@ For every name in `plan.templates.useAppShape`, follow that scaffold's
    `invoke_handler!`.
 2. Copy `ui_app.rs` and any `ui_modules/*.rs` into `app/ui/src/`,
    declaring the new modules in `app/ui/src/main.rs`.
-3. Append the scaffold's `styles.css` to `app/ui/styles.css`.
+3. Append the scaffold's `styles.css` to `app/ui/styles/app.css` (the
+   iteration-owned layer — use `var(--...)` tokens from
+   `app/ui/styles/tokens.css`, no raw hex/rgb/hsl).
 4. Merge `deps.toml` into `Cargo.toml` (workspace deps) and the relevant
    crate `[dependencies]` block.
 5. Walk every `// FILL: …` marker in the copied files and replace it

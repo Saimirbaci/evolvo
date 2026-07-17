@@ -1,51 +1,49 @@
-/* markdown_editor — append to app/ui/styles.css. ~80 lines.
-   Three-column grid: sidebar | source | preview. Uses the existing CSS
-   variables (--bg, --fg, --muted, --primary, --border) declared at the
-   top of styles.css. If those names ever change, update here too. */
+/* markdown_editor — append to app/ui/styles/app.css. ~80 lines.
+   Uses var(--...) tokens from app/ui/styles/tokens.css — no raw hex/rgb. */
 
 .md-editor-page {
   display: grid;
   grid-template-columns: 240px 1fr 1fr;
   height: calc(100vh - 56px); /* 56px = app bar height */
-  background: var(--bg, #ffffff);
-  color: var(--fg, #111827);
+  background: var(--bg);
+  color: var(--fg);
   overflow: hidden;
 }
 
 .md-editor-sidebar {
-  border-right: 1px solid var(--border, #e5e7eb);
+  border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
-  background: var(--bg, #ffffff);
+  background: var(--bg);
 }
 
 .md-editor-sidebar-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px;
-  border-bottom: 1px solid var(--border, #e5e7eb);
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--border);
 }
 
 .md-editor-sidebar-title {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
   margin: 0;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--muted, #6b7280);
+  color: var(--muted);
 }
 
 .md-editor-new-btn {
-  font-size: 12px;
-  padding: 4px 10px;
+  font-size: var(--text-xs);
+  padding: var(--space-1) var(--space-3);
 }
 
 .md-editor-doc-list {
   list-style: none;
   margin: 0;
-  padding: 8px 0;
+  padding: var(--space-2) 0;
 }
 
 .md-editor-doc-list-item {
@@ -53,7 +51,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 10px 16px;
+  padding: var(--space-2) var(--space-4);
   background: transparent;
   border: 0;
   text-align: left;
@@ -62,52 +60,52 @@
 }
 
 .md-editor-doc-list-item:hover {
-  background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+  background: color-mix(in srgb, black 4%, transparent);
 }
 
 .md-editor-doc-list-item.active {
-  background: var(--bg-active, rgba(59, 130, 246, 0.08));
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 .md-editor-doc-title {
-  font-size: 14px;
-  font-weight: 500;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .md-editor-doc-meta {
-  font-size: 11px;
-  color: var(--muted, #6b7280);
+  font-size: var(--text-xs);
+  color: var(--muted);
 }
 
 .md-editor-empty {
-  padding: 24px 16px;
-  font-size: 13px;
-  color: var(--muted, #6b7280);
+  padding: var(--space-6) var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--muted);
   text-align: center;
 }
 
 .md-editor-source {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--border, #e5e7eb);
+  border-right: 1px solid var(--border);
   overflow: hidden;
 }
 
 .md-editor-toolbar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border, #e5e7eb);
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
 }
 
 .md-editor-title-input {
   flex: 1;
-  font-size: 18px;
-  font-weight: 600;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
   border: 0;
   outline: none;
   background: transparent;
@@ -116,7 +114,7 @@
 
 .md-editor-toolbar-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .md-editor-source-area {
@@ -124,26 +122,26 @@
   border: 0;
   resize: none;
   outline: none;
-  padding: 16px;
+  padding: var(--space-4);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 14px;
+  font-size: var(--text-base);
   line-height: 1.55;
   background: transparent;
   color: inherit;
 }
 
 .md-editor-error {
-  padding: 8px 16px;
-  background: rgba(220, 38, 38, 0.08);
-  color: #dc2626;
-  border-top: 1px solid rgba(220, 38, 38, 0.2);
-  font-size: 13px;
+  padding: var(--space-2) var(--space-4);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  border-top: 1px solid color-mix(in srgb, var(--danger) 20%, transparent);
+  font-size: var(--text-sm);
 }
 
 .md-editor-preview {
   overflow-y: auto;
-  background: var(--bg-subtle, #fafafa);
-  padding: 16px;
+  background: var(--surface-sunken);
+  padding: var(--space-4);
 }
 
 .md-editor-preview-pre {
@@ -151,6 +149,6 @@
   white-space: pre-wrap;
   word-wrap: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 13px;
+  font-size: var(--text-sm);
   line-height: 1.55;
 }
