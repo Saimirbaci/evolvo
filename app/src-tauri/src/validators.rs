@@ -87,7 +87,7 @@ impl StageReport {
     /// failures, verbatim, with per-check detail capped so one noisy
     /// cargo error can't blow the prompt budget.
     pub fn failure_block(&self) -> String {
-        const MAX_DETAIL_CHARS: usize = 500;
+        const MAX_DETAIL_CHARS: usize = 2000;
         let mut out = format!("validator `{}` rejected: {}\n", self.stage, self.headline);
         for c in self.checks.iter().filter(|c| !c.passed) {
             let detail: String = if c.detail.chars().count() > MAX_DETAIL_CHARS {
@@ -1701,9 +1701,13 @@ mod tests {
 
     #[test]
     fn failure_block_lists_only_failed_checks_and_caps_detail() {
+        // Detail cap is 2000 chars (raised from 500 so a full compiler
+        // error tail survives into the Reflexion retry prompt — see
+        // `MAX_DETAIL_CHARS`); use a detail comfortably over that so the
+        // cap is actually exercised.
         let mut r = StageReport::new("backend_impl");
         r.push("compiles", true, "ok");
-        r.push("tests pass", false, "x".repeat(900));
+        r.push("tests pass", false, "x".repeat(2500));
         r.push("commands registered", false, "missing: create_task");
         let r = r.finalize();
 
@@ -1713,7 +1717,7 @@ mod tests {
         assert!(block.contains("FAILED tests pass"));
         assert!(block.contains("FAILED commands registered: missing: create_task"));
         assert!(block.contains("(truncated)"), "long detail capped");
-        assert!(block.len() < 900, "block stays prompt-sized");
+        assert!(block.len() < 2500, "block stays prompt-sized");
     }
 
     #[test]
