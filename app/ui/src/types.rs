@@ -427,3 +427,47 @@ pub struct AppHealth {
     #[serde(default)]
     pub max_concurrent_agent_sessions: u64,
 }
+
+/// UI mirror of `evolvo_desktop::plan::DesignPlan` — the visual/layout
+/// intent recorded on `plan.json`'s `frontend.design` (read directly out
+/// of the raw plan JSON `read_job_plan` returns, the same channel
+/// `openQuestions` already travels over). Every field defaults so an
+/// absent/legacy `design` object decodes as an all-empty `DesignPlan`
+/// instead of failing the whole plan-review fetch.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignPlan {
+    #[serde(default)]
+    pub layout_pattern: String,
+    #[serde(default)]
+    pub density: String,
+    #[serde(default)]
+    pub theme_overrides: Vec<TokenOverride>,
+    #[serde(default)]
+    pub visual_notes: Vec<RegionDesignNote>,
+}
+
+impl DesignPlan {
+    pub fn is_empty(&self) -> bool {
+        self.layout_pattern.is_empty()
+            && self.density.is_empty()
+            && self.theme_overrides.is_empty()
+            && self.visual_notes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenOverride {
+    pub token: String,
+    pub value: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionDesignNote {
+    pub region: String,
+    pub interpretation: String,
+}

@@ -1466,3 +1466,44 @@ button {
     border-color: var(--accent);
     background: color-mix(in srgb, var(--accent) 6%, transparent);
 }
+
+/* Planner's design intent — layout/density badges, theme overrides, and
+   canvas-mark interpretations recorded in plan.json's frontend.design.
+   Rendered alongside .plan-questions in the same review-gate panel. */
+.plan-design {
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+}
+
+.plan-design h4 {
+    margin: 0 0 6px 0;
+    font-size: 13px;
+}
+
+.plan-design-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.plan-design-tokens,
+.plan-design-notes {
+    margin: 6px 0 0 0;
+    padding-left: 18px;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+.plan-design-tokens code {
+    font-size: 12px;
+    background: var(--surface-sunken);
+    border-radius: var(--radius-sm);
+    padding: 1px 4px;
+}
+
+.plan-design-reason {
+    color: var(--muted);
+}

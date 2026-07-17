@@ -29,7 +29,7 @@ use crate::feedback_panel::FeedbackPanel;
 use crate::interop;
 use crate::toolbar::Toolbar;
 use crate::types::{
-    AppHealth, DelegationSummary, LineageJobRecord, LineageJobStatus, PreviewSummary,
+    AppHealth, DelegationSummary, DesignPlan, LineageJobRecord, LineageJobStatus, PreviewSummary,
 };
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
@@ -742,6 +742,13 @@ fn LineageDetail(
     // survives into implementation. Fetched once per detail construction
     // (the component is rebuilt on every poll tick anyway).
     let open_questions: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    // Planner's design intent — layout pattern, density, theme overrides,
+    // and its interpretation of ambiguous canvas marks. Lives at
+    // `plan.frontend.design` in the same plan.json payload as
+    // `openQuestions`; extracted from the raw JSON `Value` the same way
+    // (no new Tauri command — `read_job_plan` already returns the whole
+    // document).
+    let design_plan: RwSignal<DesignPlan> = RwSignal::new(DesignPlan::default());
     let awaiting_plan_review = matches!(record.status, LineageJobStatus::Planned);
     {
         let id = record.id.clone();
@@ -758,6 +765,13 @@ fn LineageDetail(
                     })
                     .unwrap_or_default();
                 open_questions.set(qs);
+
+                let design: DesignPlan = plan
+                    .get("frontend")
+                    .and_then(|f| f.get("design"))
+                    .and_then(|d| serde_json::from_value(d.clone()).ok())
+                    .unwrap_or_default();
+                design_plan.set(design);
             }
         });
     }
@@ -823,6 +837,69 @@ fn LineageDetail(
                         <ul class="plan-questions-list">
                             {qs.into_iter().map(|q| view! { <li>{q}</li> }).collect_view()}
                         </ul>
+                    </section>
+                }.into_any()
+            }}
+
+            {move || {
+                let design = design_plan.get();
+                if design.is_empty() {
+                    return view! { <span></span> }.into_any();
+                }
+                let layout_badge = if design.layout_pattern.is_empty() {
+                    None
+                } else {
+                    Some(design.layout_pattern.clone())
+                };
+                let density_badge = if design.density.is_empty() {
+                    None
+                } else {
+                    Some(design.density.clone())
+                };
+                view! {
+                    <section class="plan-design" aria-label="Planner's design intent">
+                        <h4>"Design"</h4>
+                        {move || {
+                            if layout_badge.is_none() && density_badge.is_none() {
+                                return view! { <span></span> }.into_any();
+                            }
+                            view! {
+                                <div class="plan-design-badges">
+                                    {layout_badge.clone().map(|p| view! {
+                                        <span class="badge badge-accent">{p}</span>
+                                    })}
+                                    {density_badge.clone().map(|d| view! {
+                                        <span class="badge">{d}</span>
+                                    })}
+                                </div>
+                            }.into_any()
+                        }}
+                        {(!design.theme_overrides.is_empty()).then(|| view! {
+                            <ul class="plan-design-tokens">
+                                {design.theme_overrides.iter().cloned().map(|ov| {
+                                    let reason = if ov.reason.is_empty() {
+                                        None
+                                    } else {
+                                        Some(view! { <span class="plan-design-reason">{format!(" — {}", ov.reason)}</span> })
+                                    };
+                                    view! {
+                                        <li>
+                                            <code>{ov.token}</code>
+                                            " → "
+                                            <code>{ov.value}</code>
+                                            {reason}
+                                        </li>
+                                    }
+                                }).collect_view()}
+                            </ul>
+                        })}
+                        {(!design.visual_notes.is_empty()).then(|| view! {
+                            <ul class="plan-design-notes">
+                                {design.visual_notes.iter().cloned().map(|n| view! {
+                                    <li><strong>{n.region}</strong>{": "}{n.interpretation}</li>
+                                }).collect_view()}
+                            </ul>
+                        })}
                     </section>
                 }.into_any()
             }}
