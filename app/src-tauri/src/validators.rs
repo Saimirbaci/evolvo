@@ -320,7 +320,97 @@ pub fn validate_frontend_plan(plan: &IterationPlan) -> StageReport {
             format!("missing: {:?}", missing)
         },
     );
+
+    validate_design_plan(&mut r, plan);
     r.finalize()
+}
+
+/// Vocabulary for `DesignPlan.layout_pattern`. Kept narrow deliberately —
+/// these are the shapes `_design_guidelines.md` and the review UI both
+/// know how to render; a planner that needs something else should still
+/// pick the closest fit rather than inventing a new string the UI can't
+/// badge.
+const LAYOUT_PATTERNS: &[&str] = &["stack", "sidebar", "grid", "dashboard", "split"];
+
+/// Characters that would let a `theme_overrides[].value` break out of a
+/// CSS custom-property declaration or inject markup if ever rendered
+/// unescaped. This is a value that lands in `:root { --token: <value>; }`
+/// in app.css and is also rendered as plain text in the review UI, so both
+/// CSS-syntax and HTML-syntax injection are in scope.
+const INJECTION_CHARS: &[char] = &[';', '{', '}', '<'];
+
+fn validate_design_plan(r: &mut StageReport, plan: &IterationPlan) {
+    let design = &plan.frontend.design;
+
+    if !design.layout_pattern.is_empty() {
+        r.push(
+            "design.layoutPattern is a known pattern",
+            LAYOUT_PATTERNS.contains(&design.layout_pattern.as_str()),
+            format!(
+                "`{}` — must be one of {:?} (empty is allowed for legacy plans)",
+                design.layout_pattern, LAYOUT_PATTERNS
+            ),
+        );
+    }
+
+    let mut bad_tokens: Vec<String> = Vec::new();
+    let mut bad_values: Vec<String> = Vec::new();
+    for ov in &design.theme_overrides {
+        if !REQUIRED_TOKEN_NAMES.contains(&ov.token.as_str()) {
+            bad_tokens.push(ov.token.clone());
+        }
+        let value_ok = !ov.value.trim().is_empty()
+            && !ov.value.contains(INJECTION_CHARS)
+            && !ov.value.contains('\n')
+            && !ov.value.contains('\r');
+        if !value_ok {
+            bad_values.push(format!("{}: `{}`", ov.token, ov.value));
+        }
+    }
+    r.push(
+        "design.themeOverrides reference known token names",
+        bad_tokens.is_empty(),
+        if bad_tokens.is_empty() {
+            "ok".to_string()
+        } else {
+            format!(
+                "not in REQUIRED_TOKEN_NAMES: {:?} — theme_overrides may only re-value tokens \
+                 that already exist in tokens.css",
+                bad_tokens
+            )
+        },
+    );
+    r.push(
+        "design.themeOverrides values are safe + non-empty",
+        bad_values.is_empty(),
+        if bad_values.is_empty() {
+            "ok".to_string()
+        } else {
+            format!(
+                "invalid value(s): {:?} — must be non-empty and must not contain ';', '{{', '}}', '<', or a newline",
+                bad_values
+            )
+        },
+    );
+
+    let mut bad_notes: Vec<String> = Vec::new();
+    for note in &design.visual_notes {
+        if note.region.trim().is_empty() || note.interpretation.trim().is_empty() {
+            bad_notes.push(format!(
+                "region=`{}` interpretation=`{}`",
+                note.region, note.interpretation
+            ));
+        }
+    }
+    r.push(
+        "design.visualNotes have non-empty region + interpretation",
+        bad_notes.is_empty(),
+        if bad_notes.is_empty() {
+            "ok".to_string()
+        } else {
+            format!("incomplete note(s): {:?}", bad_notes)
+        },
+    );
 }
 
 pub fn validate_e2e_plan(plan: &IterationPlan) -> StageReport {
@@ -607,6 +697,23 @@ struct LintFinding {
     detail: String,
 }
 
+/// True when a (comment-stripped) line is a CSS custom-property
+/// **definition** — i.e. matches `--<name>: <value>;` in declaration
+/// position. Defining a token's value is exactly where a raw color
+/// belongs (`--accent: #7c3aed;` inside a `:root { ... }` block is the
+/// point of `theme_overrides`), so these lines are exempt from the
+/// raw-hex/rgb/hsl lints. A *use* of a property (`color: var(--accent)`)
+/// does not start with `--` and is still fully linted.
+///
+/// Deliberately conservative: only the declaration's left-hand side is
+/// checked (trimmed line starts with `--` and contains a `:`), so this
+/// cannot be used to smuggle raw colors into a normal property value by
+/// prefixing something unrelated with `--`.
+fn is_custom_property_declaration(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("--") && trimmed.contains(':')
+}
+
 /// Token lint over an iteration-owned stylesheet body (comments already
 /// stripped). Scans for `#RGB`/`#RGBA`/`#RRGGBB`/`#RRGGBBAA` value-position
 /// hex literals. No regex crate in this workspace's dependency set for host
@@ -616,6 +723,9 @@ struct LintFinding {
 fn lint_hex_colors(body: &str) -> Vec<LintFinding> {
     let mut out = Vec::new();
     for (line_idx, line) in body.lines().enumerate() {
+        if is_custom_property_declaration(line) {
+            continue;
+        }
         let bytes = line.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -647,6 +757,9 @@ fn lint_hex_colors(body: &str) -> Vec<LintFinding> {
 fn lint_color_functions(body: &str) -> Vec<LintFinding> {
     let mut out = Vec::new();
     for (line_idx, line) in body.lines().enumerate() {
+        if is_custom_property_declaration(line) {
+            continue;
+        }
         for needle in ["rgb(", "rgba(", "hsl(", "hsla("] {
             if line.contains(needle) {
                 out.push(LintFinding {
@@ -865,6 +978,35 @@ pub fn validate_frontend_impl(
                 format!("missing: {}", missing_tokens.join(", "))
             },
         );
+
+        // Design-plan coherence: every token the plan promised to override
+        // must actually be re-declared in app.css (the `:root { ... }`
+        // block the implementer is instructed to write at the top of the
+        // file). We do NOT require the reverse — hand-tuned overrides with
+        // no plan entry are fine, the plan is a floor on intent-to-CSS
+        // traceability, not a ceiling on creativity.
+        let unapplied: Vec<&str> = plan
+            .frontend
+            .design
+            .theme_overrides
+            .iter()
+            .filter(|ov| !body.contains(&format!("{}:", ov.token)))
+            .map(|ov| ov.token.as_str())
+            .collect();
+        if !plan.frontend.design.theme_overrides.is_empty() {
+            r.push(
+                "design.themeOverrides applied in styles/app.css",
+                unapplied.is_empty(),
+                if unapplied.is_empty() {
+                    "ok".to_string()
+                } else {
+                    format!(
+                        "planned theme override(s) not applied in app.css: {}",
+                        unapplied.join(", ")
+                    )
+                },
+            );
+        }
     }
 
     push_tool_gate(
@@ -1039,7 +1181,45 @@ pub fn validate_final(plan: &IterationPlan, worktree: &Path) -> StageReport {
             "no app/ui/Trunk.toml — stack rewritten, skipped",
         );
     }
+
+    // Design memory: DESIGN.md must exist, be non-trivial, and retain the
+    // decision-log section header so the next iteration's frontend stages
+    // have somewhere to read continuity from and somewhere to append to.
+    // A missing/gutted DESIGN.md silently resets design memory to zero
+    // every iteration, which defeats the entire point of Part C.
+    let (design_ok, design_detail) = check_design_md(&worktree.join("DESIGN.md"));
+    r.push(
+        "DESIGN.md exists and has a decision log",
+        design_ok,
+        design_detail,
+    );
+
     r.finalize()
+}
+
+/// Minimum size (bytes) for `DESIGN.md` to count as "non-trivial" — high
+/// enough to reject a one-line stub, low enough not to force padding.
+const DESIGN_MD_MIN_BYTES: u64 = 500;
+
+fn check_design_md(path: &Path) -> (bool, String) {
+    let body = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return (false, "DESIGN.md missing at worktree root".to_string()),
+    };
+    let len = body.len() as u64;
+    if len < DESIGN_MD_MIN_BYTES {
+        return (
+            false,
+            format!("DESIGN.md is only {len}B (min {DESIGN_MD_MIN_BYTES}B) — looks like a stub"),
+        );
+    }
+    if !body.contains("## Design decisions") {
+        return (
+            false,
+            "DESIGN.md is missing the `## Design decisions` log section".to_string(),
+        );
+    }
+    (true, "ok".to_string())
 }
 
 /// Build gates for **single-session (legacy) lineage runs** — every
@@ -1515,7 +1695,8 @@ mod tests {
     use super::*;
     use crate::plan::{
         AppIdentity, BackendBudget, BackendSection, CanvasReference, CanvasRegion, CommandPlan,
-        EntityPlan, FieldPlan, FrontendBudget, FrontendSection, IterationPlan, PlanStage, TestPlan,
+        EntityPlan, FieldPlan, FrontendBudget, FrontendSection, IterationPlan, PlanStage,
+        RegionDesignNote, TestPlan, TokenOverride,
     };
 
     #[test]
@@ -1715,6 +1896,134 @@ mod tests {
         });
         let report = validate_frontend_plan(&plan);
         assert!(!report.passed);
+    }
+
+    /// A `seed_plan()` with `frontend.routes`/`components` populated enough
+    /// to satisfy the budget + command-reference checks, so design-plan
+    /// tests can assert on `report.passed` as a whole without unrelated
+    /// budget failures masking the design-specific check they care about.
+    fn seed_plan_with_frontend() -> IterationPlan {
+        let mut plan = seed_plan();
+        plan.frontend.routes.push(crate::plan::RoutePlan {
+            path: "/".into(),
+            component: "Home".into(),
+            uses_commands: vec![],
+            motivated_by_regions: vec!["R1".into()],
+        });
+        plan.frontend.components.push(crate::plan::ComponentPlan {
+            name: "Home".into(),
+            module: "app.rs".into(),
+            uses_commands: vec![],
+            summary: "".into(),
+            motivated_by_regions: vec!["R1".into()],
+        });
+        plan.frontend.components.push(crate::plan::ComponentPlan {
+            name: "Nav".into(),
+            module: "app.rs".into(),
+            uses_commands: vec![],
+            summary: "".into(),
+            motivated_by_regions: vec![],
+        });
+        plan
+    }
+
+    #[test]
+    fn frontend_plan_validator_accepts_empty_design_plan() {
+        // Legacy plans (or a planner that deliberately left design blank)
+        // must not be penalised — layoutPattern empty is not a FAIL.
+        let plan = seed_plan_with_frontend();
+        assert!(plan.frontend.design.layout_pattern.is_empty());
+        let report = validate_frontend_plan(&plan);
+        assert!(report.passed, "{:?}", report.checks);
+    }
+
+    #[test]
+    fn frontend_plan_validator_rejects_unknown_layout_pattern() {
+        let mut plan = seed_plan_with_frontend();
+        plan.frontend.design.layout_pattern = "carousel".into();
+        let report = validate_frontend_plan(&plan);
+        assert!(!report.passed);
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name.contains("layoutPattern") && !c.passed));
+    }
+
+    #[test]
+    fn frontend_plan_validator_accepts_known_layout_pattern() {
+        let mut plan = seed_plan_with_frontend();
+        plan.frontend.design.layout_pattern = "sidebar".into();
+        let report = validate_frontend_plan(&plan);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("layoutPattern"))
+            .expect("layout pattern check present");
+        assert!(check.passed, "{:?}", check);
+    }
+
+    #[test]
+    fn frontend_plan_validator_rejects_theme_override_of_unknown_token() {
+        let mut plan = seed_plan_with_frontend();
+        plan.frontend.design.theme_overrides.push(TokenOverride {
+            token: "--totally-made-up".into(),
+            value: "#7c3aed".into(),
+            reason: "test".into(),
+        });
+        let report = validate_frontend_plan(&plan);
+        assert!(!report.passed);
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name.contains("themeOverrides reference known token") && !c.passed));
+    }
+
+    #[test]
+    fn frontend_plan_validator_rejects_injection_in_theme_override_value() {
+        for bad_value in ["red; } .evil { color", "red<script>", "red{", "red}"] {
+            let mut plan = seed_plan_with_frontend();
+            plan.frontend.design.theme_overrides.push(TokenOverride {
+                token: "--accent".into(),
+                value: bad_value.into(),
+                reason: "test".into(),
+            });
+            let report = validate_frontend_plan(&plan);
+            assert!(!report.passed, "value {bad_value:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn frontend_plan_validator_accepts_clean_theme_override() {
+        let mut plan = seed_plan_with_frontend();
+        plan.frontend.design.theme_overrides.push(TokenOverride {
+            token: "--accent".into(),
+            value: "#7c3aed".into(),
+            reason: "user drew the header purple (R2)".into(),
+        });
+        let report = validate_frontend_plan(&plan);
+        assert!(report.passed, "{:?}", report.checks);
+    }
+
+    #[test]
+    fn frontend_plan_validator_rejects_incomplete_visual_note() {
+        let mut plan = seed_plan_with_frontend();
+        plan.frontend.design.visual_notes.push(RegionDesignNote {
+            region: "".into(),
+            interpretation: "red box = emphasis".into(),
+        });
+        let report = validate_frontend_plan(&plan);
+        assert!(!report.passed);
+    }
+
+    #[test]
+    fn frontend_plan_validator_accepts_complete_visual_note() {
+        let mut plan = seed_plan_with_frontend();
+        plan.frontend.design.visual_notes.push(RegionDesignNote {
+            region: "R1".into(),
+            interpretation: "red box around delete = destructive emphasis".into(),
+        });
+        let report = validate_frontend_plan(&plan);
+        assert!(report.passed, "{:?}", report.checks);
     }
 
     #[test]
@@ -2344,6 +2653,103 @@ mod tests {
     }
 
     #[test]
+    fn app_css_lint_exempts_custom_property_definitions() {
+        // A `:root { --accent: #7c3aed; }` block at the top of app.css is
+        // exactly how `theme_overrides` get realised — defining a token's
+        // *value* with a raw color is the point, not a lint violation.
+        let (tmp, plan) = layered_worktree(
+            ":root {\n  --accent: #7c3aed;\n  --shadow-1: rgba(0, 0, 0, 0.2);\n}\n.widget {\n  color: var(--accent);\n  font-size: var(--text-sm);\n}\n.widget:hover { color: var(--accent); }\n.widget:focus-visible { outline: 2px solid var(--accent); }\n",
+        );
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let hex_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: no hex color literals")
+            .expect("hex lint check present");
+        assert!(
+            hex_check.passed,
+            "token definition line must be exempt from hex lint: {:?}",
+            hex_check
+        );
+        let rgb_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: no rgb()/rgba()/hsl() literals")
+            .expect("rgb lint check present");
+        assert!(
+            rgb_check.passed,
+            "token definition line must be exempt from rgb lint: {:?}",
+            rgb_check
+        );
+    }
+
+    #[test]
+    fn app_css_lint_still_rejects_raw_color_in_non_property_declaration() {
+        // The exemption is narrow: a normal `color: #7c3aed;` declaration
+        // (not a `--name: value;` custom property) still fails.
+        let (tmp, plan) = layered_worktree(
+            ".widget {\n  color: #7c3aed;\n  font-size: var(--text-sm);\n}\n.widget:hover { color: var(--accent); }\n.widget:focus-visible { outline: 2px solid var(--accent); }\n",
+        );
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let hex_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "styles/app.css: no hex color literals")
+            .expect("hex lint check present");
+        assert!(
+            !hex_check.passed,
+            "a raw hex value on a normal property must still fail"
+        );
+    }
+
+    #[test]
+    fn theme_overrides_coherence_requires_reapplication_in_app_css() {
+        let (tmp, mut plan) = layered_worktree(
+            ".widget {\n  color: var(--fg);\n  font-size: var(--text-sm);\n}\n.widget:hover { color: var(--accent); }\n.widget:focus-visible { outline: 2px solid var(--accent); }\n",
+        );
+        plan.frontend.design.theme_overrides.push(TokenOverride {
+            token: "--accent".into(),
+            value: "#7c3aed".into(),
+            reason: "user drew the header purple (R2)".into(),
+        });
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "design.themeOverrides applied in styles/app.css")
+            .expect("coherence check present");
+        assert!(!check.passed);
+        assert!(check.detail.contains("--accent"), "{}", check.detail);
+    }
+
+    #[test]
+    fn theme_overrides_coherence_passes_when_reapplied() {
+        let (tmp, mut plan) = layered_worktree(
+            ":root {\n  --accent: #7c3aed;\n}\n.widget {\n  color: var(--accent);\n  font-size: var(--text-sm);\n}\n.widget:hover { color: var(--accent); }\n.widget:focus-visible { outline: 2px solid var(--accent); }\n",
+        );
+        plan.frontend.design.theme_overrides.push(TokenOverride {
+            token: "--accent".into(),
+            value: "#7c3aed".into(),
+            reason: "user drew the header purple (R2)".into(),
+        });
+        let worktree = tmp.path().join("wt");
+        let job_dir = tmp.path().join("job");
+        let report = validate_frontend_impl(&plan, &worktree, &job_dir);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "design.themeOverrides applied in styles/app.css")
+            .expect("coherence check present");
+        assert!(check.passed, "{:?}", check);
+    }
+
+    #[test]
     fn app_css_lint_full_pass_on_clean_stylesheet() {
         let (tmp, plan) = layered_worktree(
             ".widget {\n  color: var(--fg);\n  font-size: var(--text-sm);\n  box-shadow: var(--shadow-1);\n}\n.widget:hover { color: var(--accent); }\n.widget:focus-visible { outline: 2px solid var(--accent); }\n",
@@ -2672,6 +3078,90 @@ mod tests {
                 .unwrap();
             assert!(check.passed, "{name} should be green: {}", check.detail);
         }
+    }
+
+    #[test]
+    fn final_review_rejects_missing_design_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        // No shell.rs at all — the shell-invariant block short-circuits to
+        // "reviewed by hand", isolating this test to the DESIGN.md gate.
+        let plan = crate::plan::IterationPlan::default();
+        let report = validate_final(&plan, worktree);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("DESIGN.md"))
+            .expect("DESIGN.md check present");
+        assert!(!check.passed);
+        assert!(check.detail.contains("missing"), "{}", check.detail);
+    }
+
+    #[test]
+    fn final_review_rejects_stub_design_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        std::fs::write(
+            worktree.join("DESIGN.md"),
+            "# Design\n\n## Design decisions\n\n- todo\n",
+        )
+        .unwrap();
+        let plan = crate::plan::IterationPlan::default();
+        let report = validate_final(&plan, worktree);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("DESIGN.md"))
+            .expect("DESIGN.md check present");
+        assert!(!check.passed, "a short stub must fail the size floor");
+        assert!(check.detail.contains("stub"), "{}", check.detail);
+    }
+
+    #[test]
+    fn final_review_rejects_design_md_missing_decision_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        // Long enough to clear the size floor, but no `## Design decisions`
+        // header — padding the file doesn't satisfy the gate.
+        let body = format!(
+            "# Design\n\n{}\n",
+            "Some prose about the design. ".repeat(30)
+        );
+        assert!(body.len() as u64 >= DESIGN_MD_MIN_BYTES);
+        std::fs::write(worktree.join("DESIGN.md"), body).unwrap();
+        let plan = crate::plan::IterationPlan::default();
+        let report = validate_final(&plan, worktree);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("DESIGN.md"))
+            .expect("DESIGN.md check present");
+        assert!(!check.passed);
+        assert!(
+            check.detail.contains("Design decisions"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn final_review_accepts_real_design_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path();
+        let body = format!(
+            "# Design\n\n{}\n\n## Design decisions\n\n- 2026-07-17 — initial baseline.\n",
+            "Token vocabulary and layout pattern prose. ".repeat(20)
+        );
+        assert!(body.len() as u64 >= DESIGN_MD_MIN_BYTES);
+        std::fs::write(worktree.join("DESIGN.md"), body).unwrap();
+        let plan = crate::plan::IterationPlan::default();
+        let report = validate_final(&plan, worktree);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("DESIGN.md"))
+            .expect("DESIGN.md check present");
+        assert!(check.passed, "{:?}", check);
     }
 
     #[test]

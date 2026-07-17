@@ -431,6 +431,75 @@ pub struct FrontendSection {
     pub components: Vec<ComponentPlan>,
     #[serde(default)]
     pub budget: FrontendBudget,
+    /// Visual/layout intent for this iteration — the part of a NewApp's
+    /// design that was previously invisible to the reviewer and left to
+    /// the implementing agent's whim. See `DesignPlan` below.
+    #[serde(default)]
+    pub design: DesignPlan,
+}
+
+/// Explicit, reviewable design intent for the iteration: layout shape,
+/// density, any token re-values the plan commits to, and the planner's
+/// interpretation of ambiguous canvas marks. Written by `FrontendPlan`,
+/// read by `FrontendImpl` (which must realise `theme_overrides` in
+/// `app/ui/styles/app.css`) and rendered in the Lineage review UI
+/// alongside `openQuestions`.
+///
+/// Forward-compatible: every field is `#[serde(default)]` so plans written
+/// before this section existed still deserialise (all-empty DesignPlan),
+/// and `validate_frontend_plan` treats an empty `layoutPattern` as
+/// "legacy plan, not enforced" rather than a FAIL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignPlan {
+    /// One of: "stack" | "sidebar" | "grid" | "dashboard" | "split".
+    /// Empty string means the planner didn't commit to a pattern (legacy
+    /// plan or a deliberately unstructured page) — not validated in that
+    /// case.
+    #[serde(default)]
+    pub layout_pattern: String,
+    /// "comfortable" (default) | "compact". Empty defaults to comfortable
+    /// at the presentation layer; the validator does not require a value.
+    #[serde(default)]
+    pub density: String,
+    /// Token re-values this iteration commits to, each with a reason tied
+    /// back to the user's request or a canvas region. Every `token` must
+    /// be a name from `validators::REQUIRED_TOKEN_NAMES`; the implementer
+    /// realises these as a `:root { ... }` block at the top of
+    /// `app/ui/styles/app.css` (tokens.css itself is never edited).
+    #[serde(default)]
+    pub theme_overrides: Vec<TokenOverride>,
+    /// The planner's interpretation of ambiguous canvas marks — e.g. "a
+    /// red box usually means emphasis, not a literal red background".
+    /// Keeps that judgment call visible to the human reviewer instead of
+    /// buried in the implementing agent's head.
+    #[serde(default)]
+    pub visual_notes: Vec<RegionDesignNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenOverride {
+    /// CSS custom property name, e.g. `--accent`. Must be a member of
+    /// `validators::REQUIRED_TOKEN_NAMES`.
+    pub token: String,
+    /// The new value, e.g. `#7c3aed`. Free-form but scanned for
+    /// CSS/markup injection characters (`;`, `{`, `}`, `<`, newline).
+    pub value: String,
+    /// Why — tie back to user text or a region id, e.g. "user drew the
+    /// header purple (R2)".
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionDesignNote {
+    /// Canvas region id this note interprets, e.g. "R2".
+    pub region: String,
+    /// The planner's reading of what the mark means, e.g. "red box around
+    /// delete = destructive emphasis, not literal red bg".
+    pub interpretation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1232,6 +1301,59 @@ mod tests {
         assert!(plan.templates.backend_bindings.is_empty());
         assert_eq!(plan.templates.use_templates, vec!["openrouter".to_string()]);
         assert_eq!(plan.templates.declined.len(), 1);
+    }
+
+    #[test]
+    fn design_plan_round_trips() {
+        let dir = tempdir().unwrap();
+        let mut plan = IterationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            app: AppIdentity {
+                name: "Demo".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        plan.frontend.design.layout_pattern = "sidebar".into();
+        plan.frontend.design.density = "compact".into();
+        plan.frontend.design.theme_overrides.push(TokenOverride {
+            token: "--accent".into(),
+            value: "#7c3aed".into(),
+            reason: "user drew the header purple (R2)".into(),
+        });
+        plan.frontend.design.visual_notes.push(RegionDesignNote {
+            region: "R2".into(),
+            interpretation: "red box around delete = destructive emphasis, not literal red bg"
+                .into(),
+        });
+
+        save_plan(dir.path(), &plan).unwrap();
+        let back = load_plan(dir.path()).unwrap().unwrap();
+        assert_eq!(back.frontend.design.layout_pattern, "sidebar");
+        assert_eq!(back.frontend.design.density, "compact");
+        assert_eq!(back.frontend.design.theme_overrides.len(), 1);
+        assert_eq!(back.frontend.design.theme_overrides[0].token, "--accent");
+        assert_eq!(back.frontend.design.visual_notes.len(), 1);
+        assert_eq!(back.frontend.design.visual_notes[0].region, "R2");
+    }
+
+    #[test]
+    fn design_plan_tolerates_legacy_plans_without_it() {
+        // Plans written before DesignPlan existed decode cleanly: the
+        // field is entirely absent from the JSON, not just empty.
+        let raw = r#"{
+            "schemaVersion": 1,
+            "app": {"name": "Older"},
+            "stage": "frontend_planned",
+            "canvas": {"route": "/"},
+            "frontend": {
+                "routes": [{"path": "/", "component": "Home"}],
+                "components": [{"name": "Home"}]
+            }
+        }"#;
+        let plan: IterationPlan = serde_json::from_str(raw).unwrap();
+        assert_eq!(plan.frontend.design, DesignPlan::default());
+        assert!(plan.frontend.design.layout_pattern.is_empty());
     }
 
     #[test]
