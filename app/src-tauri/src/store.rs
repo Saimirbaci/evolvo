@@ -436,6 +436,9 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             pause_after_plan: false,
             plan_approved_at_unix_ms: None,
+            base_branch: None,
+            promoted_at_unix_ms: None,
+            promoted_commit: None,
         };
         store.save_lineage_job(&job).unwrap();
         assert_eq!(store.list_lineage_jobs().unwrap().len(), 1);

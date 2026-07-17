@@ -810,6 +810,10 @@ pub struct PreparedRun {
     pub inputs_dir: PathBuf,
     pub branch: String,
     pub source_repo: PathBuf,
+    /// Branch the source repo had checked out when this worktree was
+    /// created — see `LineageEngine::set_run_artifacts`. `None` if the
+    /// source repo was in detached-HEAD state (no branch to record).
+    pub base_branch: Option<String>,
     pub prompt: String,
     /// Resolved local-delegate spawn-time wiring. `Some` only when the
     /// user opted into delegation on the feedback record AND the wrapper
@@ -921,6 +925,13 @@ pub fn prepare_run(
     let metadata_file = metadata_path(&root, &job.id);
     let branch = branch_name(&job.id);
 
+    // Snapshot which branch the source repo has checked out *before* the
+    // worktree fork, so promotion can refuse if HEAD moves to a different
+    // branch between now and Approve. `git worktree add` does not change
+    // the source repo's own HEAD, so this reflects the branch the job is
+    // actually based on.
+    let base_branch = checked_out_branch(&source);
+
     create_worktree(&source, &worktree, &branch)?;
     let attachments = stage_attachments(store, feedback, &inputs_dir)?;
 
@@ -972,9 +983,29 @@ pub fn prepare_run(
         inputs_dir,
         branch,
         source_repo: source,
+        base_branch,
         prompt,
         local_delegate,
     })
+}
+
+/// The branch name the repo at `dir` currently has checked out, or `None`
+/// if `dir` isn't a git repo, HEAD is detached, or the query fails for any
+/// reason. Best-effort — a `None` here just means promotion can't verify
+/// branch stability for the job and callers should treat that
+/// conservatively (recorded as `base_branch: None` on the job).
+pub fn checked_out_branch(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // detached HEAD or not a git repo
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Spawn the selected agent's CLI in `worktree`, stream its output to
@@ -1953,9 +1984,113 @@ pub fn reconcile_orphaned_jobs(store: &Store) -> usize {
             );
             let _ = engine.force_status(&job.id, LineageJobStatus::Failed);
             reconciled += 1;
+        } else if matches!(job.status, LineageJobStatus::Merging) {
+            reconcile_orphaned_merge(&engine, &job);
+            reconciled += 1;
         }
     }
     reconciled
+}
+
+/// Decide the terminal state for a job the host crashed while promoting
+/// (status still `Merging` at restart — the promotion thread that would
+/// have flipped it to `Promoted` or back to `BuildReady` is gone with the
+/// old process). Two signals distinguish "the merge actually landed
+/// before the crash" from "the crash happened before/during the merge":
+///
+/// 1. `job.promoted_commit` — `promotion::stamp_promoted` sets this AND
+///    flips status to `Promoted` back-to-back under the same job lock, in
+///    that order (status first, then the SHA — see `stamp_promoted`). If
+///    the process died between those two writes, status could still read
+///    `Merging` while `promoted_commit` is unset (crash before either
+///    landed) — but never `Merging` with `promoted_commit` set, since the
+///    status write happens first. So `promoted_commit.is_some()` here
+///    would only occur from a source predating this ordering; we still
+///    check it defensively and trust it if present.
+/// 2. Independent verification: does the source repo's checked-out branch
+///    tip actually contain the lineage branch tip as an ancestor? If the
+///    merge commit landed in the source repo before the crash (e.g. the
+///    crash happened during the post-merge gates, after `attempt_merge`
+///    already committed), the source repo's history already has the
+///    change even though the job record never got stamped. In that case
+///    we finalize to `Promoted` using the source repo's current HEAD as
+///    the commit — re-running the merge would be a no-op ff/conflict
+///    anyway, and leaving the job in a resettable state risks a *second*
+///    merge attempt (and a second, spurious merge commit) on retry.
+///
+/// If neither signal confirms a landed merge, the safest terminal state is
+/// `BuildReady` — the worktree and branch are untouched (a merge attempt
+/// that touches the source repo either fully lands or fully aborts back to
+/// the pre-merge SHA; there is no partial state that leaves the source
+/// repo dirty for `check_preconditions` to trip on next Approve).
+fn reconcile_orphaned_merge(engine: &LineageEngine<'_>, job: &LineageJobRecord) {
+    if let Some(commit) = job.promoted_commit.as_deref() {
+        let _ = engine.append_note(
+            &job.id,
+            &format!(
+                "host restarted while this job was Merging — promoted_commit {} was already recorded, finalizing as Promoted",
+                &commit[..commit.len().min(8)]
+            ),
+        );
+        let _ = engine.force_status(&job.id, LineageJobStatus::Promoted);
+        return;
+    }
+
+    let landed = job
+        .source_repo
+        .as_deref()
+        .zip(job.branch_name.as_deref())
+        .and_then(|(repo, branch)| {
+            let repo = Path::new(repo);
+            let head = git_rev_parse(repo, "HEAD")?;
+            let branch_tip = git_rev_parse(repo, branch)?;
+            git_is_ancestor(repo, &branch_tip, &head).then_some(head)
+        });
+
+    match landed {
+        Some(head) => {
+            let _ = engine.append_note(
+                &job.id,
+                &format!(
+                    "host restarted while this job was Merging — verified the lineage branch is already merged into the source repo's HEAD ({}), finalizing as Promoted",
+                    &head[..head.len().min(8)]
+                ),
+            );
+            let _ = engine.force_status(&job.id, LineageJobStatus::Promoted);
+            let _ = engine.stamp_promotion(&job.id, &head);
+        }
+        None => {
+            let _ = engine.append_note(
+                &job.id,
+                "host restarted while this job was Merging — no evidence the merge landed in the source repo; returned to BuildReady (Approve to retry promotion)",
+            );
+            let _ = engine.force_status(&job.id, LineageJobStatus::BuildReady);
+        }
+    }
+}
+
+fn git_rev_parse(repo: &Path, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", rev])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+fn git_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// True iff the feedback is a NewApp request carrying a canvas screenshot or
@@ -2158,6 +2293,9 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             pause_after_plan: false,
             plan_approved_at_unix_ms: None,
+            base_branch: None,
+            promoted_at_unix_ms: None,
+            promoted_commit: None,
         }
     }
 

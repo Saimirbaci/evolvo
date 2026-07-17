@@ -99,6 +99,50 @@ impl Drop for AgentSlot {
     }
 }
 
+/// Process-global mutex ensuring at most one promotion (lineage-branch
+/// merge into the source repo) runs at a time. Unlike `AgentSlot`, this is
+/// NOT a queue — two simultaneous merges into the same source repo is
+/// never safe (interleaved `git merge`/`git reset --hard` calls would
+/// corrupt each other's view of HEAD), so a second caller must refuse
+/// rather than block indefinitely behind the first. `try_acquire` returns
+/// `None` immediately if a promotion is already running; the caller is
+/// expected to append a job note and let the reviewer retry.
+///
+/// Implemented as a `Mutex<bool>` busy-flag rather than holding a
+/// `MutexGuard` across the slot's lifetime, since a `MutexGuard` borrows
+/// the mutex and can't be stored in a `'static`, `Send`-across-threads
+/// struct without unsafe lifetime tricks. The flag is flipped back to
+/// `false` on `Drop`, covering early return and panics the same way
+/// `AgentSlot` does.
+pub struct PromotionSlot {
+    _private: (),
+}
+
+fn promotion_busy() -> &'static Mutex<bool> {
+    static FLAG: OnceLock<Mutex<bool>> = OnceLock::new();
+    FLAG.get_or_init(|| Mutex::new(false))
+}
+
+impl PromotionSlot {
+    /// Non-blocking acquire: `Some(guard)` if no promotion is currently
+    /// running, `None` if one already holds the slot.
+    pub fn try_acquire() -> Option<Self> {
+        let mut busy = promotion_busy().lock().unwrap_or_else(|e| e.into_inner());
+        if *busy {
+            return None;
+        }
+        *busy = true;
+        Some(Self { _private: () })
+    }
+}
+
+impl Drop for PromotionSlot {
+    fn drop(&mut self) {
+        let mut busy = promotion_busy().lock().unwrap_or_else(|e| e.into_inner());
+        *busy = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +247,20 @@ mod tests {
         assert_eq!(parse(Some("3.5")), DEFAULT_MAX_CONCURRENT_JOBS);
         assert_eq!(parse(Some("5")), 5);
         assert_eq!(parse(Some("1")), 1);
+    }
+
+    #[test]
+    fn promotion_slot_refuses_second_acquire_while_first_is_held() {
+        let first = PromotionSlot::try_acquire();
+        assert!(first.is_some(), "first acquire must succeed");
+        assert!(
+            PromotionSlot::try_acquire().is_none(),
+            "second acquire must refuse while the first is held"
+        );
+        drop(first);
+        assert!(
+            PromotionSlot::try_acquire().is_some(),
+            "acquire must succeed again after the holder drops"
+        );
     }
 }

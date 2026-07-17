@@ -65,7 +65,13 @@ impl Transition {
                 | (T::Plan, S::Triaging)
                 | (T::StartImplementation, S::Planned)
                 | (T::MarkBuildReady, S::Implementing)
-                | (T::Approve, S::Pending | S::Planned | S::BuildReady)
+                // NOTE: `BuildReady` is deliberately excluded here. Promoting
+                // out of `BuildReady` must go through the real merge in
+                // `promotion::start_promotion` (BuildReady -> Merging ->
+                // Promoted/BuildReady), never this direct status flip — see
+                // `commands::approve_lineage_job`, which intercepts
+                // `BuildReady` before it ever reaches `LineageEngine::transition`.
+                | (T::Approve, S::Pending | S::Planned)
                 | (T::Reject, _)
                 | (T::Fail, _)
         )
@@ -119,6 +125,9 @@ impl<'a> LineageEngine<'a> {
             agent,
             pause_after_plan: false,
             plan_approved_at_unix_ms: None,
+            base_branch: None,
+            promoted_at_unix_ms: None,
+            promoted_commit: None,
         };
         self.store.save_lineage_job(&job)?;
 
@@ -286,7 +295,11 @@ impl<'a> LineageEngine<'a> {
     }
 
     /// Record the worktree / branch / log / source paths produced by the
-    /// runner when a job first enters `Implementing`.
+    /// runner when a job first enters `Implementing`. `base_branch` is the
+    /// branch the source repo had checked out at worktree-creation time
+    /// (`None` if it could not be resolved, e.g. detached HEAD) — promotion
+    /// later refuses to merge if the source repo has since switched to a
+    /// different branch, so this snapshot is load-bearing, not cosmetic.
     pub fn set_run_artifacts(
         &self,
         job_id: &str,
@@ -294,6 +307,7 @@ impl<'a> LineageEngine<'a> {
         branch_name: String,
         log_path: String,
         source_repo: String,
+        base_branch: Option<String>,
     ) -> Result<LineageJobRecord, StoreError> {
         let lock = job_write_lock(job_id);
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -305,6 +319,30 @@ impl<'a> LineageEngine<'a> {
         job.branch_name = Some(branch_name);
         job.log_path = Some(log_path);
         job.source_repo = Some(source_repo);
+        job.base_branch = base_branch;
+        job.updated_at_unix_ms = current_time_unix_ms();
+        self.store.save_lineage_job(&job)?;
+        Ok(job)
+    }
+
+    /// Stamp a successful promotion merge onto the job record:
+    /// `promotedAtUnixMs` + `promotedCommit`. Does NOT change `status` —
+    /// callers pair this with `force_status(.., Promoted)` (see
+    /// `promotion::stamp_promoted`), kept separate so each write stays a
+    /// single clear responsibility under the job lock.
+    pub fn stamp_promotion(
+        &self,
+        job_id: &str,
+        merge_sha: &str,
+    ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut job = self
+            .store
+            .load_lineage_job(job_id)?
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+        job.promoted_at_unix_ms = Some(current_time_unix_ms());
+        job.promoted_commit = Some(merge_sha.to_string());
         job.updated_at_unix_ms = current_time_unix_ms();
         self.store.save_lineage_job(&job)?;
         Ok(job)
@@ -499,9 +537,17 @@ mod tests {
             .unwrap();
         assert_eq!(ready.status, LineageJobStatus::BuildReady);
 
-        // BuildReady -> Approve -> Promoted
-        let promoted = engine.transition(&job.id, Transition::Approve).unwrap();
-        assert_eq!(promoted.status, LineageJobStatus::Promoted);
+        // BuildReady -> Approve is deliberately NOT a valid direct
+        // transition through the engine: promotion out of BuildReady must
+        // go through the real merge in `promotion::start_promotion`
+        // (BuildReady -> Merging -> Promoted/BuildReady), which
+        // `commands::approve_lineage_job` intercepts before it ever calls
+        // `transition`. See the NOTE on `Transition::is_valid_from`.
+        let rejected_direct_promote = engine.transition(&job.id, Transition::Approve);
+        assert!(
+            rejected_direct_promote.is_err(),
+            "BuildReady -> Promoted must not be reachable as a direct engine transition"
+        );
     }
 
     #[test]

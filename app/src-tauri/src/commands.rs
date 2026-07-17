@@ -423,8 +423,11 @@ pub fn resume_lineage_job(
 ///   `claude -p … --dangerously-skip-permissions` in it, and return with
 ///   status `Implementing`. The run continues on a background thread;
 ///   the job will flip to `BuildReady` or `Failed` when claude exits.
-/// - `BuildReady` → advance to `Promoted` via the regular state machine
-///   (merging back to main is out of scope for this step).
+/// - `Planned` (with the plan-review gate armed) → resume implementation.
+/// - `BuildReady` → flip to `Merging` synchronously and run the real
+///   promotion merge (see `promotion::start_promotion`) on a background
+///   thread. The job lands on `Promoted` on success or bounces back to
+///   `BuildReady` with an explanatory note on any refusal/failure.
 /// - anything else → the normal state-machine transition, which will
 ///   surface an error if invalid.
 #[tauri::command]
@@ -455,6 +458,14 @@ pub fn approve_lineage_job(
                 .force_status(&job.id, LineageJobStatus::Implementing)
                 .map_err(store_error)?;
             runner::resume_pipeline(store.clone(), job.id.clone())?;
+            Ok(updated)
+        }
+        LineageJobStatus::BuildReady => {
+            let updated = engine
+                .force_status(&job.id, LineageJobStatus::Merging)
+                .map_err(store_error)?;
+            let _ = engine.append_note(&job.id, "reviewer approved — promotion starting");
+            crate::promotion::start_promotion(store.clone(), job.id.clone());
             Ok(updated)
         }
         _ => engine
@@ -492,6 +503,7 @@ fn start_implementation_run(
             prepared.branch.clone(),
             prepared.log_file.display().to_string(),
             prepared.source_repo.display().to_string(),
+            prepared.base_branch.clone(),
         )
         .map_err(store_error)?;
     let updated = engine

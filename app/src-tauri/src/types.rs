@@ -381,6 +381,24 @@ pub struct LineageJobRecord {
     /// re-pauses at BackendPlan.
     #[serde(default)]
     pub plan_approved_at_unix_ms: Option<u64>,
+    /// Branch the source repo had checked out when the worktree for this
+    /// job was created (captured by `runner::prepare_run`). Promotion
+    /// refuses to merge if the source repo's checked-out branch has since
+    /// moved away from this value — merging into whatever branch happens
+    /// to be checked out at promote-time would silently land the change
+    /// somewhere the reviewer didn't intend. `None` for jobs that never
+    /// reached `Implementing` (or predate this field).
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Unix-ms timestamp of a successful promotion merge. `None` until
+    /// `promotion::promote_job` lands the merge commit.
+    #[serde(default)]
+    pub promoted_at_unix_ms: Option<u64>,
+    /// SHA of the commit created (or fast-forwarded to) in the source repo
+    /// by promotion. A self-describing value — not a pointer into host
+    /// state — so it round-trips through export/import per I-P4.
+    #[serde(default)]
+    pub promoted_commit: Option<String>,
 }
 
 /// Which stage of the multi-stage NewApp pipeline a `StageState` represents.

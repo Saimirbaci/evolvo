@@ -267,6 +267,22 @@ pub struct LineageJobRecord {
     pub stages: Vec<StageState>,
     #[serde(default)]
     pub agent: AgentKind,
+    #[serde(default)]
+    pub pause_after_plan: bool,
+    #[serde(default)]
+    pub plan_approved_at_unix_ms: Option<u64>,
+    /// Branch the source repo had checked out when this job's worktree
+    /// was created. Promotion refuses to merge if the source repo has
+    /// since switched away from this branch.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Set once promotion successfully merges this job's lineage branch
+    /// into the source repo.
+    #[serde(default)]
+    pub promoted_at_unix_ms: Option<u64>,
+    /// SHA of the merge (or fast-forward) commit landed by promotion.
+    #[serde(default)]
+    pub promoted_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
