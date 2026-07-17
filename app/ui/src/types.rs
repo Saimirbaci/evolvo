@@ -442,6 +442,11 @@ pub struct AppHealth {
     pub active_agent_sessions: u64,
     #[serde(default)]
     pub max_concurrent_agent_sessions: u64,
+    /// Feedback/lineage-job records quarantined into `.corrupted/`
+    /// because they failed to parse as JSON on the most recent listing.
+    /// Not surfaced in the UI yet — mirrored here so the type round-trips.
+    #[serde(default)]
+    pub corrupted_entity_count: u64,
 }
 
 /// UI mirror of `evolvo_desktop::plan::DesignPlan` — the visual/layout

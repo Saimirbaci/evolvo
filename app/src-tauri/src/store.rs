@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::fsutil;
 use crate::types::{FeedbackRecord, LineageJobRecord};
 
 const WORKSPACE_DIR_NAME: &str = "evolvo_workspace";
@@ -9,6 +10,12 @@ const FEEDBACK_DIR: &str = "feedback";
 const SANDBOX_JOBS_DIR: &str = "lineage_jobs";
 const ATTACHMENTS_DIR: &str = "attachments";
 const ITERATION_FILE: &str = "iteration.json";
+/// Sibling directory (inside each entity dir) that unparseable JSON files
+/// get moved into instead of being silently skipped. Not a `.json` file
+/// itself, so `list_json_entities`'s extension filter naturally excludes
+/// it from being walked as an entity — see the `.corrupted` dir doesn't
+/// leak back into listings" test.
+const CORRUPTED_DIR: &str = ".corrupted";
 
 /// Hard ceiling on a single attachment's decoded byte size (canvas
 /// screenshot, one pasted image, or the voice recording). Enforced again
@@ -127,8 +134,20 @@ impl Store {
 
     pub fn init_workspace(&self) -> Result<(), StoreError> {
         for dir in self.layout.directories() {
-            fs::create_dir_all(&dir)?;
+            fsutil::create_dir_all_private(&dir)?;
+            // Best-effort: a directory created by an older Evolvo build
+            // (before 0700 hardening landed) keeps whatever permissive
+            // mode it already has — `create_dir_all` is a no-op on an
+            // existing dir, so it never gets the tightened mode without
+            // this explicit chmod.
+            fsutil::tighten_permissions_best_effort(&dir);
         }
+        // Sweep `.tmp` debris `write_atomic` can leave behind if the
+        // process crashed between `fs::write(&tmp, ..)` and the rename.
+        // These never match the `.json` extension filter, so they're
+        // otherwise invisible clutter that accumulates forever.
+        sweep_tmp_files(&self.layout.feedback_dir());
+        sweep_tmp_files(&self.layout.lineage_jobs_dir());
         Ok(())
     }
 
@@ -192,6 +211,18 @@ impl Store {
         list_json_entities::<LineageJobRecord>(&self.layout.lineage_jobs_dir())
     }
 
+    /// Total number of `.corrupted/` entries across the feedback and
+    /// lineage-jobs directories. Computed on demand (rather than threaded
+    /// through `list_feedback`/`list_lineage_jobs`, which would change
+    /// their signatures and every call site) for `app_health` to surface
+    /// as `AppHealth::corrupted_entity_count`. Best-effort: an unreadable
+    /// `.corrupted` dir counts as zero rather than failing the health
+    /// check.
+    pub fn count_quarantined_entities(&self) -> usize {
+        count_entries(&self.layout.feedback_dir().join(CORRUPTED_DIR))
+            + count_entries(&self.layout.lineage_jobs_dir().join(CORRUPTED_DIR))
+    }
+
     /// Allocate the next iteration number for this workspace. The counter is
     /// stored in `iteration.json` at the workspace root as
     /// `{"nextIteration": N}`. A fresh workspace returns `1` on first call
@@ -232,7 +263,7 @@ impl Store {
         }
 
         let dir = self.layout.attachments_dir(feedback_id);
-        fs::create_dir_all(&dir)?;
+        fsutil::create_dir_all_private(&dir)?;
 
         let safe = sanitise_filename(filename);
         if safe.is_empty() {
@@ -260,23 +291,22 @@ impl Store {
     }
 }
 
-/// Write `bytes` to `path` atomically: same-directory `.tmp` file + rename.
-/// A crash mid-`fs::write` truncates the record, and a truncated record is
-/// silently skipped by `list_json_entities` — the job/feedback "vanishes"
-/// from the UI. Rename within one directory is atomic on every platform we
-/// target. The `.tmp` sibling never matches the `.json` extension filter,
-/// so a crash between write and rename leaves only harmless debris.
+/// Write `bytes` to `path` atomically. Thin wrapper over `fsutil::write_atomic`
+/// that maps `io::Error` into `StoreError` — kept so existing call sites in
+/// this file don't need `.map_err`.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("atomic write: path has no filename")?;
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
+    fsutil::write_atomic(path, bytes)?;
     Ok(())
 }
 
+/// List every well-formed `T` in `dir`'s `*.json` files. A file that fails
+/// to parse is moved into `dir/.corrupted/` (preserving its filename, or
+/// appending a unix-ms suffix on a collision) rather than silently skipped
+/// — a corrupt record used to just vanish from the UI with no trace beyond
+/// an `eprintln!`; quarantining keeps the bytes recoverable and lets
+/// `Store::count_quarantined_entities` surface a non-zero count via
+/// `AppHealth`. `.corrupted` itself has no `.json` extension, so it's
+/// naturally excluded from being walked as an entity on the next pass.
 fn list_json_entities<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<T>, StoreError> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -294,12 +324,84 @@ fn list_json_entities<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<
         }) {
             Ok(rec) => items.push(rec),
             Err(err) => {
-                eprintln!("skip unreadable entity at {}: {err}", path.display());
-                continue;
+                eprintln!(
+                    "quarantining unreadable entity at {}: {err}",
+                    path.display()
+                );
+                quarantine_file(dir, &path);
             }
         }
     }
     Ok(items)
+}
+
+/// Move `path` into `dir/.corrupted/`, keeping the original filename
+/// unless that name is already taken there, in which case a unix-ms
+/// suffix is appended so a repeated corruption of the same id doesn't
+/// clobber an earlier quarantined copy. Best-effort: if the move itself
+/// fails (e.g. permissions), logs and leaves the original file in place
+/// rather than losing it.
+fn quarantine_file(dir: &Path, path: &Path) {
+    let corrupted_dir = dir.join(CORRUPTED_DIR);
+    if let Err(err) = fs::create_dir_all(&corrupted_dir) {
+        eprintln!(
+            "failed to create quarantine dir {}: {err}",
+            corrupted_dir.display()
+        );
+        return;
+    }
+    let Some(file_name) = path.file_name() else {
+        return;
+    };
+    let mut dest = corrupted_dir.join(file_name);
+    if dest.exists() {
+        let now = crate::types::current_time_unix_ms();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("entity");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
+        dest = corrupted_dir.join(format!("{stem}.{now}.{ext}"));
+    }
+    if let Err(err) = fs::rename(path, &dest) {
+        eprintln!(
+            "failed to quarantine {} to {}: {err}",
+            path.display(),
+            dest.display()
+        );
+    }
+}
+
+/// Count regular files directly inside `dir` (non-recursive). Returns `0`
+/// for a missing directory rather than erroring — the quarantine dir
+/// legitimately doesn't exist until the first corrupt file shows up.
+fn count_entries(dir: &Path) -> usize {
+    if !dir.exists() {
+        return 0;
+    }
+    fs::read_dir(dir)
+        .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
+        .unwrap_or(0)
+}
+
+/// Remove leftover `*.tmp` files from a `write_atomic` that crashed
+/// between the write and the rename. Called from `init_workspace` so
+/// every store construction sweeps debris rather than letting it
+/// accumulate silently. Best-effort — an unreadable directory or a
+/// removal that fails (e.g. permissions) is logged, not propagated,
+/// since this must never block startup.
+fn sweep_tmp_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            if let Err(err) = fs::remove_file(&path) {
+                eprintln!("failed to sweep stale tmp file {}: {err}", path.display());
+            }
+        }
+    }
 }
 
 fn sanitise_filename(name: &str) -> String {
@@ -462,6 +564,84 @@ mod tests {
         let all = store.list_feedback().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "good");
+
+        // The corrupt file is quarantined, not deleted, and no longer
+        // shows up on subsequent listings (it's not a `.json` sibling of
+        // the entity dir anymore).
+        let quarantined = store
+            .layout()
+            .feedback_dir()
+            .join(".corrupted")
+            .join("bad.json");
+        assert!(quarantined.exists());
+        assert!(!store.layout().feedback_dir().join("bad.json").exists());
+        let all_again = store.list_feedback().unwrap();
+        assert_eq!(all_again.len(), 1);
+    }
+
+    #[test]
+    fn quarantine_count_is_reported_and_survives_collisions() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        store.save_feedback(&sample("good")).unwrap();
+        fs::write(store.layout().feedback_dir().join("bad1.json"), b"{oops").unwrap();
+        store.list_feedback().unwrap();
+        assert_eq!(store.count_quarantined_entities(), 1);
+
+        // A second corruption of a file with the same name must not
+        // clobber the first quarantined copy.
+        fs::write(store.layout().feedback_dir().join("bad1.json"), b"{oops2").unwrap();
+        store.list_feedback().unwrap();
+        assert_eq!(store.count_quarantined_entities(), 2);
+
+        fs::write(
+            store.layout().lineage_jobs_dir().join("badjob.json"),
+            b"not json",
+        )
+        .unwrap();
+        store.list_lineage_jobs().unwrap();
+        assert_eq!(store.count_quarantined_entities(), 3);
+    }
+
+    #[test]
+    fn init_workspace_sweeps_leftover_tmp_files() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        // Simulate a crash between `fs::write(&tmp, ..)` and the rename.
+        fs::write(store.layout().feedback_dir().join("fb-1.json.tmp"), b"{}").unwrap();
+        fs::write(
+            store.layout().lineage_jobs_dir().join("job-1.json.tmp"),
+            b"{}",
+        )
+        .unwrap();
+
+        store.init_workspace().unwrap();
+
+        assert!(!store.layout().feedback_dir().join("fb-1.json.tmp").exists());
+        assert!(!store
+            .layout()
+            .lineage_jobs_dir()
+            .join("job-1.json.tmp")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_workspace_creates_dirs_with_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        for dir in store.layout().directories() {
+            let mode = fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{} was not 0700", dir.display());
+        }
     }
 
     #[test]

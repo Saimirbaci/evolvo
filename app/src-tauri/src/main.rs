@@ -20,6 +20,25 @@ fn main() {
         eprintln!("evolvo: marked {orphaned} orphaned lineage job(s) failed after restart");
     }
 
+    // Workspace retention: reclaim disk from old Failed/Rejected lineage
+    // workspaces. Runs on a background thread (it walks + may `git
+    // worktree prune` every lineage workspace, which is not something
+    // startup should block on) after reconciliation, so it only ever
+    // considers jobs whose terminal status is already settled.
+    {
+        let store = app_state.store();
+        std::thread::spawn(move || {
+            let max_age_days = evolvo_desktop::runner::workspace_retention_days();
+            let summary = evolvo_desktop::runner::cleanup_old_workspaces(&store, max_age_days);
+            if summary.removed > 0 || summary.quarantined > 0 {
+                eprintln!(
+                    "evolvo: workspace retention — removed {} old workspace(s), quarantined {} orphaned workspace(s), kept {}",
+                    summary.removed, summary.quarantined, summary.kept
+                );
+            }
+        });
+    }
+
     tauri::Builder::default()
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![

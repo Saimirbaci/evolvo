@@ -215,6 +215,48 @@ impl Default for LocalDelegateConfig {
     }
 }
 
+impl LocalDelegateConfig {
+    /// Max length for `provider` / `model`. These strings are spliced
+    /// verbatim into a child process environment
+    /// (`EVOLVO_DELEGATE_PROVIDER` / `EVOLVO_DELEGATE_MODEL` in
+    /// `runner.rs`) and into a `pi --model <provider>/<model>` CLI
+    /// invocation, so they must be restricted to an inert charset well
+    /// before they reach a shell — 128 chars is generous for any real
+    /// provider/model slug.
+    const MAX_FIELD_LEN: usize = 128;
+
+    /// Reject anything outside `[A-Za-z0-9._/-]` or over the length cap.
+    /// Called at the deserialization boundary (`submit_feedback`) so a
+    /// malformed value never reaches `resolve_delegate`'s env-var
+    /// splice. Returns a clear, field-specific error message.
+    pub fn validate(&self) -> Result<(), String> {
+        Self::validate_field("provider", &self.provider)?;
+        Self::validate_field("model", &self.model)?;
+        Ok(())
+    }
+
+    fn validate_field(name: &str, value: &str) -> Result<(), String> {
+        if value.is_empty() {
+            return Err(format!("local_delegate.{name} cannot be empty"));
+        }
+        if value.chars().count() > Self::MAX_FIELD_LEN {
+            return Err(format!(
+                "local_delegate.{name} is too long (max {} chars)",
+                Self::MAX_FIELD_LEN
+            ));
+        }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        {
+            return Err(format!(
+                "local_delegate.{name} contains invalid characters (only [A-Za-z0-9._/-] allowed)"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Whether local-model delegation is wireable on this host. Returned by
 /// the `list_local_delegate_availability` Tauri command so the UI can
 /// disable the "Local worker" chip when either piece is missing and show
@@ -672,6 +714,14 @@ pub struct AppHealth {
     /// default). `#[serde(default)]` for the same forward-compat reason.
     #[serde(default)]
     pub max_concurrent_agent_sessions: usize,
+    /// Total number of entity files (feedback + lineage jobs) quarantined
+    /// into a sibling `.corrupted/` directory because they failed to
+    /// parse as JSON on the most recent listing. Non-zero is a signal
+    /// worth surfacing to the user — see `store::list_json_entities`.
+    /// `#[serde(default)]` for the same forward-compat reason as the
+    /// concurrency fields above.
+    #[serde(default)]
+    pub corrupted_entity_count: usize,
 }
 
 #[cfg(test)]
@@ -710,6 +760,54 @@ mod tests {
             } else {
                 assert!(p ^ i, "stage {kind:?} must be exactly one of planner/impl");
             }
+        }
+    }
+
+    #[test]
+    fn local_delegate_config_accepts_valid_strings() {
+        let cfg = LocalDelegateConfig {
+            provider: "ollama".into(),
+            model: "gemma4".into(),
+        };
+        assert!(cfg.validate().is_ok());
+
+        let cfg = LocalDelegateConfig {
+            provider: "a.b_c-d/e9".into(),
+            model: "Model-1.2_3".into(),
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn local_delegate_config_rejects_invalid_strings() {
+        let cases = [
+            LocalDelegateConfig {
+                provider: "".into(),
+                model: "gemma4".into(),
+            },
+            LocalDelegateConfig {
+                provider: "ollama".into(),
+                model: "".into(),
+            },
+            LocalDelegateConfig {
+                provider: "ollama; rm -rf /".into(),
+                model: "gemma4".into(),
+            },
+            LocalDelegateConfig {
+                provider: "$(whoami)".into(),
+                model: "gemma4".into(),
+            },
+            LocalDelegateConfig {
+                provider: "ollama".into(),
+                model: "a b".into(),
+            },
+            LocalDelegateConfig {
+                provider: "a".repeat(129),
+                model: "gemma4".into(),
+            },
+        ];
+        for cfg in cases {
+            assert!(cfg.validate().is_err(), "expected rejection for {cfg:?}");
         }
     }
 

@@ -3,6 +3,7 @@ pub mod bundle;
 pub mod commands;
 pub mod concurrency;
 pub mod delegation;
+pub mod fsutil;
 pub mod lineage;
 pub mod plan;
 pub mod proc;
