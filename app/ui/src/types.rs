@@ -167,6 +167,8 @@ pub struct FeedbackRecord {
     #[serde(default)]
     pub pasted_images: Vec<String>,
     pub screenshot_filename: Option<String>,
+    #[serde(default)]
+    pub screens: Vec<FeedbackScreenRecord>,
     pub voice_filename: Option<String>,
     pub voice_transcript: Option<String>,
     pub window_width: u32,
@@ -176,6 +178,24 @@ pub struct FeedbackRecord {
     pub lineage_job_id: Option<String>,
     #[serde(default)]
     pub local_delegate: Option<LocalDelegateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackScreenRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_images: Vec<String>,
+    pub screenshot_filename: Option<String>,
+    pub window_width: u32,
+    pub window_height: u32,
 }
 
 /// Mirror of `evolvo_desktop::types::LocalDelegateConfig`. Carries the
@@ -408,6 +428,8 @@ pub struct SubmitFeedbackPayload {
     pub annotations: Vec<serde_json::Value>,
     pub pasted_images_base64: Vec<String>,
     pub screenshot_base64: Option<String>,
+    #[serde(default)]
+    pub screens: Vec<FeedbackScreenPayload>,
     pub voice_base64: Option<String>,
     pub voice_mime_type: Option<String>,
     pub voice_transcript: Option<String>,
@@ -427,6 +449,20 @@ pub struct SubmitFeedbackPayload {
     /// Opt-in local-model worker. `None` keeps historical behaviour.
     #[serde(default)]
     pub local_delegate: Option<LocalDelegateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackScreenPayload {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub intended_route: String,
+    pub annotations: Vec<serde_json::Value>,
+    pub pasted_images_base64: Vec<String>,
+    pub screenshot_base64: Option<String>,
+    pub window_width: u32,
+    pub window_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

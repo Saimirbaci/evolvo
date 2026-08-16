@@ -11,8 +11,8 @@ use crate::store::StoreError;
 use crate::types::AgentKind;
 use crate::types::{
     current_time_unix_ms, AgentAvailability, AppHealth, DelegationSummary, EntityIdPayload,
-    FeedbackRecord, FeedbackStatus, LineageJobRecord, LineageJobStatus, LocalDelegateAvailability,
-    PreviewSummary, SubmitFeedbackPayload,
+    FeedbackRecord, FeedbackScreenRecord, FeedbackStatus, LineageJobRecord, LineageJobStatus,
+    LocalDelegateAvailability, PreviewSummary, SubmitFeedbackPayload,
 };
 
 const APP_NAME: &str = "Evolvo";
@@ -141,7 +141,13 @@ pub fn submit_feedback(
 
     let mut budget = AttachmentBudget::new();
 
+    let screens = persist_storyboard_screens(&store, &id, &payload, &mut budget)?;
+    let has_storyboard = !screens.is_empty();
+
     let screenshot_filename = match payload.screenshot_base64.as_deref() {
+        _ if has_storyboard => screens
+            .first()
+            .and_then(|screen| screen.screenshot_filename.clone()),
         Some(b64) if !b64.is_empty() => {
             let bytes = decode_base64("screenshot", b64)?;
             budget.add("screenshot", bytes.len())?;
@@ -154,20 +160,28 @@ pub fn submit_feedback(
         _ => None,
     };
 
-    let mut pasted_images = Vec::with_capacity(payload.pasted_images_base64.len());
-    for (idx, b64) in payload.pasted_images_base64.iter().enumerate() {
-        if b64.is_empty() {
-            continue;
+    let pasted_images = if has_storyboard {
+        screens
+            .first()
+            .map(|screen| screen.pasted_images.clone())
+            .unwrap_or_default()
+    } else {
+        let mut images = Vec::with_capacity(payload.pasted_images_base64.len());
+        for (idx, b64) in payload.pasted_images_base64.iter().enumerate() {
+            if b64.is_empty() {
+                continue;
+            }
+            let name = format!("pasted-image-{idx}");
+            let bytes = decode_base64(&name, b64)?;
+            budget.add(&name, bytes.len())?;
+            let filename = format!("paste-{idx}.png");
+            let saved = store
+                .save_attachment(&id, &filename, &bytes)
+                .map_err(store_error)?;
+            images.push(saved);
         }
-        let name = format!("pasted-image-{idx}");
-        let bytes = decode_base64(&name, b64)?;
-        budget.add(&name, bytes.len())?;
-        let filename = format!("paste-{idx}.png");
-        let saved = store
-            .save_attachment(&id, &filename, &bytes)
-            .map_err(store_error)?;
-        pasted_images.push(saved);
-    }
+        images
+    };
 
     let voice_filename = match payload.voice_base64.as_deref() {
         Some(b64) if !b64.is_empty() => {
@@ -183,19 +197,28 @@ pub fn submit_feedback(
         _ => None,
     };
 
+    let first_screen = screens.first();
     let mut record = FeedbackRecord {
         id: id.clone(),
         feedback_type: payload.feedback_type,
         status: FeedbackStatus::New,
-        page_route: if payload.page_route.is_empty() {
+        page_route: if let Some(route) = first_screen
+            .map(|screen| screen.intended_route.as_str())
+            .filter(|route| !route.is_empty())
+        {
+            route.to_string()
+        } else if payload.page_route.is_empty() {
             "/".into()
         } else {
             payload.page_route
         },
         feedback_text: payload.feedback_text,
-        annotations: payload.annotations,
+        annotations: first_screen
+            .map(|screen| screen.annotations.clone())
+            .unwrap_or(payload.annotations),
         pasted_images,
         screenshot_filename,
+        screens,
         voice_filename,
         voice_transcript: payload.voice_transcript.filter(|s| !s.trim().is_empty()),
         window_width: payload.window_width,
@@ -235,6 +258,74 @@ pub fn submit_feedback(
     }
 
     Ok(record)
+}
+
+fn persist_storyboard_screens(
+    store: &crate::store::Store,
+    feedback_id: &str,
+    payload: &SubmitFeedbackPayload,
+    budget: &mut AttachmentBudget,
+) -> Result<Vec<FeedbackScreenRecord>, String> {
+    let mut records = Vec::with_capacity(payload.screens.len());
+    for (screen_idx, screen) in payload.screens.iter().enumerate() {
+        let ordinal = screen_idx + 1;
+        let screenshot_filename = match screen.screenshot_base64.as_deref() {
+            Some(b64) if !b64.is_empty() => {
+                let label = format!("screen-{ordinal:02}-screenshot");
+                let bytes = decode_base64(&label, b64)?;
+                budget.add(&label, bytes.len())?;
+                Some(
+                    store
+                        .save_attachment(feedback_id, &format!("screen-{ordinal:02}.png"), &bytes)
+                        .map_err(store_error)?,
+                )
+            }
+            _ => None,
+        };
+
+        let mut pasted_images = Vec::with_capacity(screen.pasted_images_base64.len());
+        for (paste_idx, b64) in screen.pasted_images_base64.iter().enumerate() {
+            if b64.is_empty() {
+                continue;
+            }
+            let label = format!("screen-{ordinal:02}-pasted-image-{paste_idx}");
+            let bytes = decode_base64(&label, b64)?;
+            budget.add(&label, bytes.len())?;
+            let saved = store
+                .save_attachment(
+                    feedback_id,
+                    &format!("screen-{ordinal:02}-paste-{paste_idx}.png"),
+                    &bytes,
+                )
+                .map_err(store_error)?;
+            pasted_images.push(saved);
+        }
+
+        records.push(FeedbackScreenRecord {
+            id: if screen.id.trim().is_empty() {
+                format!("screen-{ordinal}")
+            } else {
+                screen.id.clone()
+            },
+            name: if screen.name.trim().is_empty() {
+                format!("Screen {ordinal}")
+            } else {
+                screen.name.trim().to_string()
+            },
+            description: screen.description.trim().to_string(),
+            intended_route: if screen.intended_route.trim().is_empty() {
+                format!("/screen-{ordinal}")
+            } else {
+                screen.intended_route.trim().to_string()
+            },
+            annotations: screen.annotations.clone(),
+            pasted_images,
+            screenshot_filename,
+            window_width: screen.window_width,
+            window_height: screen.window_height,
+        });
+    }
+    Ok(records)
 }
 
 /// Enumerate every known agent backend along with whether its CLI binary is
@@ -1001,7 +1092,7 @@ pub fn open_external_url(payload: OpenUrlPayload) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::FeedbackType;
+    use crate::types::{FeedbackScreenPayload, FeedbackType};
     use tempfile::tempdir;
 
     fn mk_payload(text: &str, pasted: usize, with_screenshot: bool) -> SubmitFeedbackPayload {
@@ -1017,6 +1108,7 @@ mod tests {
             } else {
                 None
             },
+            screens: vec![],
             voice_base64: None,
             voice_mime_type: None,
             voice_transcript: None,
@@ -1205,6 +1297,55 @@ mod tests {
     }
 
     #[test]
+    fn storyboard_screens_persist_as_separate_ordered_attachments() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+        let png = STANDARD.encode([137u8, 80, 78, 71, 13, 10, 26, 10]);
+        let mut payload = mk_payload("two-screen app", 0, false);
+        payload.screens = vec![
+            FeedbackScreenPayload {
+                id: "dashboard".into(),
+                name: "Dashboard".into(),
+                description: "Overview".into(),
+                intended_route: "/".into(),
+                annotations: vec![serde_json::json!({"type": "rect"})],
+                pasted_images_base64: vec![],
+                screenshot_base64: Some(png.clone()),
+                window_width: 1200,
+                window_height: 800,
+            },
+            FeedbackScreenPayload {
+                id: "settings".into(),
+                name: "Settings".into(),
+                description: "Account preferences".into(),
+                intended_route: "/settings".into(),
+                annotations: vec![],
+                pasted_images_base64: vec![png.clone()],
+                screenshot_base64: Some(png),
+                window_width: 1200,
+                window_height: 800,
+            },
+        ];
+
+        let mut budget = AttachmentBudget::new();
+        let records =
+            persist_storyboard_screens(&store, "fb-storyboard", &payload, &mut budget).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, "Dashboard");
+        assert_eq!(records[1].intended_route, "/settings");
+        assert_eq!(
+            records[0].screenshot_filename.as_deref(),
+            Some("screen-01.png")
+        );
+        assert_eq!(records[1].pasted_images, vec!["screen-02-paste-0.png"]);
+        assert!(store
+            .read_attachment("fb-storyboard", "screen-02.png")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn submit_feedback_stores_record_and_spawns_job() {
         let (_temp, app) = state_with_tmp();
         let store = app.store();
@@ -1225,6 +1366,7 @@ mod tests {
                 annotations: payload.annotations.clone(),
                 pasted_images: vec![],
                 screenshot_filename: None,
+                screens: vec![],
                 voice_filename: None,
                 voice_transcript: None,
                 window_width: payload.window_width,
@@ -1272,6 +1414,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 100,
@@ -1310,6 +1453,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 800,

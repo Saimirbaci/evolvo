@@ -198,6 +198,30 @@ pub struct CanvasReference {
     /// region. Deterministic; no LLM involved.
     #[serde(default)]
     pub regions: Vec<CanvasRegion>,
+    /// Ordered NewApp storyboard. Empty for legacy single-canvas feedback.
+    /// The singular fields above mirror the first screen so older plans and
+    /// validators remain readable while every stage can inspect all screens.
+    #[serde(default)]
+    pub screens: Vec<StoryboardScreenReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryboardScreenReference {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    pub png_path: Option<String>,
+    pub annotations_path: Option<String>,
+    #[serde(default)]
+    pub pasted_image_paths: Vec<String>,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    #[serde(default)]
+    pub regions: Vec<CanvasRegion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

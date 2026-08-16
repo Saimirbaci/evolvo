@@ -95,6 +95,13 @@ When you select New App, an **Auto-evolve** checkbox appears below the chips
 and is pre-checked. Leave it checked — this tells Evolvo to start the agent run
 automatically after submission without waiting for you to click Evolve manually.
 
+An **App screens** storyboard also appears. The current drawing is Screen 1.
+Use **+ Screen** to sketch additional pages, give each one a name, route, and
+short description, or duplicate a screen to preserve a shared layout. The
+thumbnail strip lets you switch and reorder screens. Evolvo submits the full
+ordered storyboard as one lineage job, so the agent can plan the routes and
+navigation together instead of guessing unseen pages.
+
 ### Choose an agent
 
 Below the chips is an agent row. Chips whose CLI is not installed are greyed

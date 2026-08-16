@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use crate::lineage::LineageEngine;
 use crate::plan::{
     append_history, extract_regions, load_plan, save_plan, AppIdentity, CanvasReference,
-    HistoryKind, IterationPlan, PlanStage, PLAN_SCHEMA_VERSION,
+    HistoryKind, IterationPlan, PlanStage, StoryboardScreenReference, PLAN_SCHEMA_VERSION,
 };
 use crate::store::{Store, StoreError};
 use crate::types::{FeedbackRecord, StageKind, StageState, StageStatus};
@@ -83,13 +83,27 @@ pub fn seed_plan_from_feedback(
     let inputs_dir = job_dir.join("inputs");
     std::fs::create_dir_all(&inputs_dir)?;
 
-    let canvas_png = stage_canvas_png(store, feedback, &inputs_dir)?;
-    let annotations_path = stage_annotations(feedback, &inputs_dir)?;
-    let regions = extract_regions(
-        &feedback.annotations,
-        feedback.window_width,
-        feedback.window_height,
-    );
+    let canvas = if feedback.screens.is_empty() {
+        let canvas_png = stage_canvas_png(store, feedback, &inputs_dir)?;
+        let annotations_path = stage_annotations(feedback, &inputs_dir)?;
+        let regions = extract_regions(
+            &feedback.annotations,
+            feedback.window_width,
+            feedback.window_height,
+        );
+        CanvasReference {
+            png_path: canvas_png.map(|p| p.display().to_string()),
+            annotations_path: annotations_path.map(|p| p.display().to_string()),
+            route: feedback.page_route.clone(),
+            viewport_width: feedback.window_width,
+            viewport_height: feedback.window_height,
+            stroke_count: feedback.annotations.len() as u32,
+            regions,
+            screens: Vec::new(),
+        }
+    } else {
+        stage_storyboard(store, feedback, &inputs_dir)?
+    };
 
     // Seed the backend budget so the planner sees a region-scaled
     // floor from the start. The planner is free to raise these
@@ -97,7 +111,7 @@ pub fn seed_plan_from_feedback(
     // validation time, so a planner that "lazily" downgrades the
     // budget still gets held to the floor.
     let backend = crate::plan::BackendSection {
-        budget: crate::plan::budget_floor_for_regions(regions.len()),
+        budget: crate::plan::budget_floor_for_regions(canvas.regions.len()),
         ..Default::default()
     };
 
@@ -112,15 +126,7 @@ pub fn seed_plan_from_feedback(
             iteration,
         },
         stage: PlanStage::Seeded,
-        canvas: CanvasReference {
-            png_path: canvas_png.map(|p| p.display().to_string()),
-            annotations_path: annotations_path.map(|p| p.display().to_string()),
-            route: feedback.page_route.clone(),
-            viewport_width: feedback.window_width,
-            viewport_height: feedback.window_height,
-            stroke_count: feedback.annotations.len() as u32,
-            regions,
-        },
+        canvas,
         user_text: feedback.feedback_text.clone(),
         voice_transcript: feedback.voice_transcript.clone(),
         templates: Default::default(),
@@ -132,6 +138,89 @@ pub fn seed_plan_from_feedback(
     };
     save_plan(job_dir, &plan)?;
     Ok(plan)
+}
+
+fn stage_storyboard(
+    store: &Store,
+    feedback: &FeedbackRecord,
+    inputs_dir: &Path,
+) -> Result<CanvasReference, StoreError> {
+    let mut screens = Vec::with_capacity(feedback.screens.len());
+    let mut all_regions = Vec::new();
+    let mut total_strokes = 0u32;
+
+    for (idx, screen) in feedback.screens.iter().enumerate() {
+        let ordinal = idx + 1;
+        let png_path = if let Some(filename) = screen.screenshot_filename.as_ref() {
+            match store.read_attachment(&feedback.id, filename)? {
+                Some(bytes) => {
+                    let dest = inputs_dir.join(format!("screen-{ordinal:02}.png"));
+                    std::fs::write(&dest, bytes)?;
+                    Some(dest.display().to_string())
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let annotations_path = if screen.annotations.is_empty() {
+            None
+        } else {
+            let dest = inputs_dir.join(format!("screen-{ordinal:02}.annotations.json"));
+            std::fs::write(&dest, serde_json::to_string_pretty(&screen.annotations)?)?;
+            Some(dest.display().to_string())
+        };
+        let mut pasted_image_paths = Vec::with_capacity(screen.pasted_images.len());
+        for filename in &screen.pasted_images {
+            if let Some(bytes) = store.read_attachment(&feedback.id, filename)? {
+                let dest = inputs_dir.join(filename);
+                std::fs::write(&dest, bytes)?;
+                pasted_image_paths.push(dest.display().to_string());
+            }
+        }
+        let mut regions = extract_regions(
+            &screen.annotations,
+            screen.window_width,
+            screen.window_height,
+        );
+        for region in &mut regions {
+            region.id = format!("S{ordinal}-{}", region.id);
+        }
+        total_strokes = total_strokes.saturating_add(screen.annotations.len() as u32);
+        all_regions.extend(regions.iter().cloned());
+        screens.push(StoryboardScreenReference {
+            id: screen.id.clone(),
+            name: screen.name.clone(),
+            description: screen.description.clone(),
+            intended_route: screen.intended_route.clone(),
+            png_path,
+            annotations_path,
+            pasted_image_paths,
+            viewport_width: screen.window_width,
+            viewport_height: screen.window_height,
+            regions,
+        });
+    }
+
+    let manifest = inputs_dir.join("storyboard.json");
+    std::fs::write(&manifest, serde_json::to_string_pretty(&screens)?)?;
+    let first = screens.first();
+    Ok(CanvasReference {
+        png_path: first.and_then(|screen| screen.png_path.clone()),
+        annotations_path: first.and_then(|screen| screen.annotations_path.clone()),
+        route: first
+            .map(|screen| screen.intended_route.clone())
+            .unwrap_or_else(|| feedback.page_route.clone()),
+        viewport_width: first
+            .map(|screen| screen.viewport_width)
+            .unwrap_or_default(),
+        viewport_height: first
+            .map(|screen| screen.viewport_height)
+            .unwrap_or_default(),
+        stroke_count: total_strokes,
+        regions: all_regions,
+        screens,
+    })
 }
 
 /// Copy the canvas screenshot from the feedback attachments dir into the
@@ -705,7 +794,7 @@ fn should_pause_for_plan_review(store: &Store, job_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FeedbackStatus, FeedbackType};
+    use crate::types::{FeedbackScreenRecord, FeedbackStatus, FeedbackType};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -722,6 +811,7 @@ mod tests {
             ],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 1440,
@@ -758,6 +848,55 @@ mod tests {
         let a = seed_plan_from_feedback(&store, &feedback, "job-1", &job_dir, 1).unwrap();
         let b = seed_plan_from_feedback(&store, &feedback, "job-1", &job_dir, 1).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn seed_plan_stages_every_storyboard_screen_with_qualified_regions() {
+        let tmp = tempdir().unwrap();
+        let store = Store::new(tmp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let mut feedback = mk_feedback();
+        store
+            .save_attachment(&feedback.id, "screen-01.png", b"one")
+            .unwrap();
+        store
+            .save_attachment(&feedback.id, "screen-02.png", b"two")
+            .unwrap();
+        feedback.screens = vec![
+            FeedbackScreenRecord {
+                id: "dashboard".into(),
+                name: "Dashboard".into(),
+                intended_route: "/".into(),
+                annotations: vec![json!({"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2})],
+                screenshot_filename: Some("screen-01.png".into()),
+                window_width: 1000,
+                window_height: 700,
+                ..Default::default()
+            },
+            FeedbackScreenRecord {
+                id: "settings".into(),
+                name: "Settings".into(),
+                description: "Edit account preferences".into(),
+                intended_route: "/settings".into(),
+                annotations: vec![json!({"x": 0.6, "y": 0.6, "w": 0.2, "h": 0.2})],
+                screenshot_filename: Some("screen-02.png".into()),
+                window_width: 1000,
+                window_height: 700,
+                ..Default::default()
+            },
+        ];
+
+        let job_dir = tmp.path().join("job-storyboard");
+        let plan =
+            seed_plan_from_feedback(&store, &feedback, "job-storyboard", &job_dir, 1).unwrap();
+
+        assert_eq!(plan.canvas.screens.len(), 2);
+        assert_eq!(plan.canvas.regions.len(), 2);
+        assert_eq!(plan.canvas.regions[0].id, "S1-R1");
+        assert_eq!(plan.canvas.regions[1].id, "S2-R1");
+        assert!(job_dir.join("inputs/screen-01.png").exists());
+        assert!(job_dir.join("inputs/screen-02.png").exists());
+        assert!(job_dir.join("inputs/storyboard.json").exists());
     }
 
     #[test]

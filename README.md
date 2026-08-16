@@ -30,7 +30,9 @@ Evolvo is a **provenance-native app builder** — a desktop app (Tauri 2 +
 Leptos/WASM) that wraps a feedback-to-iteration pipeline around whatever app
 you're building. You give feedback on the running app using a transparent
 canvas overlay that sits on top of every page. The feedback becomes a lineage
-job. The lineage job runs an agent of your choice. The agent produces an
+job. For a multi-page New App, add, name, duplicate, and reorder storyboard
+screens in that same overlay; Evolvo sends the complete ordered flow to the
+agent in one job. The lineage job runs an agent of your choice. The agent produces an
 iteration. You review the diff, run the iteration locally, and — with one
 click — promote it or reject it. The full history lives in
 `~/.evolvo/evolvo_workspace/` as plain JSON files.
@@ -124,7 +126,7 @@ so a single project guide reaches every backend.
 ~/.evolvo/evolvo_workspace/
 ├── feedback/              {id}.json — every piece of feedback you submitted
 ├── lineage_jobs/          {id}.json — the job created for each feedback row
-├── attachments/{id}/      canvas.png, paste-N.png, voice.* — what you drew/pasted/said
+├── attachments/{id}/      canvas.png or screen-NN.png, pasted images, voice.*
 └── lineage_workspaces/    one git worktree per agent run
 ```
 

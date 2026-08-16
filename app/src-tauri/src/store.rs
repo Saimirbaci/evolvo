@@ -442,6 +442,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 100,

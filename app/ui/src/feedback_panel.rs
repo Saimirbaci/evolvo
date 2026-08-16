@@ -8,13 +8,71 @@ use web_sys::{
     HtmlInputElement, HtmlTextAreaElement, PointerEvent,
 };
 
-use crate::canvas::CanvasController;
+use crate::canvas::{CanvasController, Shape};
 use crate::interop;
 use crate::types::{
-    AgentAvailability, AgentKind, FeedbackType, LocalDelegateAvailability, LocalDelegateConfig,
-    SubmitFeedbackPayload,
+    AgentAvailability, AgentKind, FeedbackScreenPayload, FeedbackType, LocalDelegateAvailability,
+    LocalDelegateConfig, SubmitFeedbackPayload,
 };
 use crate::voice::{VoiceRecorder, VoiceState};
+
+const MAX_STORYBOARD_SCREENS: usize = 8;
+
+#[derive(Clone)]
+struct StoryboardScreenDraft {
+    id: String,
+    name: String,
+    description: String,
+    intended_route: String,
+    shapes: Vec<Shape>,
+    undo_stack: Vec<Vec<Shape>>,
+    pasted_base64: Vec<String>,
+    annotation_data_url: Option<String>,
+}
+
+impl StoryboardScreenDraft {
+    fn empty(number: usize, route: String) -> Self {
+        Self {
+            id: format!("screen-{number}"),
+            name: format!("Screen {number}"),
+            description: String::new(),
+            intended_route: route,
+            shapes: Vec::new(),
+            undo_stack: Vec::new(),
+            pasted_base64: Vec::new(),
+            annotation_data_url: None,
+        }
+    }
+
+    fn has_signal(&self) -> bool {
+        !self.shapes.is_empty() || !self.pasted_base64.is_empty()
+    }
+}
+
+fn save_active_screen(
+    controller: &CanvasController,
+    screens: RwSignal<Vec<StoryboardScreenDraft>>,
+    active: RwSignal<usize>,
+) {
+    let idx = active.get_untracked();
+    screens.update(|items| {
+        if let Some(screen) = items.get_mut(idx) {
+            screen.shapes = controller.shapes.get_untracked();
+            screen.undo_stack = controller.undo_stack.get_untracked();
+            screen.pasted_base64 = controller.pasted_base64.get_untracked();
+            screen.annotation_data_url = controller.to_png_data_url();
+        }
+    });
+}
+
+fn load_active_screen(controller: &CanvasController, screen: &StoryboardScreenDraft) {
+    controller.shapes.set(screen.shapes.clone());
+    controller.undo_stack.set(screen.undo_stack.clone());
+    controller.pasted_base64.set(screen.pasted_base64.clone());
+    controller.selected_idx.set(None);
+    controller.text_input.set(None);
+    controller.poke_redraw();
+}
 
 #[component]
 pub fn FeedbackPanel(
@@ -38,6 +96,9 @@ pub fn FeedbackPanel(
     // "supervisor does everything" path is unchanged.
     let delegate_on = RwSignal::new(false);
     let text = RwSignal::new(String::new());
+    let active_screen = RwSignal::new(0usize);
+    let next_screen_number = RwSignal::new(2usize);
+    let screens = RwSignal::new(vec![StoryboardScreenDraft::empty(1, route.get_untracked())]);
     let submitting = RwSignal::new(false);
     let status: RwSignal<Option<Result<String, String>>> = RwSignal::new(None);
     let voice = VoiceState::new();
@@ -134,9 +195,19 @@ pub fn FeedbackPanel(
         let ctrl = controller.clone();
         let voice = voice.clone();
         move |_| {
+            let is_storyboard = matches!(feedback_type.get_untracked(), FeedbackType::NewApp);
+            if is_storyboard {
+                save_active_screen(&ctrl, screens, active_screen);
+            }
+            let storyboard_has_signal = is_storyboard
+                && screens
+                    .get_untracked()
+                    .iter()
+                    .any(StoryboardScreenDraft::has_signal);
             let ready = !text.get_untracked().trim().is_empty()
                 || !ctrl.shapes.get_untracked().is_empty()
-                || !ctrl.pasted_base64.get_untracked().is_empty();
+                || !ctrl.pasted_base64.get_untracked().is_empty()
+                || storyboard_has_signal;
             if !ready || submitting.get_untracked() {
                 return;
             }
@@ -145,6 +216,11 @@ pub fn FeedbackPanel(
             let anno_url = ctrl.to_png_data_url();
             let annotations = ctrl.annotations_json();
             let pasted = ctrl.pasted_base64.get_untracked();
+            let storyboard_drafts = if is_storyboard {
+                screens.get_untracked()
+            } else {
+                Vec::new()
+            };
             let (win_w, win_h) = window_size();
             let transcript = {
                 let t = voice.transcript.get_untracked();
@@ -200,13 +276,52 @@ pub fn FeedbackPanel(
                 }
                 .filter(|s| !s.is_empty());
 
+                let mut storyboard_payload = Vec::with_capacity(storyboard_drafts.len());
+                for draft in storyboard_drafts {
+                    let screen_screenshot =
+                        match (page_b64.as_deref(), draft.annotation_data_url.as_deref()) {
+                            (Some(page), Some(anno)) => composite_page_and_annotations(page, anno)
+                                .await
+                                .or_else(|| Some(page.to_string())),
+                            (Some(page), None) => Some(page.to_string()),
+                            (None, Some(anno)) => anno
+                                .split(',')
+                                .nth(1)
+                                .map(str::to_string)
+                                .filter(|value| !value.is_empty()),
+                            (None, None) => None,
+                        };
+                    storyboard_payload.push(FeedbackScreenPayload {
+                        id: draft.id,
+                        name: draft.name,
+                        description: draft.description,
+                        intended_route: draft.intended_route,
+                        annotations: draft.shapes.iter().map(Shape::to_json).collect(),
+                        pasted_images_base64: draft.pasted_base64,
+                        screenshot_base64: screen_screenshot,
+                        window_width: win_w,
+                        window_height: win_h,
+                    });
+                }
+                let (legacy_annotations, legacy_pasted, legacy_screenshot) = storyboard_payload
+                    .first()
+                    .map(|screen| {
+                        (
+                            screen.annotations.clone(),
+                            screen.pasted_images_base64.clone(),
+                            screen.screenshot_base64.clone(),
+                        )
+                    })
+                    .unwrap_or((annotations, pasted, screenshot));
+
                 let payload = SubmitFeedbackPayload {
                     feedback_type: feedback_type_v,
                     page_route: route_v,
                     feedback_text: text_v,
-                    annotations,
-                    pasted_images_base64: pasted,
-                    screenshot_base64: screenshot,
+                    annotations: legacy_annotations,
+                    pasted_images_base64: legacy_pasted,
+                    screenshot_base64: legacy_screenshot,
+                    screens: storyboard_payload,
                     voice_base64: voice_b64,
                     voice_mime_type: voice_mime,
                     voice_transcript: transcript,
@@ -227,6 +342,9 @@ pub fn FeedbackPanel(
                         };
                         status.set(Some(Ok(msg)));
                         ctrl_reset.clear_all();
+                        screens.set(vec![StoryboardScreenDraft::empty(1, route.get_untracked())]);
+                        active_screen.set(0);
+                        next_screen_number.set(2);
                         voice_reset.clear();
                         text.set(String::new());
                         is_open.set(false);
@@ -243,6 +361,99 @@ pub fn FeedbackPanel(
     let disabled_ctrl = controller.clone();
     let thumbs_ctrl = controller.clone();
     let voice_view = voice.clone();
+
+    let switch_to_screen = {
+        let ctrl = controller.clone();
+        move |idx: usize| {
+            if idx == active_screen.get_untracked() {
+                return;
+            }
+            save_active_screen(&ctrl, screens, active_screen);
+            if let Some(screen) = screens.get_untracked().get(idx).cloned() {
+                active_screen.set(idx);
+                load_active_screen(&ctrl, &screen);
+            }
+        }
+    };
+
+    let add_screen = {
+        let ctrl = controller.clone();
+        move |_| {
+            if screens.get_untracked().len() >= MAX_STORYBOARD_SCREENS {
+                return;
+            }
+            save_active_screen(&ctrl, screens, active_screen);
+            let number = next_screen_number.get_untracked();
+            next_screen_number.set(number + 1);
+            let mut items = screens.get_untracked();
+            let route = format!("/screen-{number}");
+            items.push(StoryboardScreenDraft::empty(number, route));
+            let idx = items.len() - 1;
+            let screen = items[idx].clone();
+            screens.set(items);
+            active_screen.set(idx);
+            load_active_screen(&ctrl, &screen);
+        }
+    };
+
+    let duplicate_screen = {
+        let ctrl = controller.clone();
+        move |_| {
+            if screens.get_untracked().len() >= MAX_STORYBOARD_SCREENS {
+                return;
+            }
+            save_active_screen(&ctrl, screens, active_screen);
+            let idx = active_screen.get_untracked();
+            let number = next_screen_number.get_untracked();
+            next_screen_number.set(number + 1);
+            let mut items = screens.get_untracked();
+            let Some(mut copy) = items.get(idx).cloned() else {
+                return;
+            };
+            copy.id = format!("screen-{number}");
+            copy.name = format!("{} copy", copy.name);
+            copy.intended_route = format!("/screen-{number}");
+            items.insert(idx + 1, copy.clone());
+            screens.set(items);
+            active_screen.set(idx + 1);
+            load_active_screen(&ctrl, &copy);
+        }
+    };
+
+    let delete_screen = {
+        let ctrl = controller.clone();
+        move |_| {
+            let mut items = screens.get_untracked();
+            if items.len() <= 1 {
+                return;
+            }
+            let idx = active_screen.get_untracked().min(items.len() - 1);
+            items.remove(idx);
+            let next = idx.min(items.len() - 1);
+            let screen = items[next].clone();
+            screens.set(items);
+            active_screen.set(next);
+            load_active_screen(&ctrl, &screen);
+        }
+    };
+
+    let move_screen = {
+        let ctrl = controller.clone();
+        move |direction: i32| {
+            save_active_screen(&ctrl, screens, active_screen);
+            let mut items = screens.get_untracked();
+            let from = active_screen.get_untracked();
+            let to = (from as i32 + direction).clamp(0, items.len() as i32 - 1) as usize;
+            if from == to {
+                return;
+            }
+            items.swap(from, to);
+            let screen = items[to].clone();
+            screens.set(items);
+            active_screen.set(to);
+            load_active_screen(&ctrl, &screen);
+        }
+    };
 
     let offset: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let drag_origin: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
@@ -449,6 +660,148 @@ pub fn FeedbackPanel(
                     }).collect_view()}
                 </div>
 
+                {move || {
+                    if !matches!(feedback_type.get(), FeedbackType::NewApp) {
+                        return view! { <span></span> }.into_any();
+                    }
+                    let items = screens.get();
+                    let current = active_screen.get().min(items.len().saturating_sub(1));
+                    let active = items.get(current).cloned();
+                    let can_add = items.len() < MAX_STORYBOARD_SCREENS;
+                    let add = add_screen.clone();
+                    let duplicate = duplicate_screen.clone();
+                    let delete = delete_screen.clone();
+                    let move_left = move_screen.clone();
+                    let _move_right = move_screen.clone();
+                    view! {
+                        <section class="storyboard" aria-label="App screens">
+                            <div class="storyboard-heading">
+                                <div>
+                                    <div class="panel-section-label">"App screens"</div>
+                                    <div class="storyboard-help">"Draw each page, then submit them together."</div>
+                                </div>
+                                <button
+                                    class="storyboard-add"
+                                    prop:disabled=move || !can_add
+                                    title=move || if can_add { "Add screen" } else { "Maximum 8 screens" }
+                                    on:click=move |ev| add(ev)
+                                >
+                                    "+ Screen"
+                                </button>
+                            </div>
+                            <div class="storyboard-strip" role="tablist" aria-label="Storyboard screens">
+                                {items.into_iter().enumerate().map(|(idx, screen)| {
+                                    let switch = switch_to_screen.clone();
+                                    let is_active = idx == current;
+                                    let detail = if screen.description.trim().is_empty() {
+                                        screen.intended_route.clone()
+                                    } else {
+                                        screen.description.clone()
+                                    };
+                                    let title = format!("Open {}", screen.name);
+                                    let preview = screen.annotation_data_url.clone();
+                                    view! {
+                                        <button
+                                            class="storyboard-card"
+                                            class:active=is_active
+                                            role="tab"
+                                            aria-selected=if is_active { "true" } else { "false" }
+                                            title=title
+                                            on:click=move |_| switch(idx)
+                                        >
+                                            <span class="storyboard-number">{idx + 1}</span>
+                                            <span class="storyboard-preview" aria-hidden="true">
+                                                {preview.map(|src| view! { <img src=src alt="" /> })}
+                                            </span>
+                                            <span class="storyboard-card-copy">
+                                                <strong>{screen.name}</strong>
+                                                <small>{detail}</small>
+                                            </span>
+                                        </button>
+                                    }
+                                }).collect_view()}
+                            </div>
+                            {active.map(|screen| view! {
+                                <div class="storyboard-editor">
+                                    <input
+                                        class="storyboard-input"
+                                        aria-label="Screen name"
+                                        placeholder="Screen name"
+                                        prop:value=screen.name
+                                        on:input=move |ev| {
+                                            let value = event_target::<HtmlInputElement>(&ev).value();
+                                            let idx = active_screen.get_untracked();
+                                            screens.update(|items| {
+                                                if let Some(screen) = items.get_mut(idx) {
+                                                    screen.name = value;
+                                                }
+                                            });
+                                        }
+                                    />
+                                    <input
+                                        class="storyboard-input storyboard-route"
+                                        aria-label="Intended route"
+                                        placeholder="/route"
+                                        prop:value=screen.intended_route
+                                        on:input=move |ev| {
+                                            let value = event_target::<HtmlInputElement>(&ev).value();
+                                            let idx = active_screen.get_untracked();
+                                            screens.update(|items| {
+                                                if let Some(screen) = items.get_mut(idx) {
+                                                    screen.intended_route = value;
+                                                }
+                                            });
+                                        }
+                                    />
+                                    <textarea
+                                        class="storyboard-description"
+                                        aria-label="Screen description"
+                                        placeholder="What happens on this screen?"
+                                        prop:value=screen.description
+                                        on:input=move |ev| {
+                                            let value = event_target::<HtmlTextAreaElement>(&ev).value();
+                                            let idx = active_screen.get_untracked();
+                                            screens.update(|items| {
+                                                if let Some(screen) = items.get_mut(idx) {
+                                                    screen.description = value;
+                                                }
+                                            });
+                                        }
+                                    ></textarea>
+                                    <div class="storyboard-actions">
+                                        <button
+                                            class="storyboard-action"
+                                            title="Move screen left"
+                                            aria-label="Move screen left"
+                                            prop:disabled=current == 0
+                                            on:click=move |_| move_left(-1)
+                                        >"←"</button>
+                                        <button
+                                            class="storyboard-action"
+                                            title="Move screen right"
+                                            aria-label="Move screen right"
+                                            prop:disabled=current + 1 >= screens.get_untracked().len()
+                                            on:click=move |_| _move_right(1)
+                                        >"→"</button>
+                                        <button
+                                            class="storyboard-action"
+                                            title="Duplicate screen"
+                                            prop:disabled=move || !can_add
+                                            on:click=move |ev| duplicate(ev)
+                                        >"Duplicate"</button>
+                                        <button
+                                            class="storyboard-action danger"
+                                            title="Delete screen"
+                                            prop:disabled=move || screens.get().len() <= 1
+                                            on:click=move |ev| delete(ev)
+                                        >"Delete"</button>
+                                    </div>
+                                </div>
+                            })}
+                        </section>
+                    }.into_any()
+                }}
+
                 <div class="panel-section-label">"Describe it"</div>
                 <textarea
                     class="text-area"
@@ -525,7 +878,9 @@ pub fn FeedbackPanel(
                         submitting.get()
                             || (text.get().trim().is_empty()
                                 && disabled_ctrl.shapes.get().is_empty()
-                                && disabled_ctrl.pasted_base64.get().is_empty())
+                                && disabled_ctrl.pasted_base64.get().is_empty()
+                                && !(matches!(feedback_type.get(), FeedbackType::NewApp)
+                                    && screens.get().iter().any(StoryboardScreenDraft::has_signal)))
                     }
                     on:click=submit
                 >

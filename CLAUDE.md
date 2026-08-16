@@ -22,6 +22,8 @@ Evolvo is a **Tauri 2** desktop app with a **Leptos 0.8 (CSR / WASM)** frontend.
 ├── lineage_jobs/       # {id}.json — LineageJobRecord
 └── attachments/{feedback_id}/
     ├── canvas.png      # optional canvas screenshot
+    ├── screen-NN.png   # ordered NewApp storyboard screens
+    ├── screen-NN-paste-N.png # images pasted into one storyboard screen
     ├── paste-N.png     # pasted images
     └── voice.{ext}     # voice capture (webm/ogg/m4a/wav)
 ```
@@ -56,7 +58,7 @@ The Tauri config wires the UI build/serve at `app/ui/scripts/trunk-{dev,build}.s
 
 Defined in `app/src-tauri/src/types.rs`. All wire types are `serde(rename_all = "camelCase")` — the Leptos side sees camelCase JSON, the Rust side owns snake_case.
 
-- `FeedbackRecord` — one user submission. Holds canvas screenshot ref, pasted images, voice file, annotations (arbitrary JSON), window size, status.
+- `FeedbackRecord` — one user submission. Holds the legacy single canvas fields plus an ordered `screens` storyboard for multi-screen NewApp requests, pasted images, voice file, annotations (arbitrary JSON), window size, and status.
 - `FeedbackStatus` — `new → triaged → in_lineage → resolved | rejected`.
 - `LineageJobRecord` — created automatically when feedback is submitted. Status machine in `lineage.rs`.
 - `LineageJobStatus` — `pending → triaging → planned → implementing → build_ready → merging → promoted | rejected | failed`. `can_approve()` gates UI action.
@@ -108,6 +110,7 @@ app/ui/src/
 - Trunk does NOT type-check the workspace automatically. Run `cargo check --workspace` before declaring UI work done — a Leptos view macro will happily compile nonsense into a runtime panic.
 - `withGlobalTauri: true` is set — `interop.rs` relies on `window.__TAURI__`. Don't switch to module import without updating both sides.
 - Canvas pastes/screenshots go through the clipboard + canvas→PNG path; the base64 encode happens in WASM before `submit_feedback`. Large images will dominate the IPC payload — keep attachments sane (soft-cap at a few MB).
+- NewApp feedback can contain up to eight ordered storyboard screens. Each keeps independent vectors, pasted images, name, intended route, and description; submission captures the underlying route once, composites every screen separately, and stages a `storyboard.json` manifest so every agent stage reads the complete flow.
 - `.evolvo/evolvo_workspace/` is outside the repo. Use `EVOLVO_WORKSPACE_ROOT` to point at a temp dir for reproducible runs.
 
 ## Product invariants (read this first)

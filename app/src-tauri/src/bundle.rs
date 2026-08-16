@@ -307,6 +307,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec!["paste-0.png".into()],
             screenshot_filename: Some("canvas.png".into()),
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 1024,
