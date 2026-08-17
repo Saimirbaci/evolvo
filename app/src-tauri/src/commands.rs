@@ -10,8 +10,9 @@ use crate::store::StoreError;
 #[cfg(test)]
 use crate::types::AgentKind;
 use crate::types::{
-    current_time_unix_ms, AgentAvailability, AppHealth, DelegationSummary, EntityIdPayload,
-    FeedbackRecord, FeedbackScreenRecord, FeedbackStatus, LineageJobRecord, LineageJobStatus,
+    current_time_unix_ms, AgentAvailability, AppHealth, DelegationSummary, EditableFeedback,
+    EditableFeedbackScreen, EntityIdPayload, FeedbackRecord, FeedbackRevision,
+    FeedbackScreenRecord, FeedbackStatus, LineageJobRecord, LineageJobStatus,
     LocalDelegateAvailability, PreviewSummary, SubmitFeedbackPayload,
 };
 
@@ -136,6 +137,21 @@ pub fn submit_feedback(
         cfg.validate()?;
     }
 
+    let mut parent_feedback = match payload
+        .parent_feedback_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(parent_id) => Some(
+            store
+                .load_feedback(parent_id)
+                .map_err(store_error)?
+                .ok_or_else(|| format!("feedback revision parent not found: {parent_id}"))?,
+        ),
+        None => None,
+    };
+
     let now = current_time_unix_ms();
     let id = format!("fb-{now}");
 
@@ -227,6 +243,10 @@ pub fn submit_feedback(
         updated_at_unix_ms: now,
         lineage_job_id: None,
         local_delegate: payload.local_delegate.clone(),
+        revision: parent_feedback
+            .as_ref()
+            .map(next_feedback_revision)
+            .unwrap_or_default(),
     };
 
     store.save_feedback(&record).map_err(store_error)?;
@@ -248,6 +268,20 @@ pub fn submit_feedback(
         job
     };
 
+    // Link the old record to its successor only after the new feedback and
+    // lineage job are durable. A metadata-write failure must not make the UI
+    // report that an otherwise valid revision was lost.
+    if let Some(parent) = parent_feedback.as_mut() {
+        parent.revision.superseded_by_feedback_id = Some(record.id.clone());
+        parent.updated_at_unix_ms = now;
+        if let Err(err) = store.save_feedback(parent) {
+            eprintln!(
+                "evolvo: revision {} saved but failed to link parent {}: {err}",
+                record.id, parent.id
+            );
+        }
+    }
+
     // Auto-evolve: skip the manual "Evolve" click and fire the agent run
     // immediately. We swallow run-prep errors so the feedback record is
     // still reported as saved — the failure is recorded on the lineage
@@ -258,6 +292,14 @@ pub fn submit_feedback(
     }
 
     Ok(record)
+}
+
+fn next_feedback_revision(parent: &FeedbackRecord) -> FeedbackRevision {
+    FeedbackRevision {
+        number: parent.revision.number.max(1).saturating_add(1),
+        parent_feedback_id: Some(parent.id.clone()),
+        superseded_by_feedback_id: None,
+    }
 }
 
 fn persist_storyboard_screens(
@@ -377,6 +419,110 @@ pub fn load_feedback(
         .store()
         .load_feedback(&payload.id)
         .map_err(store_error)
+}
+
+#[tauri::command]
+pub fn load_feedback_for_revision(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<Option<EditableFeedback>, String> {
+    let store = state.store();
+    let Some(feedback) = store.load_feedback(&payload.id).map_err(store_error)? else {
+        return Ok(None);
+    };
+
+    let screens = if feedback.screens.is_empty() {
+        vec![editable_screen(
+            &store,
+            &feedback.id,
+            "screen-1",
+            "Screen 1",
+            "",
+            &feedback.page_route,
+            &feedback.annotations,
+            &feedback.pasted_images,
+            feedback.window_width,
+            feedback.window_height,
+        )?]
+    } else {
+        feedback
+            .screens
+            .iter()
+            .map(|screen| {
+                editable_screen(
+                    &store,
+                    &feedback.id,
+                    &screen.id,
+                    &screen.name,
+                    &screen.description,
+                    &screen.intended_route,
+                    &screen.annotations,
+                    &screen.pasted_images,
+                    screen.window_width,
+                    screen.window_height,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(Some(EditableFeedback { feedback, screens }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn editable_screen(
+    store: &crate::store::Store,
+    feedback_id: &str,
+    id: &str,
+    name: &str,
+    description: &str,
+    intended_route: &str,
+    annotations: &[serde_json::Value],
+    pasted_images: &[String],
+    window_width: u32,
+    window_height: u32,
+) -> Result<EditableFeedbackScreen, String> {
+    let pasted_image_data_urls = pasted_images
+        .iter()
+        .map(|filename| {
+            let bytes = store
+                .read_attachment(feedback_id, filename)
+                .map_err(store_error)?;
+            Ok(bytes
+                .map(|bytes| {
+                    format!(
+                        "data:{};base64,{}",
+                        image_mime_type(&bytes),
+                        STANDARD.encode(bytes)
+                    )
+                })
+                .unwrap_or_default())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(EditableFeedbackScreen {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        intended_route: intended_route.to_string(),
+        annotations: annotations.to_vec(),
+        pasted_image_data_urls,
+        window_width,
+        window_height,
+    })
+}
+
+fn image_mime_type(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 #[tauri::command]
@@ -1118,6 +1264,7 @@ mod tests {
             auto_evolve: false,
             pause_after_plan: false,
             local_delegate: None,
+            parent_feedback_id: None,
         }
     }
 
@@ -1346,6 +1493,38 @@ mod tests {
     }
 
     #[test]
+    fn editable_screen_restores_attachment_data_urls_without_host_paths() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+        let png = [137u8, 80, 78, 71, 13, 10, 26, 10];
+        store
+            .save_attachment("fb-edit", "paste-0.png", &png)
+            .unwrap();
+
+        let editable = editable_screen(
+            &store,
+            "fb-edit",
+            "screen-1",
+            "Home",
+            "Landing page",
+            "/",
+            &[serde_json::json!({
+                "type": "image", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4,
+                "assetIndex": 0
+            })],
+            &["paste-0.png".into()],
+            1200,
+            800,
+        )
+        .unwrap();
+
+        assert_eq!(editable.name, "Home");
+        assert_eq!(editable.pasted_image_data_urls.len(), 1);
+        assert!(editable.pasted_image_data_urls[0].starts_with("data:image/png;base64,"));
+        assert!(!editable.pasted_image_data_urls[0].contains("fb-edit"));
+    }
+
+    #[test]
     fn submit_feedback_stores_record_and_spawns_job() {
         let (_temp, app) = state_with_tmp();
         let store = app.store();
@@ -1375,6 +1554,7 @@ mod tests {
                 updated_at_unix_ms: now,
                 lineage_job_id: None,
                 local_delegate: None,
+                revision: Default::default(),
             };
             store.save_feedback(&rec).unwrap();
             let engine = LineageEngine::new(&store);
@@ -1387,6 +1567,13 @@ mod tests {
         assert!(record.lineage_job_id.is_some());
         assert_eq!(store.list_feedback().unwrap().len(), before_len + 1);
         assert_eq!(store.list_lineage_jobs().unwrap().len(), 1);
+        let revision = next_feedback_revision(&record);
+        assert_eq!(revision.number, 2);
+        assert_eq!(
+            revision.parent_feedback_id.as_deref(),
+            Some(record.id.as_str())
+        );
+        assert!(revision.superseded_by_feedback_id.is_none());
     }
 
     #[test]
@@ -1423,6 +1610,7 @@ mod tests {
             updated_at_unix_ms: 0,
             lineage_job_id: None,
             local_delegate: None,
+            revision: Default::default(),
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(&store);
@@ -1462,6 +1650,7 @@ mod tests {
             updated_at_unix_ms: 0,
             lineage_job_id: None,
             local_delegate: None,
+            revision: Default::default(),
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(store);

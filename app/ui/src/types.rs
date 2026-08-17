@@ -178,6 +178,33 @@ pub struct FeedbackRecord {
     pub lineage_job_id: Option<String>,
     #[serde(default)]
     pub local_delegate: Option<LocalDelegateConfig>,
+    #[serde(default)]
+    pub revision: FeedbackRevision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackRevision {
+    #[serde(default = "default_feedback_revision_number")]
+    pub number: u32,
+    #[serde(default)]
+    pub parent_feedback_id: Option<String>,
+    #[serde(default)]
+    pub superseded_by_feedback_id: Option<String>,
+}
+
+const fn default_feedback_revision_number() -> u32 {
+    1
+}
+
+impl Default for FeedbackRevision {
+    fn default() -> Self {
+        Self {
+            number: default_feedback_revision_number(),
+            parent_feedback_id: None,
+            superseded_by_feedback_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -194,6 +221,30 @@ pub struct FeedbackScreenRecord {
     #[serde(default)]
     pub pasted_images: Vec<String>,
     pub screenshot_filename: Option<String>,
+    pub window_width: u32,
+    pub window_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableFeedback {
+    pub feedback: FeedbackRecord,
+    pub screens: Vec<EditableFeedbackScreen>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableFeedbackScreen {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_image_data_urls: Vec<String>,
     pub window_width: u32,
     pub window_height: u32,
 }
@@ -303,6 +354,34 @@ pub struct LineageJobRecord {
     /// SHA of the merge (or fast-forward) commit landed by promotion.
     #[serde(default)]
     pub promoted_commit: Option<String>,
+}
+
+/// Semantic artifact categories emitted by the host filesystem watcher.
+/// These mirror `evolvo_desktop::lineage_events::ArtifactKind`; raw file
+/// paths intentionally never cross the IPC boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageArtifactKind {
+    Plan,
+    Delegation,
+    Log,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageArtifactsChanged {
+    pub job_id: String,
+    pub changed_at_unix_ms: u64,
+    #[serde(default)]
+    pub kinds: Vec<LineageArtifactKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageJobUpserted {
+    pub revision: u64,
+    pub job: LineageJobRecord,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -446,6 +525,8 @@ pub struct SubmitFeedbackPayload {
     /// before implementation starts. Approving the Planned job resumes it.
     #[serde(default)]
     pub pause_after_plan: bool,
+    #[serde(default)]
+    pub parent_feedback_id: Option<String>,
     /// Opt-in local-model worker. `None` keeps historical behaviour.
     #[serde(default)]
     pub local_delegate: Option<LocalDelegateConfig>,

@@ -194,6 +194,12 @@ impl Store {
         self.init_workspace()?;
         let json = serde_json::to_string_pretty(rec)?;
         write_atomic(&self.lineage_job_path(&rec.id), json.as_bytes())?;
+        // Persistence remains the source of truth. Publishing happens only
+        // after the atomic write succeeds and is deliberately best-effort:
+        // a closed window must never turn a valid lineage transition into a
+        // failed mutation. The initial UI snapshot/reconciliation catches up
+        // when no listener is present.
+        crate::lineage_events::publish_job_upserted(self.layout.root(), rec);
         Ok(())
     }
 
@@ -451,6 +457,7 @@ mod tests {
             updated_at_unix_ms: 10,
             lineage_job_id: None,
             local_delegate: None,
+            revision: Default::default(),
         }
     }
 

@@ -13,6 +13,7 @@ fn main() {
     }
 
     let app_state = AppState::new();
+    let watcher_root = app_state.store().layout().root().to_path_buf();
     // Crash recovery: jobs whose runner thread died with the previous
     // process must not sit in `Implementing` forever.
     let orphaned = evolvo_desktop::runner::reconcile_orphaned_jobs(&app_state.store());
@@ -41,11 +42,26 @@ fn main() {
 
     tauri::Builder::default()
         .manage(app_state)
+        .setup(move |app| {
+            evolvo_desktop::lineage_events::install_tauri_sink(
+                app.handle().clone(),
+                watcher_root.clone(),
+            );
+            if let Err(err) =
+                evolvo_desktop::lineage_events::start_workspace_watcher(watcher_root.clone())
+            {
+                // The 60-second UI reconciliation remains a recovery path;
+                // watcher startup failure must not stop Evolvo opening.
+                eprintln!("evolvo: {err}");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
             commands::submit_feedback,
             commands::list_feedback,
             commands::load_feedback,
+            commands::load_feedback_for_revision,
             commands::delete_feedback,
             commands::list_lineage_jobs,
             commands::load_lineage_job,

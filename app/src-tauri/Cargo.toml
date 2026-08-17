@@ -26,6 +26,7 @@ sha2 = "0.10"
 tauri = { version = "2", features = [] }
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
+notify = "8.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Host-side only (never in the WASM bundle): validators capture build-tool
 # output into a temp file to surface error tails in stage reports.

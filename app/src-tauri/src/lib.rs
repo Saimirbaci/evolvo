@@ -5,6 +5,7 @@ pub mod concurrency;
 pub mod delegation;
 pub mod fsutil;
 pub mod lineage;
+pub mod lineage_events;
 pub mod plan;
 pub mod proc;
 pub mod promotion;
@@ -22,7 +23,8 @@ pub use state::AppState;
 pub use store::{default_workspace_root, Store, StoreError, WorkspaceLayout};
 pub use types::{
     current_time_unix_ms, AgentAvailability, AgentKind, AppHealth, DelegationStageStat,
-    DelegationSummary, EntityIdPayload, FeedbackRecord, FeedbackStatus, FeedbackType,
-    LineageJobRecord, LineageJobStatus, LocalDelegateAvailability, LocalDelegateConfig,
-    PreviewSummary, StageKind, StageState, StageStatus, SubmitFeedbackPayload,
+    DelegationSummary, EditableFeedback, EditableFeedbackScreen, EntityIdPayload, FeedbackRecord,
+    FeedbackRevision, FeedbackStatus, FeedbackType, LineageJobRecord, LineageJobStatus,
+    LocalDelegateAvailability, LocalDelegateConfig, PreviewSummary, StageKind, StageState,
+    StageStatus, SubmitFeedbackPayload,
 };

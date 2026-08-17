@@ -6,13 +6,91 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
 use crate::types::{
-    AgentAvailability, AppHealth, DelegationSummary, FeedbackRecord, LineageJobRecord,
-    LocalDelegateAvailability, PreviewSummary, StageState, SubmitFeedbackPayload,
+    AgentAvailability, AppHealth, DelegationSummary, EditableFeedback, FeedbackRecord,
+    LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted, LocalDelegateAvailability,
+    PreviewSummary, StageState, SubmitFeedbackPayload,
 };
+
+pub const LINEAGE_JOB_UPSERTED_EVENT: &str = "lineage://job-upserted";
+pub const LINEAGE_ARTIFACTS_CHANGED_EVENT: &str = "lineage://artifacts-changed";
+pub const LINEAGE_SNAPSHOT_INVALIDATED_EVENT: &str = "lineage://snapshot-invalidated";
 
 fn js_error(v: JsValue) -> String {
     v.as_string()
         .unwrap_or_else(|| "tauri invocation failed".into())
+}
+
+/// Owns both sides of a Tauri JS event subscription. Dropping it calls the
+/// unlisten function before releasing the WASM callback, preventing duplicate
+/// listeners when the Lineage route is mounted more than once.
+pub struct TauriEventListener {
+    unlisten: Function,
+    _callback: wasm_bindgen::closure::Closure<dyn FnMut(JsValue)>,
+}
+
+impl Drop for TauriEventListener {
+    fn drop(&mut self) {
+        let _ = self.unlisten.call0(&JsValue::NULL);
+    }
+}
+
+async fn listen_event<T, F>(event_name: &str, mut handler: F) -> Result<TauriEventListener, String>
+where
+    T: DeserializeOwned + 'static,
+    F: FnMut(T) + 'static,
+{
+    let win = window().ok_or_else(|| "window is not available".to_string())?;
+    let tauri = Reflect::get(&win, &JsValue::from_str("__TAURI__")).map_err(js_error)?;
+    let event_api = Reflect::get(&tauri, &JsValue::from_str("event")).map_err(js_error)?;
+    let listen = Reflect::get(&event_api, &JsValue::from_str("listen")).map_err(js_error)?;
+    let listen: Function = listen
+        .dyn_into()
+        .map_err(|_| "window.__TAURI__.event.listen is unavailable".to_string())?;
+
+    let callback = wasm_bindgen::closure::Closure::<dyn FnMut(JsValue)>::new(move |event| {
+        let Ok(payload) = Reflect::get(&event, &JsValue::from_str("payload")) else {
+            return;
+        };
+        if let Ok(value) = serde_wasm_bindgen::from_value::<T>(payload) {
+            handler(value);
+        }
+    });
+    let promise = listen
+        .call2(
+            &event_api,
+            &JsValue::from_str(event_name),
+            callback.as_ref().unchecked_ref(),
+        )
+        .map_err(js_error)?;
+    let promise: Promise = promise
+        .dyn_into()
+        .map_err(|_| "Tauri event.listen did not return a Promise".to_string())?;
+    let unlisten = JsFuture::from(promise).await.map_err(js_error)?;
+    let unlisten: Function = unlisten
+        .dyn_into()
+        .map_err(|_| "Tauri event.listen did not return an unlisten function".to_string())?;
+    Ok(TauriEventListener {
+        unlisten,
+        _callback: callback,
+    })
+}
+
+pub async fn listen_lineage_job_upserted(
+    handler: impl FnMut(LineageJobUpserted) + 'static,
+) -> Result<TauriEventListener, String> {
+    listen_event(LINEAGE_JOB_UPSERTED_EVENT, handler).await
+}
+
+pub async fn listen_lineage_artifacts_changed(
+    handler: impl FnMut(LineageArtifactsChanged) + 'static,
+) -> Result<TauriEventListener, String> {
+    listen_event(LINEAGE_ARTIFACTS_CHANGED_EVENT, handler).await
+}
+
+pub async fn listen_lineage_snapshot_invalidated(
+    handler: impl FnMut(serde_json::Value) + 'static,
+) -> Result<TauriEventListener, String> {
+    listen_event(LINEAGE_SNAPSHOT_INVALIDATED_EVENT, handler).await
 }
 
 pub async fn invoke_command<T: DeserializeOwned>(command: &str) -> Result<T, String> {
@@ -79,6 +157,14 @@ pub async fn submit_feedback(payload: &SubmitFeedbackPayload) -> Result<Feedback
 
 pub async fn list_feedback() -> Result<Vec<FeedbackRecord>, String> {
     invoke_command("list_feedback").await
+}
+
+pub async fn load_feedback(id: &str) -> Result<Option<FeedbackRecord>, String> {
+    invoke_command_with_args("load_feedback", &IdArg { id }).await
+}
+
+pub async fn load_feedback_for_revision(id: &str) -> Result<Option<EditableFeedback>, String> {
+    invoke_command_with_args("load_feedback_for_revision", &IdArg { id }).await
 }
 
 pub async fn list_lineage_jobs() -> Result<Vec<LineageJobRecord>, String> {

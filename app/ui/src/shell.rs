@@ -19,17 +19,23 @@
 //! The shell exposes `panel_open` via context so children can react to the
 //! Canvas overlay being open (e.g. to hide copy from a page screenshot).
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use send_wrapper::SendWrapper;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::canvas::{CanvasController, CanvasSurface};
-use crate::feedback_panel::FeedbackPanel;
+use crate::feedback_panel::{FeedbackPanel, FeedbackRevisionRequest};
 use crate::interop;
 use crate::toolbar::Toolbar;
 use crate::types::{
-    AppHealth, DelegationSummary, DesignPlan, LineageJobRecord, LineageJobStatus, PreviewSummary,
+    AppHealth, DelegationSummary, DesignPlan, FeedbackRecord, LineageJobRecord, LineageJobStatus,
+    PreviewSummary,
 };
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
@@ -95,6 +101,7 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
     let controller = CanvasController::new();
     let health: RwSignal<Option<AppHealth>> = RwSignal::new(None);
     let panel_open: RwSignal<bool> = RwSignal::new(false);
+    let revision_request: RwSignal<Option<FeedbackRevisionRequest>> = RwSignal::new(None);
 
     provide_context(PanelOpen(panel_open));
 
@@ -149,7 +156,13 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
 
             {move || match view_sig.get() {
                 View::Home => children().into_any(),
-                View::Lineage => view! { <LineagePage /> }.into_any(),
+                View::Lineage => view! {
+                    <LineagePage
+                        view_sig=view_sig
+                        panel_open=panel_open
+                        revision_request=revision_request
+                    />
+                }.into_any(),
             }}
 
             {move || {
@@ -159,16 +172,21 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
                             <Toolbar controller=ctrl_toolbar.clone() />
                             <CanvasSurface controller=ctrl_canvas.clone() />
                         </div>
-                        <FeedbackPanel
-                            controller=ctrl_panel.clone()
-                            route=route
-                            is_open=panel_open
-                        />
                     }.into_any()
                 } else {
                     view! { <span></span> }.into_any()
                 }
             }}
+
+            // Keep the editor mounted while closed so a partially edited
+            // multi-screen revision retains its draft and ancestry. The
+            // visible canvas overlay remains conditional above.
+            <FeedbackPanel
+                controller=ctrl_panel.clone()
+                route=route
+                is_open=panel_open
+                revision_request=revision_request
+            />
 
             <FeedbackFab controller=ctrl_fab.clone() is_open=panel_open />
         </div>
@@ -337,9 +355,16 @@ impl LineageDetailState {
 }
 
 #[component]
-fn LineagePage() -> impl IntoView {
+fn LineagePage(
+    view_sig: RwSignal<View>,
+    panel_open: RwSignal<bool>,
+    revision_request: RwSignal<Option<FeedbackRevisionRequest>>,
+) -> impl IntoView {
     let items: RwSignal<Option<Result<Vec<LineageJobRecord>, String>>> = RwSignal::new(None);
-    let reload = RwSignal::new(0_u32);
+    // Live state arrives through Tauri events. This signal is reserved for
+    // initial loading and quiet recovery reconciliation.
+    let reconcile = RwSignal::new(0_u32);
+    let artifact_reload = RwSignal::new(0_u32);
     let selected: RwSignal<Option<String>> = RwSignal::new(None);
     // Sort order for the sidebar list. `true` = newest first (default), which
     // matches the user's mental model — recent work sits at the top.
@@ -352,19 +377,109 @@ fn LineagePage() -> impl IntoView {
     let action_success: RwSignal<Option<String>> = RwSignal::new(None);
     let detail_state = LineageDetailState::new();
     Effect::new(move |_: Option<()>| {
-        let _ = reload.get();
+        let _ = reconcile.get();
         spawn_local(async move {
             let result = interop::list_lineage_jobs().await;
-            items.set(Some(result));
+            match result {
+                Ok(records) => {
+                    // Do not invalidate the view when a safety pass returns
+                    // the same durable snapshot.
+                    let unchanged = matches!(
+                        items.get_untracked(),
+                        Some(Ok(existing)) if existing == records
+                    );
+                    if !unchanged {
+                        items.set(Some(Ok(records)));
+                    }
+                }
+                Err(error) => {
+                    // Preserve an already usable snapshot across transient
+                    // reconciliation errors. Initial-load failures still
+                    // render through the existing error state.
+                    if items.get_untracked().is_none() {
+                        items.set(Some(Err(error)));
+                    }
+                }
+            }
         });
     });
 
-    // Poll the backend every 2s so that (a) status changes driven by the
-    // background claude run surface without a user action and (b) edits made
-    // directly to the lineage_jobs JSON on disk are picked up without an app
-    // restart. The backend reads from disk on each call, so a simple reload
-    // bump is sufficient.
-    spawn_interval(reload, 2000);
+    // Register one set of listeners per mount. Each handle owns its JS
+    // callback and unlisten function, including the async-unmount race.
+    // `on_cleanup` is Send+Sync in Leptos even for CSR. These values are JS
+    // thread-affine, so SendWrapper documents and enforces same-thread access
+    // while allowing the cleanup registration to satisfy that API boundary.
+    let listeners: SendWrapper<Rc<RefCell<Vec<interop::TauriEventListener>>>> =
+        SendWrapper::new(Rc::new(RefCell::new(Vec::new())));
+    let disposed = SendWrapper::new(Rc::new(Cell::new(false)));
+    let seen_revisions = Rc::new(RefCell::new(HashMap::<String, u64>::new()));
+    {
+        let listeners = Rc::clone(&listeners);
+        let disposed = Rc::clone(&disposed);
+        let seen_revisions = Rc::clone(&seen_revisions);
+        spawn_local(async move {
+            let listener = interop::listen_lineage_job_upserted(move |event| {
+                let mut revisions = seen_revisions.borrow_mut();
+                let last = revisions.entry(event.job.id.clone()).or_default();
+                if event.revision <= *last {
+                    return;
+                }
+                *last = event.revision;
+                drop(revisions);
+                upsert_lineage_job(items, event.job);
+            })
+            .await;
+            if let Ok(listener) = listener {
+                if disposed.get() {
+                    drop(listener);
+                } else {
+                    listeners.borrow_mut().push(listener);
+                }
+            }
+        });
+    }
+    {
+        let listeners = Rc::clone(&listeners);
+        let disposed = Rc::clone(&disposed);
+        spawn_local(async move {
+            let listener = interop::listen_lineage_artifacts_changed(move |event| {
+                if selected.get_untracked().as_deref() == Some(event.job_id.as_str()) {
+                    artifact_reload.update(|value| *value = value.wrapping_add(1));
+                }
+            })
+            .await;
+            if let Ok(listener) = listener {
+                if disposed.get() {
+                    drop(listener);
+                } else {
+                    listeners.borrow_mut().push(listener);
+                }
+            }
+        });
+    }
+    {
+        let listeners = Rc::clone(&listeners);
+        let disposed = Rc::clone(&disposed);
+        spawn_local(async move {
+            let listener = interop::listen_lineage_snapshot_invalidated(move |_| {
+                reconcile.update(|value| *value = value.wrapping_add(1));
+            })
+            .await;
+            if let Ok(listener) = listener {
+                if disposed.get() {
+                    drop(listener);
+                } else {
+                    listeners.borrow_mut().push(listener);
+                }
+            }
+        });
+    }
+    on_cleanup(move || {
+        disposed.set(true);
+        listeners.borrow_mut().clear();
+    });
+
+    spawn_reconciliation(reconcile, 60_000);
 
     // Keep selection valid — if nothing selected but records exist, select the
     // first; if the selected id disappeared, fall back.
@@ -532,7 +647,19 @@ fn LineagePage() -> impl IntoView {
                     let Some(record) = records.into_iter().find(|r| r.id == id) else {
                         return view! { <div class="empty-state">"No selection."</div> }.into_any();
                     };
-                    view! { <LineageDetail record=record reload=reload action_error=action_error action_success=action_success detail_state=detail_state /> }.into_any()
+                    view! {
+                        <LineageDetail
+                            record=record
+                            reload=reconcile
+                            artifact_reload=artifact_reload
+                            action_error=action_error
+                            action_success=action_success
+                            detail_state=detail_state
+                            view_sig=view_sig
+                            panel_open=panel_open
+                            revision_request=revision_request
+                        />
+                    }.into_any()
                 }}
             </section>
         </div>
@@ -543,12 +670,16 @@ fn LineagePage() -> impl IntoView {
 fn LineageDetail(
     record: LineageJobRecord,
     reload: RwSignal<u32>,
+    artifact_reload: RwSignal<u32>,
     // Surface for backend errors from Evolve / Reject / Run / Fix. Owned by
     // `LineagePage` so the message outlives this component's reconstruction
     // when `items` reloads right after an action fires.
     action_error: RwSignal<Option<String>>,
     action_success: RwSignal<Option<String>>,
     detail_state: LineageDetailState,
+    view_sig: RwSignal<View>,
+    panel_open: RwSignal<bool>,
+    revision_request: RwSignal<Option<FeedbackRevisionRequest>>,
 ) -> impl IntoView {
     let can_approve = record.status.can_approve();
     let can_retry = record.status.can_retry();
@@ -570,6 +701,10 @@ fn LineageDetail(
     let run_id = record.id.clone();
     let resume_id = record.id.clone();
     let fork_id = record.id.clone();
+    let revise_request = FeedbackRevisionRequest {
+        feedback_id: record.feedback_id.clone(),
+        agent: record.agent,
+    };
 
     let fix_open = detail_state.fix_open;
     let fix_text = detail_state.fix_text;
@@ -646,7 +781,6 @@ fn LineageDetail(
             }
             reload.update(|v| *v = v.wrapping_add(1));
         });
-        schedule_reloads(reload, &[1500, 4000, 10_000]);
     };
     let do_fork = move || {
         // Operationalises product invariant I-P4 — bundle this lineage and
@@ -695,9 +829,6 @@ fn LineageDetail(
             }
             reload.update(|v| *v = v.wrapping_add(1));
         });
-        // The pipeline runs on a background thread; nudge the UI to pick up
-        // stage transitions as Claude advances.
-        schedule_reloads(reload, &[2000, 6000, 15_000, 30_000]);
     };
     let submit_fix = move || {
         if fix_submitting.get_untracked() {
@@ -723,6 +854,11 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
+    let do_revise = move || {
+        revision_request.set(Some(revise_request.clone()));
+        view_sig.set(View::Home);
+        panel_open.set(true);
+    };
 
     let branch = record.branch_name.clone();
     let worktree = record.worktree_path.clone();
@@ -736,11 +872,19 @@ fn LineageDetail(
     let stages = record.stages.clone();
     let agent_label = record.agent.label();
 
+    let feedback_record: RwSignal<Option<FeedbackRecord>> = RwSignal::new(None);
+    let feedback_id = record.feedback_id.clone();
+    spawn_local(async move {
+        if let Ok(Some(feedback)) = interop::load_feedback(&feedback_id).await {
+            feedback_record.set(Some(feedback));
+        }
+    });
+
     // Planner's open questions from plan.json — the guesses it recorded on
     // ambiguous points. Most important while the job is parked in `Planned`
     // by the plan-review gate, but shown whenever non-empty so the context
-    // survives into implementation. Fetched once per detail construction
-    // (the component is rebuilt on every poll tick anyway).
+    // survives into implementation. The scoped watcher refreshes this only
+    // when an artifact for the selected job changes.
     let open_questions: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
     // Planner's design intent — layout pattern, density, theme overrides,
     // and its interpretation of ambiguous canvas marks. Lives at
@@ -750,8 +894,10 @@ fn LineageDetail(
     // document).
     let design_plan: RwSignal<DesignPlan> = RwSignal::new(DesignPlan::default());
     let awaiting_plan_review = matches!(record.status, LineageJobStatus::Planned);
-    {
-        let id = record.id.clone();
+    let plan_id = record.id.clone();
+    Effect::new(move |_| {
+        let _ = artifact_reload.get();
+        let id = plan_id.clone();
         spawn_local(async move {
             if let Ok(Some(plan)) = interop::read_job_plan(&id).await {
                 let qs: Vec<String> = plan
@@ -774,16 +920,15 @@ fn LineageDetail(
                 design_plan.set(design);
             }
         });
-    }
+    });
 
     // Per-job delegation telemetry (pi-events.jsonl). `None` either
     // means "not yet loaded" or "this job didn't run delegations".
-    // Re-fetched on every `reload` tick so the panel reflects new
-    // events the wrapper appends mid-run without a manual refresh.
+    // Refreshed from an artifact event rather than the lineage-list clock.
     let delegation: RwSignal<Option<DelegationSummary>> = RwSignal::new(None);
     let delegation_id = record.id.clone();
     Effect::new(move |_| {
-        let _ = reload.get();
+        let _ = artifact_reload.get();
         let id = delegation_id.clone();
         spawn_local(async move {
             match interop::read_delegation_summary(&id).await {
@@ -813,6 +958,24 @@ fn LineageDetail(
             </header>
 
             <p class="lineage-detail-summary">{summary}</p>
+
+            {move || feedback_record.get().and_then(|feedback| {
+                let revision = feedback.revision;
+                if revision.number <= 1 && revision.superseded_by_feedback_id.is_none() {
+                    return None;
+                }
+                let ancestry = revision.parent_feedback_id
+                    .map(|parent| format!("Revision {} of {parent}", revision.number))
+                    .unwrap_or_else(|| format!("Original feedback · revision {}", revision.number));
+                Some(view! {
+                    <div class="lineage-revision-card">
+                        <strong>{ancestry}</strong>
+                        {revision.superseded_by_feedback_id.map(|next| view! {
+                            <span>{format!("Superseded by {next}")}</span>
+                        })}
+                    </div>
+                })
+            })}
 
             {move || {
                 let qs = open_questions.get();
@@ -1057,6 +1220,14 @@ fn LineageDetail(
             }}
 
             <div class="lineage-detail-actions">
+                <button
+                    class="secondary-btn"
+                    on:click=move |_| do_revise()
+                    aria-label="Revise this feedback on the canvas"
+                    title="Restore this iteration's drawing as a new immutable feedback revision"
+                >
+                    "Revise on Canvas"
+                </button>
                 // Secondary: Run — preview the current iteration's app.
                 <button
                     class="secondary-btn"
@@ -1343,49 +1514,70 @@ fn format_time(ms: u64) -> String {
     String::from(date.to_iso_string())
 }
 
-/// Bump `reload` on a fixed interval until the component unmounts. Used by
-/// `LineagePage` so that (a) status changes from the background claude run
-/// surface without user action and (b) manual edits to `lineage_jobs/*.json`
-/// on disk are picked up without an app restart. `setInterval` keeps firing
-/// forever unless we clear it, so register an `on_cleanup` to stop when the
-/// Lineage view is unmounted.
-fn spawn_interval(reload: RwSignal<u32>, interval_ms: i32) {
+fn upsert_lineage_job(
+    items: RwSignal<Option<Result<Vec<LineageJobRecord>, String>>>,
+    incoming: LineageJobRecord,
+) {
+    let next = match items.get_untracked() {
+        Some(Ok(mut records)) => {
+            if let Some(existing) = records.iter_mut().find(|record| record.id == incoming.id) {
+                // Filesystem watcher events can duplicate the immediate
+                // persistence event. They can also arrive after a newer
+                // write, so never regress a record by timestamp.
+                if incoming.updated_at_unix_ms < existing.updated_at_unix_ms
+                    || existing == &incoming
+                {
+                    return;
+                }
+                *existing = incoming;
+            } else {
+                records.push(incoming);
+            }
+            records
+        }
+        _ => vec![incoming],
+    };
+    items.set(Some(Ok(next)));
+}
+
+/// Reconcile on focus and every 60 seconds as a missed-event safety net.
+/// Equality checking in the loader means an unchanged pass does not touch the
+/// rendered tree. Both browser callbacks are owned until component cleanup;
+/// unlike the old poller this leaves no leaked closures across route mounts.
+fn spawn_reconciliation(reload: RwSignal<u32>, interval_ms: i32) {
     let Some(win) = web_sys::window() else {
         return;
     };
-    let cb = Closure::<dyn FnMut()>::new(move || {
+
+    let interval_cb = Closure::<dyn FnMut()>::new(move || {
         reload.update(|v| *v = v.wrapping_add(1));
     });
     let handle = win
         .set_interval_with_callback_and_timeout_and_arguments_0(
-            cb.as_ref().unchecked_ref(),
+            interval_cb.as_ref().unchecked_ref(),
             interval_ms,
         )
         .ok();
-    // The closure must outlive the interval; `forget` leaks it for the life
-    // of the page (one per LineagePage mount — bounded).
-    cb.forget();
-    on_cleanup(move || {
-        if let Some(h) = handle {
-            if let Some(win) = web_sys::window() {
-                win.clear_interval_with_handle(h);
-            }
-        }
-    });
-}
 
-/// Bump `reload` after each delay (ms). Used to surface asynchronous lineage
-/// notes (e.g. the Run button's background-thread spawn result) without
-/// requiring the user to navigate away and back.
-fn schedule_reloads(reload: RwSignal<u32>, delays_ms: &[i32]) {
-    let Some(win) = web_sys::window() else {
-        return;
-    };
-    for &ms in delays_ms {
-        let r = reload;
-        let cb = Closure::once_into_js(move || {
-            r.update(|v| *v = v.wrapping_add(1));
-        });
-        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(cb.unchecked_ref(), ms);
-    }
+    let focus_reload = reload;
+    let focus_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        focus_reload.update(|v| *v = v.wrapping_add(1));
+    });
+    let focus_installed = win
+        .add_event_listener_with_callback("focus", focus_cb.as_ref().unchecked_ref())
+        .is_ok();
+
+    let cleanup = SendWrapper::new((win, handle, focus_installed, interval_cb, focus_cb));
+    on_cleanup(move || {
+        let (win, handle, focus_installed, interval_cb, focus_cb) = cleanup.take();
+        if let Some(h) = handle {
+            win.clear_interval_with_handle(h);
+        }
+        if focus_installed {
+            let _ =
+                win.remove_event_listener_with_callback("focus", focus_cb.as_ref().unchecked_ref());
+        }
+        drop(interval_cb);
+        drop(focus_cb);
+    });
 }

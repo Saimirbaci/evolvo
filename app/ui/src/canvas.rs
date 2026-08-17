@@ -222,6 +222,87 @@ impl Shape {
             }),
         }
     }
+
+    /// Reconstruct a vector annotation saved by `to_json`. Image bytes are
+    /// intentionally supplied out-of-band because persisted annotation JSON
+    /// contains geometry and an asset index, never a multi-megabyte data URL.
+    pub fn from_json(value: &serde_json::Value, image_data_url: Option<&str>) -> Option<Self> {
+        let kind = value.get("type")?.as_str()?;
+        let number = |key: &str| value.get(key).and_then(serde_json::Value::as_f64);
+        let text = |key: &str| value.get(key).and_then(serde_json::Value::as_str);
+        let point = |key: &str| {
+            let values = value.get(key)?.as_array()?;
+            Some((values.first()?.as_f64()?, values.get(1)?.as_f64()?))
+        };
+        let color = || text("color").unwrap_or("#ef4444").to_string();
+        let width = || number("width").unwrap_or(3.0);
+
+        match kind {
+            "path" => Some(Self::Path {
+                points: value
+                    .get("points")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|point| {
+                        let pair = point.as_array()?;
+                        Some((pair.first()?.as_f64()?, pair.get(1)?.as_f64()?))
+                    })
+                    .collect(),
+                color: color(),
+                width: width(),
+            }),
+            "line" => Some(Self::Line {
+                from: point("from")?,
+                to: point("to")?,
+                color: color(),
+                width: width(),
+            }),
+            "arrow" => Some(Self::Arrow {
+                from: point("from")?,
+                to: point("to")?,
+                color: color(),
+                width: width(),
+            }),
+            "ellipse" => Some(Self::Ellipse {
+                x: number("x")?,
+                y: number("y")?,
+                w: number("w")?,
+                h: number("h")?,
+                color: color(),
+                width: width(),
+            }),
+            "rect" => Some(Self::Rect {
+                x: number("x")?,
+                y: number("y")?,
+                w: number("w")?,
+                h: number("h")?,
+                color: color(),
+                width: width(),
+            }),
+            "highlight" => Some(Self::Highlight {
+                x: number("x")?,
+                y: number("y")?,
+                w: number("w")?,
+                h: number("h")?,
+                color: color(),
+            }),
+            "text" => Some(Self::Text {
+                x: number("x")?,
+                y: number("y")?,
+                text: text("text")?.to_string(),
+                color: color(),
+                font_size: number("fontSize").unwrap_or(16.0),
+            }),
+            "image" => Some(Self::Image {
+                x: number("x")?,
+                y: number("y")?,
+                w: number("w")?,
+                h: number("h")?,
+                data_url: image_data_url?.to_string(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,11 +410,79 @@ impl CanvasController {
     }
 
     pub fn annotations_json(&self) -> Vec<serde_json::Value> {
-        self.shapes
-            .get_untracked()
+        Self::annotations_for_shapes(&self.shapes.get_untracked())
+    }
+
+    /// Serialize image geometry with a stable index into the accompanying
+    /// pasted-image array. Legacy records without `assetIndex` remain
+    /// loadable by image order.
+    pub fn annotations_for_shapes(shapes: &[Shape]) -> Vec<serde_json::Value> {
+        let mut image_index = 0_u64;
+        shapes
             .iter()
-            .map(Shape::to_json)
+            .map(|shape| {
+                let mut value = shape.to_json();
+                if matches!(shape, Shape::Image { .. }) {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("assetIndex".into(), image_index.into());
+                    }
+                    image_index += 1;
+                }
+                value
+            })
             .collect()
+    }
+
+    /// Derive attachment bytes from live image shapes so delete/crop edits
+    /// cannot leave the old parallel `pasted_base64` array out of sync.
+    pub fn pasted_base64_for_shapes(shapes: &[Shape]) -> Vec<String> {
+        shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                Shape::Image { data_url, .. } => data_url.split_once(',').map(|(_, data)| data),
+                _ => None,
+            })
+            .filter(|data| !data.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Hydrate persisted annotations and their attachment data URLs. Missing
+    /// or corrupt image assets drop only that image shape; every vector shape
+    /// remains editable.
+    pub fn restore_annotations(
+        annotations: &[serde_json::Value],
+        image_data_urls: &[String],
+    ) -> (Vec<Shape>, Vec<String>) {
+        let mut legacy_image_index = 0_usize;
+        let mut shapes = Vec::with_capacity(annotations.len());
+        let mut restored_images = Vec::new();
+
+        for value in annotations {
+            let is_image = value.get("type").and_then(|v| v.as_str()) == Some("image");
+            let image_url = if is_image {
+                let index = value
+                    .get("assetIndex")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|index| index as usize)
+                    .unwrap_or(legacy_image_index);
+                legacy_image_index += 1;
+                image_data_urls.get(index).filter(|url| !url.is_empty())
+            } else {
+                None
+            };
+
+            if let Some(shape) = Shape::from_json(value, image_url.map(String::as_str)) {
+                if let Shape::Image { data_url, .. } = &shape {
+                    if let Some((_, data)) = data_url.split_once(',') {
+                        restored_images.push(data.to_string());
+                    }
+                }
+                shapes.push(shape);
+            }
+        }
+
+        (shapes, restored_images)
     }
 
     pub fn cycle_stroke(&self, dir: i32) {
@@ -1746,4 +1895,61 @@ fn is_editable_target(ev: &KeyboardEvent) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn annotation_round_trip_restores_vectors_and_indexed_images() {
+        let shapes = vec![
+            Shape::Rect {
+                x: 0.1,
+                y: 0.2,
+                w: 0.3,
+                h: 0.4,
+                color: "#123456".into(),
+                width: 6.0,
+            },
+            Shape::Image {
+                x: 0.2,
+                y: 0.3,
+                w: 0.4,
+                h: 0.5,
+                data_url: "data:image/png;base64,AAAA".into(),
+            },
+        ];
+        let annotations = CanvasController::annotations_for_shapes(&shapes);
+        assert_eq!(annotations[1]["assetIndex"], 0);
+
+        let urls = vec!["data:image/png;base64,AAAA".to_string()];
+        let (restored, pasted) = CanvasController::restore_annotations(&annotations, &urls);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(pasted, vec!["AAAA"]);
+        assert!(matches!(
+            restored[0],
+            Shape::Rect { x, y, w, h, .. }
+                if x == 0.1 && y == 0.2 && w == 0.3 && h == 0.4
+        ));
+        assert!(matches!(
+            &restored[1],
+            Shape::Image { data_url, .. } if data_url == "data:image/png;base64,AAAA"
+        ));
+    }
+
+    #[test]
+    fn legacy_images_restore_by_shape_order() {
+        let annotations = vec![
+            json!({"type":"image", "x":0.0, "y":0.0, "w":0.5, "h":0.5}),
+            json!({"type":"image", "x":0.5, "y":0.5, "w":0.5, "h":0.5}),
+        ];
+        let urls = vec![
+            "data:image/png;base64,ONE".to_string(),
+            "data:image/png;base64,TWO".to_string(),
+        ];
+        let (restored, pasted) = CanvasController::restore_annotations(&annotations, &urls);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(pasted, vec!["ONE", "TWO"]);
+    }
 }

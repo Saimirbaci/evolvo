@@ -192,6 +192,37 @@ pub struct FeedbackRecord {
     /// deserialise as `None`, so disk migrations are unnecessary.
     #[serde(default)]
     pub local_delegate: Option<LocalDelegateConfig>,
+    /// Immutable revision ancestry. Historical records deserialize as
+    /// revision 1; revising from the Lineage view creates a new feedback
+    /// record and links both directions without rewriting this record's
+    /// original canvas/text payload.
+    #[serde(default)]
+    pub revision: FeedbackRevision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackRevision {
+    #[serde(default = "default_feedback_revision_number")]
+    pub number: u32,
+    #[serde(default)]
+    pub parent_feedback_id: Option<String>,
+    #[serde(default)]
+    pub superseded_by_feedback_id: Option<String>,
+}
+
+const fn default_feedback_revision_number() -> u32 {
+    1
+}
+
+impl Default for FeedbackRevision {
+    fn default() -> Self {
+        Self {
+            number: default_feedback_revision_number(),
+            parent_feedback_id: None,
+            superseded_by_feedback_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -208,6 +239,33 @@ pub struct FeedbackScreenRecord {
     #[serde(default)]
     pub pasted_images: Vec<String>,
     pub screenshot_filename: Option<String>,
+    pub window_width: u32,
+    pub window_height: u32,
+}
+
+/// Read-only projection used to hydrate an existing feedback into the canvas
+/// editor. Attachments are returned as data URLs so no host filesystem paths
+/// cross into the webview.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableFeedback {
+    pub feedback: FeedbackRecord,
+    pub screens: Vec<EditableFeedbackScreen>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableFeedbackScreen {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_image_data_urls: Vec<String>,
     pub window_width: u32,
     pub window_height: u32,
 }
@@ -663,6 +721,11 @@ pub struct SubmitFeedbackPayload {
     /// so older UI builds keep behaving as before.
     #[serde(default)]
     pub pause_after_plan: bool,
+    /// Direct parent when this submission was opened from "Revise on
+    /// Canvas". The backend resolves and validates the ancestry; callers
+    /// never choose the revision number themselves.
+    #[serde(default)]
+    pub parent_feedback_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -886,6 +949,7 @@ mod tests {
             updated_at_unix_ms: 1,
             lineage_job_id: None,
             local_delegate: None,
+            revision: Default::default(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"feedbackType\":\"bug\""));
@@ -980,5 +1044,7 @@ mod tests {
         assert_eq!(back.id, "fb-1");
         assert!(back.annotations.is_empty());
         assert!(back.pasted_images.is_empty());
+        assert_eq!(back.revision.number, 1);
+        assert!(back.revision.parent_feedback_id.is_none());
     }
 }

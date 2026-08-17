@@ -11,12 +11,18 @@ use web_sys::{
 use crate::canvas::{CanvasController, Shape};
 use crate::interop;
 use crate::types::{
-    AgentAvailability, AgentKind, FeedbackScreenPayload, FeedbackType, LocalDelegateAvailability,
-    LocalDelegateConfig, SubmitFeedbackPayload,
+    AgentAvailability, AgentKind, EditableFeedbackScreen, FeedbackRecord, FeedbackScreenPayload,
+    FeedbackType, LocalDelegateAvailability, LocalDelegateConfig, SubmitFeedbackPayload,
 };
 use crate::voice::{VoiceRecorder, VoiceState};
 
 const MAX_STORYBOARD_SCREENS: usize = 8;
+
+#[derive(Debug, Clone)]
+pub struct FeedbackRevisionRequest {
+    pub feedback_id: String,
+    pub agent: AgentKind,
+}
 
 #[derive(Clone)]
 struct StoryboardScreenDraft {
@@ -47,6 +53,23 @@ impl StoryboardScreenDraft {
     fn has_signal(&self) -> bool {
         !self.shapes.is_empty() || !self.pasted_base64.is_empty()
     }
+
+    fn from_editable(screen: EditableFeedbackScreen) -> Self {
+        let (shapes, pasted_base64) = CanvasController::restore_annotations(
+            &screen.annotations,
+            &screen.pasted_image_data_urls,
+        );
+        Self {
+            id: screen.id,
+            name: screen.name,
+            description: screen.description,
+            intended_route: screen.intended_route,
+            shapes,
+            undo_stack: Vec::new(),
+            pasted_base64,
+            annotation_data_url: None,
+        }
+    }
 }
 
 fn save_active_screen(
@@ -59,7 +82,7 @@ fn save_active_screen(
         if let Some(screen) = items.get_mut(idx) {
             screen.shapes = controller.shapes.get_untracked();
             screen.undo_stack = controller.undo_stack.get_untracked();
-            screen.pasted_base64 = controller.pasted_base64.get_untracked();
+            screen.pasted_base64 = CanvasController::pasted_base64_for_shapes(&screen.shapes);
             screen.annotation_data_url = controller.to_png_data_url();
         }
     });
@@ -79,6 +102,7 @@ pub fn FeedbackPanel(
     controller: CanvasController,
     route: RwSignal<String>,
     is_open: RwSignal<bool>,
+    revision_request: RwSignal<Option<FeedbackRevisionRequest>>,
 ) -> impl IntoView {
     let feedback_type = RwSignal::new(FeedbackType::Bug);
     let agent = RwSignal::new(AgentKind::ClaudeCode);
@@ -102,6 +126,7 @@ pub fn FeedbackPanel(
     let submitting = RwSignal::new(false);
     let status: RwSignal<Option<Result<String, String>>> = RwSignal::new(None);
     let voice = VoiceState::new();
+    let revision_parent: RwSignal<Option<FeedbackRecord>> = RwSignal::new(None);
     // Auto-evolve = skip the manual "Evolve" click and fire the agent
     // run immediately on submit. Pre-checked for NewApp (where the user
     // almost always wants the agent to start straight away) and unchecked
@@ -117,6 +142,71 @@ pub fn FeedbackPanel(
     // pipeline park in `Planned` after the backend plan validates so the
     // user can read plan.json before implementation burns a worktree.
     let pause_after_plan = RwSignal::new(false);
+
+    // A Lineage action opens this panel with a one-shot request. Hydration
+    // restores the complete storyboard and then clears the request while
+    // retaining the immutable parent record as submission ancestry.
+    {
+        let ctrl = controller.clone();
+        let voice = voice.clone();
+        Effect::new(move |_| {
+            let Some(request) = revision_request.get() else {
+                return;
+            };
+            revision_request.set(None);
+            status.set(Some(Ok(format!(
+                "Loading {} for revision…",
+                request.feedback_id
+            ))));
+            let ctrl = ctrl.clone();
+            let voice = voice.clone();
+            spawn_local(async move {
+                match interop::load_feedback_for_revision(&request.feedback_id).await {
+                    Ok(Some(editable)) => {
+                        let parent = editable.feedback;
+                        let drafts: Vec<StoryboardScreenDraft> = editable
+                            .screens
+                            .into_iter()
+                            .map(StoryboardScreenDraft::from_editable)
+                            .collect();
+                        let drafts = if drafts.is_empty() {
+                            vec![StoryboardScreenDraft::empty(1, parent.page_route.clone())]
+                        } else {
+                            drafts
+                        };
+                        feedback_type.set(parent.feedback_type);
+                        agent.set(request.agent);
+                        text.set(parent.feedback_text.clone());
+                        route.set(parent.page_route.clone());
+                        voice.clear();
+                        if let Some(transcript) = parent.voice_transcript.clone() {
+                            voice.transcript.set(transcript);
+                        }
+                        auto_evolve.set(false);
+                        // Revisions should never unexpectedly start a second
+                        // agent while the parent iteration may still run.
+                        // The user can explicitly re-enable the toggle.
+                        auto_evolve_user_set.set(true);
+                        pause_after_plan.set(false);
+                        delegate_on.set(false);
+                        next_screen_number.set(drafts.len().saturating_add(1));
+                        active_screen.set(0);
+                        screens.set(drafts.clone());
+                        load_active_screen(&ctrl, &drafts[0]);
+                        status.set(None);
+                        revision_parent.set(Some(parent));
+                    }
+                    Ok(None) => status.set(Some(Err(format!(
+                        "Feedback {} no longer exists",
+                        request.feedback_id
+                    )))),
+                    Err(error) => {
+                        status.set(Some(Err(format!("Could not restore feedback: {error}"))))
+                    }
+                }
+            });
+        });
+    }
     Effect::new(move |_| {
         let ft = feedback_type.get();
         if !auto_evolve_user_set.get_untracked() {
@@ -215,7 +305,7 @@ pub fn FeedbackPanel(
             status.set(None);
             let anno_url = ctrl.to_png_data_url();
             let annotations = ctrl.annotations_json();
-            let pasted = ctrl.pasted_base64.get_untracked();
+            let pasted = CanvasController::pasted_base64_for_shapes(&ctrl.shapes.get_untracked());
             let storyboard_drafts = if is_storyboard {
                 screens.get_untracked()
             } else {
@@ -234,6 +324,7 @@ pub fn FeedbackPanel(
             let agent_v = agent.get_untracked();
             let auto_evolve_v = auto_evolve.get_untracked();
             let pause_after_plan_v = pause_after_plan.get_untracked();
+            let parent_feedback_id_v = revision_parent.get_untracked().map(|parent| parent.id);
             // Snapshot delegate config at submit time. Only rides
             // through when the user explicitly toggled it on AND the
             // chip was actually live (probe ready, agent supports it).
@@ -296,7 +387,7 @@ pub fn FeedbackPanel(
                         name: draft.name,
                         description: draft.description,
                         intended_route: draft.intended_route,
-                        annotations: draft.shapes.iter().map(Shape::to_json).collect(),
+                        annotations: CanvasController::annotations_for_shapes(&draft.shapes),
                         pasted_images_base64: draft.pasted_base64,
                         screenshot_base64: screen_screenshot,
                         window_width: win_w,
@@ -330,12 +421,15 @@ pub fn FeedbackPanel(
                     agent: Some(agent_v),
                     auto_evolve: auto_evolve_v,
                     pause_after_plan: pause_after_plan_v,
+                    parent_feedback_id: parent_feedback_id_v.clone(),
                     local_delegate: delegate_v,
                 };
 
                 match interop::submit_feedback(&payload).await {
                     Ok(record) => {
-                        let msg = if auto_evolve_v {
+                        let msg = if parent_feedback_id_v.is_some() {
+                            format!("Revision sent • queued as {}", record.id)
+                        } else if auto_evolve_v {
                             format!("Sent • agent running for {}", record.id)
                         } else {
                             format!("Sent • queued as {}", record.id)
@@ -347,6 +441,7 @@ pub fn FeedbackPanel(
                         next_screen_number.set(2);
                         voice_reset.clear();
                         text.set(String::new());
+                        revision_parent.set(None);
                         is_open.set(false);
                     }
                     Err(err) => {
@@ -533,12 +628,16 @@ pub fn FeedbackPanel(
             let _ = target.release_pointer_capture(ev.pointer_id());
         }
     };
+    let revision_ctrl = controller.clone();
+    let revision_voice = voice.clone();
 
     view! {
         <aside
             id="feedback-panel"
             class="panel"
+            class:panel-hidden=move || !is_open.get()
             aria-label="Feedback"
+            aria-hidden=move || if is_open.get() { "false" } else { "true" }
             style:transform=move || {
                 let (x, y) = offset.get();
                 format!("translate({x}px, {y}px)")
@@ -555,7 +654,9 @@ pub fn FeedbackPanel(
                 on:pointerup=on_handle_up
                 on:pointercancel=on_handle_up
             >
-                <div class="panel-title">"Feedback"</div>
+                <div class="panel-title">
+                    {move || if revision_parent.get().is_some() { "Revise feedback" } else { "Feedback" }}
+                </div>
                 <button
                     class="panel-close-btn"
                     title="Close"
@@ -567,6 +668,36 @@ pub fn FeedbackPanel(
             </div>
 
             <div class="panel-body">
+                {move || {
+                    let ctrl = revision_ctrl.clone();
+                    let voice = revision_voice.clone();
+                    revision_parent.get().map(|parent| view! {
+                        <div class="revision-banner" role="status">
+                            <div>
+                                <strong>{format!("Revision {}", parent.revision.number.saturating_add(1))}</strong>
+                                <span>{format!("Based on {}. The original remains unchanged.", parent.id)}</span>
+                            </div>
+                            <button
+                                class="revision-cancel"
+                                title="Discard this restored draft and start unrelated feedback"
+                                on:click=move |_| {
+                                    ctrl.clear_all();
+                                    let initial = StoryboardScreenDraft::empty(1, route.get_untracked());
+                                    screens.set(vec![initial]);
+                                    active_screen.set(0);
+                                    next_screen_number.set(2);
+                                    text.set(String::new());
+                                    voice.clear();
+                                    feedback_type.set(FeedbackType::Bug);
+                                    auto_evolve_user_set.set(false);
+                                    pause_after_plan.set(false);
+                                    revision_parent.set(None);
+                                    status.set(None);
+                                }
+                            >"Start fresh"</button>
+                        </div>
+                    })
+                }}
                 <div class="panel-section-label">"Agent"</div>
                 <div class="type-chips agent-chips">
                     {AgentKind::all().into_iter().map(|ak| {
@@ -887,6 +1018,8 @@ pub fn FeedbackPanel(
                     {move || {
                         if submitting.get() {
                             "Sending…"
+                        } else if revision_parent.get().is_some() {
+                            "Send revision"
                         } else if auto_evolve.get() {
                             "Submit & Evolve"
                         } else {

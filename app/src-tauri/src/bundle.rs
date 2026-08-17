@@ -84,12 +84,21 @@ pub fn build_bundle_bytes(
         .load_lineage_job(job_id)?
         .ok_or_else(|| StoreError::Other(format!("lineage job not found: {job_id}")))?;
 
-    // For now a bundle is one primary job + the single feedback row that
-    // spawned it. Multi-feedback bundles are a forward-compatible extension
-    // (`feedback_ids` is already a Vec).
+    // A bundle carries the primary feedback plus its immutable parent chain.
+    // The primary lineage job remains singular, but a revised canvas must not
+    // become a dangling revision when forked into a fresh Evolvo workspace.
     let mut feedback_ids = Vec::new();
     let mut feedback_records = Vec::new();
-    if let Some(fb) = store.load_feedback(&job.feedback_id)? {
+    let mut next_feedback_id = Some(job.feedback_id.clone());
+    let mut seen_feedback_ids = std::collections::BTreeSet::new();
+    while let Some(feedback_id) = next_feedback_id.take() {
+        if !seen_feedback_ids.insert(feedback_id.clone()) {
+            break;
+        }
+        let Some(fb) = store.load_feedback(&feedback_id)? else {
+            break;
+        };
+        next_feedback_id = fb.revision.parent_feedback_id.clone();
         feedback_ids.push(fb.id.clone());
         feedback_records.push(fb);
     }
@@ -316,6 +325,7 @@ mod tests {
             updated_at_unix_ms: 1,
             lineage_job_id: Some("job-1".into()),
             local_delegate: None,
+            revision: Default::default(),
         };
         store.save_feedback(&fb).unwrap();
         store
@@ -364,6 +374,47 @@ mod tests {
         let needle = "/Users/host";
         let memmem_hit = bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
         assert!(!memmem_hit, "bundle leaked host-absolute path");
+    }
+
+    #[test]
+    fn revised_feedback_bundle_includes_its_ancestors() {
+        let temp = tempdir().unwrap();
+        let store = seed_workspace(temp.path());
+
+        let mut parent = store.load_feedback("fb-1").unwrap().unwrap();
+        parent.revision.superseded_by_feedback_id = Some("fb-2".into());
+        store.save_feedback(&parent).unwrap();
+
+        let mut child = parent.clone();
+        child.id = "fb-2".into();
+        child.feedback_text = "the revised login request".into();
+        child.pasted_images.clear();
+        child.screenshot_filename = None;
+        child.lineage_job_id = Some("job-2".into());
+        child.revision.number = 2;
+        child.revision.parent_feedback_id = Some("fb-1".into());
+        child.revision.superseded_by_feedback_id = None;
+        store.save_feedback(&child).unwrap();
+
+        let mut child_job = store.load_lineage_job("job-1").unwrap().unwrap();
+        child_job.id = "job-2".into();
+        child_job.feedback_id = "fb-2".into();
+        store.save_lineage_job(&child_job).unwrap();
+
+        let (bytes, manifest) =
+            build_bundle_bytes(&store, "job-2", "Evolvo", "0.1.0").unwrap();
+        assert_eq!(manifest.feedback_ids, vec!["fb-2", "fb-1"]);
+
+        let bundle_dir = tempdir().unwrap();
+        let bundle_path = bundle_dir.path().join("revision.evolvo-bundle");
+        std::fs::write(&bundle_path, bytes).unwrap();
+        let target = tempdir().unwrap();
+        let summary = import_lineage_bundle(&bundle_path, target.path()).unwrap();
+        assert_eq!(summary.feedback_count, 2);
+        assert!(Store::new(target.path().to_path_buf())
+            .load_feedback("fb-1")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
