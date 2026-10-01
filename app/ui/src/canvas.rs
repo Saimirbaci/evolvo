@@ -324,6 +324,9 @@ pub struct CanvasController {
     pub pasted_base64: RwSignal<Vec<String>>,
     pub hint_dismissed: RwSignal<bool>,
     pub selected_idx: RwSignal<Option<usize>>,
+    /// An AI sketch request is in flight; the canvas is read-only meanwhile
+    /// so the returned ops (which address shapes by index) stay valid.
+    pub sketch_busy: RwSignal<bool>,
     canvas_node: StoredValue<Option<HtmlCanvasElement>>,
     redraw_trigger: RwSignal<u64>,
     /// State before an in-progress drag (move / resize / erase). Live edits
@@ -406,6 +409,7 @@ impl CanvasController {
             pasted_base64: RwSignal::new(Vec::new()),
             hint_dismissed: RwSignal::new(false),
             selected_idx: RwSignal::new(None),
+            sketch_busy: RwSignal::new(false),
             canvas_node: StoredValue::new(None),
             redraw_trigger: RwSignal::new(0),
         }
@@ -506,6 +510,23 @@ impl CanvasController {
         if let Some(next) = next {
             self.apply(next);
         }
+    }
+
+    /// Install an AI-generated shape list computed from `base` as one undo
+    /// step. Refuses if the canvas changed since the request was sent —
+    /// the ops addressed shapes by their index in `base`.
+    pub fn apply_generated(&self, base: &[Shape], next: Vec<Shape>) -> Result<(), String> {
+        if self.shapes.with_untracked(|cur| cur.as_slice() != base) {
+            return Err("The canvas changed while the AI was working — try again.".into());
+        }
+        self.end_gesture();
+        self.commit(next, None);
+        Ok(())
+    }
+
+    /// Canvas size in CSS px (0×0 before first layout).
+    pub fn canvas_size(&self) -> (f64, f64) {
+        CANVAS_PX.with(|c| c.get())
     }
 
     /// User-initiated "Clear canvas" — undoable.
@@ -855,6 +876,9 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
         let text_input_value = text_input_value;
         let begin_text_edit = begin_text_edit.clone();
         move |ev: MouseEvent| {
+            if ctrl.sketch_busy.get_untracked() {
+                return;
+            }
             if !ctrl.hint_dismissed.get_untracked() {
                 ctrl.hint_dismissed.set(true);
             }
@@ -2021,7 +2045,7 @@ fn text_font(font_size: f64) -> String {
 
 /// Ratio-space (width, height) a text shape occupies on the current canvas,
 /// measured with the same font the renderer uses.
-fn text_extent(text: &str, font_size: f64) -> (f64, f64) {
+pub(crate) fn text_extent(text: &str, font_size: f64) -> (f64, f64) {
     let (cw, ch) = CANVAS_PX.with(|c| c.get());
     // Before first layout (and in native unit tests) assume a typical window.
     let (cw, ch) = if cw > 0.0 && ch > 0.0 {
@@ -2061,10 +2085,10 @@ fn measure_text_px(_text: &str, _font_size: f64) -> Option<f64> {
 /// On-screen size of a resize handle, in CSS px.
 const HANDLE_PX: f64 = 9.0;
 /// Font-size range a text resize is clamped to, in px.
-const MIN_FONT_PX: f64 = 8.0;
-const MAX_FONT_PX: f64 = 160.0;
+pub(crate) const MIN_FONT_PX: f64 = 8.0;
+pub(crate) const MAX_FONT_PX: f64 = 160.0;
 /// Smallest width/height (ratio coords) a resize can shrink a shape to.
-const MIN_SHAPE_SIZE: f64 = 0.004;
+pub(crate) const MIN_SHAPE_SIZE: f64 = 0.004;
 
 /// A grab point on the selected shape. Box-like shapes (including text)
 /// get four corners; lines/arrows get their two endpoints.
@@ -2571,7 +2595,7 @@ fn install_keyboard_shortcuts(ctrl: CanvasController) {
             // Leave every shortcut — including Cmd+Z — to the field when the
             // user is typing in an input / textarea / contenteditable, so
             // undoing a typo in the description never undoes the drawing.
-            if is_editable_target(kev) {
+            if is_editable_target(kev) || ctrl.sketch_busy.get_untracked() {
                 return;
             }
             let cmd_or_ctrl = kev.meta_key() || kev.ctrl_key();

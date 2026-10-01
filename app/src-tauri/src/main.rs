@@ -83,6 +83,7 @@ fn main() {
             commands::preview_lineage_evolution,
             commands::export_lineage,
             commands::import_lineage_bundle,
+            commands::generate_sketch,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Evolvo desktop app");

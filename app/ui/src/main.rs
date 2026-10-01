@@ -3,6 +3,7 @@ mod canvas;
 mod feedback_panel;
 mod interop;
 mod shell;
+mod sketch;
 mod toolbar;
 mod types;
 mod voice;

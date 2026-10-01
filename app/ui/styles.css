@@ -337,6 +337,77 @@ button {
     padding: 8px;
 }
 
+/* AI sketch prompt (experimental) — lives in the canvas toolbar. */
+.pill-sketch {
+    color: var(--accent);
+}
+
+.pill-sketch.busy {
+    animation: sketch-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes sketch-pulse {
+    50% {
+        opacity: 0.4;
+    }
+}
+
+.popover-sketch {
+    width: min(360px, calc(100vw - 32px));
+    padding: var(--space-2);
+    gap: var(--space-2);
+}
+
+.sketch-label {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--fg);
+}
+
+.sketch-input {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 72px;
+    padding: var(--space-2);
+    font: inherit;
+    font-size: var(--text-sm);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+}
+
+.sketch-input:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+}
+
+.sketch-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+}
+
+.sketch-hint {
+    font-size: var(--text-sm);
+    color: var(--muted);
+}
+
+.sketch-status {
+    font-size: var(--text-sm);
+    line-height: 1.4;
+}
+
+.sketch-status.ok {
+    color: var(--success);
+}
+
+.sketch-status.error {
+    color: var(--danger);
+}
+
 .popover-item {
     display: flex;
     align-items: center;

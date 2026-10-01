@@ -74,6 +74,7 @@ See `app/src-tauri/src/commands.rs` and `lib.rs::run()` / `main.rs` for registra
 - `list_lineage_jobs` / `load_lineage_job`
 - `approve_lineage_job` / `reject_lineage_job` / `append_lineage_note`
 - `open_workspace_path`
+- `generate_sketch(SketchRequest)` → `SketchResponse` — **experimental** AI sketching (`sketch.rs` host / `ui/src/sketch.rs`). Runs `claude -p --json-schema … --tools ""` (no tools) and returns add/update/delete ops in the canvas annotation JSON; the UI sanitises them and applies them as one undo step. Opus for empty-canvas generation, Sonnet for edits; override with `EVOLVO_SKETCH_MODEL_GENERATE` / `EVOLVO_SKETCH_MODEL_EDIT`.
 
 Every new command MUST be registered in the `invoke_handler` in `src-tauri/src/lib.rs` AND mirrored in `app/ui/src/interop.rs`.
 

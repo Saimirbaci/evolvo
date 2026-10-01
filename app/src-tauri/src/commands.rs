@@ -1109,6 +1109,18 @@ pub fn append_lineage_note(
         .map_err(store_error)
 }
 
+/// Experimental: turn a text description (plus the current canvas shapes)
+/// into add/update/delete ops via the `claude` CLI. Runs on a blocking
+/// worker so the 5–30s model call never stalls the IPC/main thread.
+#[tauri::command]
+pub async fn generate_sketch(
+    payload: crate::sketch::SketchRequest,
+) -> Result<crate::sketch::SketchResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::sketch::generate_sketch(&payload))
+        .await
+        .map_err(|e| format!("sketch worker failed: {e}"))?
+}
+
 #[tauri::command]
 pub fn open_workspace_path(state: State<'_, AppState>) -> Result<String, String> {
     Ok(state.workspace_root_display())

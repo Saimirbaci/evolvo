@@ -64,7 +64,7 @@ pub fn backend_for(kind: AgentKind) -> Box<dyn AgentBackend> {
 /// Finder/Dock on macOS, which inherits a minimal PATH — without this list
 /// `which claude` would fail even when the CLI is installed under a common
 /// user-local prefix.
-fn enriched_path() -> String {
+pub(crate) fn enriched_path() -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         parts.push(format!("{home}/.cargo/bin"));
