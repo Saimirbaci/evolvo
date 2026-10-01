@@ -89,12 +89,32 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
                 class="pill-btn"
                 title="Undo (Cmd/Ctrl+Z)"
                 aria-label="Undo"
+                disabled={
+                    let ctrl = controller.clone();
+                    move || !ctrl.history.with(|h| h.can_undo())
+                }
                 on:click={
                     let ctrl = controller.clone();
                     move |_| ctrl.undo()
                 }
             >
                 "↶"
+            </button>
+
+            <button
+                class="pill-btn"
+                title="Redo (Shift+Cmd/Ctrl+Z)"
+                aria-label="Redo"
+                disabled={
+                    let ctrl = controller.clone();
+                    move || !ctrl.history.with(|h| h.can_redo())
+                }
+                on:click={
+                    let ctrl = controller.clone();
+                    move |_| ctrl.redo()
+                }
+            >
+                "↷"
             </button>
 
             <button

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use leptos::html::{Canvas, Input};
 use leptos::prelude::*;
@@ -144,7 +145,8 @@ pub enum Shape {
         y: f64,
         w: f64,
         h: f64,
-        data_url: String,
+        /// Shared so undo/redo snapshots don't copy multi-MB image bytes.
+        data_url: Arc<str>,
     },
 }
 
@@ -298,7 +300,7 @@ impl Shape {
                 y: number("y")?,
                 w: number("w")?,
                 h: number("h")?,
-                data_url: image_data_url?.to_string(),
+                data_url: image_data_url?.into(),
             }),
             _ => None,
         }
@@ -317,14 +319,68 @@ pub struct CanvasController {
     pub stroke_color: RwSignal<String>,
     pub stroke_width: RwSignal<f64>,
     pub shapes: RwSignal<Vec<Shape>>,
-    pub undo_stack: RwSignal<Vec<Vec<Shape>>>,
+    pub history: RwSignal<History>,
     pub text_input: RwSignal<Option<TextInputState>>,
     pub pasted_base64: RwSignal<Vec<String>>,
     pub hint_dismissed: RwSignal<bool>,
     pub selected_idx: RwSignal<Option<usize>>,
     canvas_node: StoredValue<Option<HtmlCanvasElement>>,
     redraw_trigger: RwSignal<u64>,
+    /// State before an in-progress drag (move / resize / erase). Live edits
+    /// during the drag skip history; `end_gesture` records one entry.
+    gesture_base: StoredValue<Option<Snapshot>>,
 }
+
+/// One undo/redo entry: the full shape list plus which shape was selected,
+/// so undo also restores what the user was working on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Snapshot {
+    shapes: Vec<Shape>,
+    selected: Option<usize>,
+}
+
+/// Linear undo/redo history. Any new edit clears the redo branch.
+#[derive(Debug, Clone, Default)]
+pub struct History {
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+}
+
+/// Max undo entries kept per canvas (per storyboard screen).
+const HISTORY_LIMIT: usize = 100;
+
+impl History {
+    fn record(&mut self, before: Snapshot) {
+        self.undo.push(before);
+        if self.undo.len() > HISTORY_LIMIT {
+            self.undo.drain(..self.undo.len() - HISTORY_LIMIT);
+        }
+        self.redo.clear();
+    }
+
+    fn undo(&mut self, current: Snapshot) -> Option<Snapshot> {
+        let prev = self.undo.pop()?;
+        self.redo.push(current);
+        Some(prev)
+    }
+
+    fn redo(&mut self, current: Snapshot) -> Option<Snapshot> {
+        let next = self.redo.pop()?;
+        self.undo.push(current);
+        Some(next)
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+}
+
+/// Stroke widths offered by the toolbar (S / M / L).
+const STROKE_SIZES: [f64; 3] = [1.5, 3.0, 6.0];
 
 #[derive(Clone, Debug)]
 pub struct TextInputState {
@@ -344,7 +400,8 @@ impl CanvasController {
             stroke_color: RwSignal::new("#ef4444".into()),
             stroke_width: RwSignal::new(3.0),
             shapes: RwSignal::new(Vec::new()),
-            undo_stack: RwSignal::new(Vec::new()),
+            history: RwSignal::new(History::default()),
+            gesture_base: StoredValue::new(None),
             text_input: RwSignal::new(None),
             pasted_base64: RwSignal::new(Vec::new()),
             hint_dismissed: RwSignal::new(false),
@@ -358,44 +415,117 @@ impl CanvasController {
         self.canvas_node.set_value(Some(canvas));
     }
 
-    pub fn add_shape(&self, shape: Shape) {
-        let prev = self.shapes.get_untracked();
-        let mut next = prev.clone();
-        next.push(shape);
-        self.shapes.set(next);
-        let mut stack = self.undo_stack.get_untracked();
-        stack.push(prev);
-        if stack.len() > 100 {
-            stack.drain(..stack.len() - 100);
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            shapes: self.shapes.get_untracked(),
+            selected: self.selected_idx.get_untracked(),
         }
-        self.undo_stack.set(stack);
+    }
+
+    /// The single path for undoable edits: records the current state, then
+    /// installs `next`. A no-op edit records nothing.
+    fn commit(&self, next: Vec<Shape>, selected: Option<usize>) {
+        let before = self.snapshot();
+        if next == before.shapes {
+            return;
+        }
+        self.history.update(|h| h.record(before));
+        self.shapes.set(next);
+        self.selected_idx.set(selected);
+        self.sync_pasted();
         self.poke_redraw();
+    }
+
+    /// Install a history entry (undo/redo/load) without recording one.
+    fn apply(&self, snap: Snapshot) {
+        // Any inline text edit refers to indices that are about to change.
+        self.text_input.set(None);
+        self.gesture_base.set_value(None);
+        let selected = snap.selected.filter(|i| *i < snap.shapes.len());
+        self.shapes.set(snap.shapes);
+        self.sync_pasted();
+        self.select(selected);
+    }
+
+    /// Image thumbnails are always derived from the image shapes, so undo,
+    /// erase and delete can never leave a stale attachment behind.
+    fn sync_pasted(&self) {
+        let next = self
+            .shapes
+            .with_untracked(|s| Self::pasted_base64_for_shapes(s));
+        if self.pasted_base64.with_untracked(|cur| *cur != next) {
+            self.pasted_base64.set(next);
+        }
+    }
+
+    /// Start a drag whose intermediate states should not hit history.
+    fn begin_gesture(&self) {
+        self.gesture_base.set_value(Some(self.snapshot()));
+    }
+
+    fn gesture_active(&self) -> bool {
+        self.gesture_base.with_value(Option::is_some)
+    }
+
+    /// Finish a drag: record its starting state as one undo entry if the
+    /// drag changed anything. Safe to call when no gesture is active.
+    fn end_gesture(&self) {
+        let Some(base) = self.gesture_base.with_value(|b| b.clone()) else {
+            return;
+        };
+        self.gesture_base.set_value(None);
+        let changed = self.shapes.with_untracked(|cur| *cur != base.shapes);
+        if changed {
+            self.history.update(|h| h.record(base));
+            self.sync_pasted();
+        }
+    }
+
+    pub fn add_shape(&self, shape: Shape) {
+        let mut next = self.shapes.get_untracked();
+        next.push(shape);
+        self.commit(next, self.selected_idx.get_untracked());
     }
 
     pub fn undo(&self) {
-        let mut stack = self.undo_stack.get_untracked();
-        if let Some(prev) = stack.pop() {
-            self.shapes.set(prev);
-            self.undo_stack.set(stack);
-            // Keep the toolbar pucks honest about the (restored) selection.
-            let selected = self
-                .selected_idx
-                .get_untracked()
-                .filter(|i| *i < self.shapes.with_untracked(Vec::len));
-            self.select(selected);
+        // Undo mid-drag: settle the drag first so it is what gets undone.
+        self.end_gesture();
+        let current = self.snapshot();
+        let mut prev = None;
+        self.history.update(|h| prev = h.undo(current));
+        if let Some(prev) = prev {
+            self.apply(prev);
         }
     }
 
-    pub fn clear_all(&self) {
-        let prev = self.shapes.get_untracked();
-        if !prev.is_empty() {
-            let mut stack = self.undo_stack.get_untracked();
-            stack.push(prev);
-            self.undo_stack.set(stack);
+    pub fn redo(&self) {
+        self.end_gesture();
+        let current = self.snapshot();
+        let mut next = None;
+        self.history.update(|h| next = h.redo(current));
+        if let Some(next) = next {
+            self.apply(next);
         }
-        self.shapes.set(Vec::new());
-        self.pasted_base64.set(Vec::new());
-        self.poke_redraw();
+    }
+
+    /// User-initiated "Clear canvas" — undoable.
+    pub fn clear_all(&self) {
+        self.commit(Vec::new(), None);
+    }
+
+    /// Start completely fresh (after a submit, or discarding a draft): no
+    /// shapes and no history, so Cmd+Z can't resurrect sent feedback.
+    pub fn reset(&self) {
+        self.load(Vec::new(), History::default());
+    }
+
+    /// Swap in another canvas's shapes + history (storyboard screen switch).
+    pub fn load(&self, shapes: Vec<Shape>, history: History) {
+        self.history.set(history);
+        self.apply(Snapshot {
+            shapes,
+            selected: None,
+        });
     }
 
     pub fn poke_redraw(&self) {
@@ -499,7 +629,7 @@ impl CanvasController {
     }
 
     pub fn cycle_stroke(&self, dir: i32) {
-        let sizes = [1.5_f64, 3.0, 6.0];
+        let sizes = STROKE_SIZES;
         let current = self.stroke_width.get_untracked();
         let idx = sizes
             .iter()
@@ -526,7 +656,10 @@ impl CanvasController {
         });
         if let Some((color, width)) = style {
             self.stroke_color.set(color);
-            if let Some(width) = width {
+            // Free-resized text can have an in-between size; only mirror
+            // widths the S/M/L control can actually represent.
+            if let Some(width) = width.filter(|w| STROKE_SIZES.iter().any(|p| (p - w).abs() < 0.01))
+            {
                 self.stroke_width.set(width);
             }
         }
@@ -553,41 +686,30 @@ impl CanvasController {
         let Some(idx) = self.selected_idx.get_untracked() else {
             return;
         };
-        let prev = self.shapes.get_untracked();
-        if idx >= prev.len() {
+        let mut next = self.shapes.get_untracked();
+        if idx >= next.len() {
             self.selected_idx.set(None);
             return;
         }
-        let mut next = prev.clone();
         next.remove(idx);
-        let mut stack = self.undo_stack.get_untracked();
-        stack.push(prev);
-        self.undo_stack.set(stack);
-        self.shapes.set(next);
-        self.selected_idx.set(None);
-        self.poke_redraw();
+        self.commit(next, None);
     }
 
-    pub fn replace_shape(&self, idx: usize, shape: Shape, push_undo: bool) {
-        let prev = self.shapes.get_untracked();
-        if idx >= prev.len() {
+    /// Replace one shape. `record = true` is an undoable edit; `false` is a
+    /// live update inside a gesture (drag/resize), which only takes effect
+    /// while that gesture is active — a stale mousemove after undo is a no-op.
+    pub fn replace_shape(&self, idx: usize, shape: Shape, record: bool) {
+        let mut next = self.shapes.get_untracked();
+        if idx >= next.len() {
             return;
         }
-        let mut next = prev.clone();
         next[idx] = shape;
-        if push_undo {
-            let mut stack = self.undo_stack.get_untracked();
-            stack.push(prev);
-            self.undo_stack.set(stack);
+        if record {
+            self.commit(next, self.selected_idx.get_untracked());
+        } else if self.gesture_active() {
+            self.shapes.set(next);
+            self.poke_redraw();
         }
-        self.shapes.set(next);
-        self.poke_redraw();
-    }
-
-    pub fn add_pasted_base64(&self, value: String) {
-        let mut current = self.pasted_base64.get_untracked();
-        current.push(value);
-        self.pasted_base64.set(current);
     }
 }
 
@@ -787,6 +909,9 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                 if resize.is_none() {
                     ctrl.select(picked);
                 }
+                if picked.is_some() {
+                    ctrl.begin_gesture();
+                }
                 pointer.update_value(|state| {
                     state.is_down = true;
                     state.start = (rx, ry);
@@ -835,6 +960,7 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
             });
 
             if tool == DrawingTool::Eraser {
+                ctrl.begin_gesture();
                 erase_at(&ctrl, rx, ry, width);
             }
             let _ = color; // silence unused in this branch
@@ -971,42 +1097,17 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
             let tool = ctrl.active_tool.get_untracked();
             let color = ctrl.stroke_color.get_untracked();
             let width = ctrl.stroke_width.get_untracked();
+            // Close any move/resize/erase gesture regardless of the current
+            // tool — a shortcut pressed mid-drag must not leave it open.
+            ctrl.end_gesture();
 
             if tool == DrawingTool::Select {
-                let drag = pointer.with_value(|s| s.drag_original.clone());
-                let resize = pointer.with_value(|s| s.resize.clone());
                 pointer.update_value(|state| {
                     state.is_down = false;
                     state.drag_original = None;
                     state.preview = None;
                     state.resize = None;
                 });
-                if let Some((idx, _, original)) = resize {
-                    let resized = ctrl
-                        .shapes
-                        .with_untracked(|shapes| shapes.get(idx).cloned());
-                    if let Some(resized) = resized.filter(|r| *r != original) {
-                        // Same rollback-then-commit trick as a move: one undo step.
-                        ctrl.replace_shape(idx, original, false);
-                        ctrl.replace_shape(idx, resized, true);
-                    }
-                }
-                if let Some((idx, original)) = drag {
-                    let dx = rx - pointer.with_value(|s| s.start.0);
-                    let dy = ry - pointer.with_value(|s| s.start.1);
-                    if dx.abs() > 0.0005 || dy.abs() > 0.0005 {
-                        // Roll back live move, then replay through add_shape semantics
-                        // so undo captures a single pre-move snapshot.
-                        let moved = ctrl
-                            .shapes
-                            .get_untracked()
-                            .get(idx)
-                            .cloned()
-                            .unwrap_or(original.clone());
-                        ctrl.replace_shape(idx, original, false);
-                        ctrl.replace_shape(idx, moved, true);
-                    }
-                }
                 ctrl.poke_redraw();
                 return;
             }
@@ -1279,7 +1380,10 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                 on:mousedown=on_mousedown
                 on:dblclick=on_dblclick
                 on:mousemove=on_mousemove
-                on:mouseup=on_mouseup
+                on:mouseup=on_mouseup.clone()
+                // Releasing outside the canvas never delivers a mouseup here;
+                // finish the stroke/drag on leave so nothing stays stuck.
+                on:mouseleave=on_mouseup
             ></canvas>
 
             <EmptyHint controller=controller.clone() />
@@ -1348,6 +1452,7 @@ fn EmptyHint(controller: CanvasController) -> impl IntoView {
 
 fn fit_canvas_to_viewport(canvas: &HtmlCanvasElement) {
     let (w, h) = canvas_pixel_size(canvas);
+    CANVAS_PX.with(|c| c.set((w as f64, h as f64)));
     if canvas.width() != w {
         canvas.set_width(w);
     }
@@ -1617,7 +1722,7 @@ fn render_shape(ctx: &CanvasRenderingContext2d, shape: &Shape, w: f64, h: f64) {
             font_size,
         } => {
             ctx.set_fill_style_str(color);
-            ctx.set_font(&format!("{font_size}px -apple-system, sans-serif"));
+            ctx.set_font(&text_font(*font_size));
             ctx.set_text_baseline("top");
             let _ = ctx.fill_text(text, x * w, y * h);
         }
@@ -1674,13 +1779,21 @@ fn event_ratio(ev: &MouseEvent, rect: &DomRect) -> (f64, f64) {
 }
 
 fn erase_at(ctrl: &CanvasController, rx: f64, ry: f64, width: f64) {
+    // Erasing happens live inside an eraser gesture; the whole stroke is
+    // recorded as one undo entry on mouseup.
+    if !ctrl.gesture_active() {
+        return;
+    }
     let radius_r = 0.02 * (width.max(1.0) / 2.0);
     let shapes = ctrl.shapes.get_untracked();
+    let before = shapes.len();
     let filtered: Vec<Shape> = shapes
         .into_iter()
         .filter(|s| !shape_hit(s, rx, ry, radius_r))
         .collect();
-    if filtered.len() != ctrl.shapes.get_untracked().len() {
+    if filtered.len() != before {
+        // Indices shifted; a stale selection would point at the wrong shape.
+        ctrl.selected_idx.set(None);
         ctrl.shapes.set(filtered);
         ctrl.poke_redraw();
     }
@@ -1701,7 +1814,9 @@ fn shape_hit(shape: &Shape, rx: f64, ry: f64, r: f64) -> bool {
         | Shape::Image { x, y, w, h, .. } => {
             rx >= *x - r && rx <= *x + *w + r && ry >= *y - r && ry <= *y + *h + r
         }
-        Shape::Text { x, y, .. } => (rx - x).abs() < 0.05 && (ry - y).abs() < 0.05,
+        Shape::Text { .. } => shape_bounds(shape).is_some_and(|(x, y, w, h)| {
+            rx >= x - r && rx <= x + w + r && ry >= y - r && ry <= y + h + r
+        }),
     }
 }
 
@@ -1731,7 +1846,16 @@ fn shape_bounds(shape: &Shape) -> Option<(f64, f64, f64, f64)> {
         | Shape::Ellipse { x, y, w, h, .. }
         | Shape::Highlight { x, y, w, h, .. }
         | Shape::Image { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
-        Shape::Text { x, y, .. } => Some((*x, *y, 0.1, 0.04)),
+        Shape::Text {
+            x,
+            y,
+            text,
+            font_size,
+            ..
+        } => {
+            let (w, h) = text_extent(text, *font_size);
+            Some((*x, *y, w, h))
+        }
     }
 }
 
@@ -1882,14 +2006,68 @@ fn translate_shape(shape: &Shape, dx: f64, dy: f64) -> Shape {
 // Shape editing — resize handles + restyle (pure geometry, unit-tested)
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Last known canvas size in px. Shapes live in 0..1 ratio space, but
+    /// text has a pixel font size, so its ratio bounds depend on this.
+    static CANVAS_PX: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+}
+
+/// Line height multiplier for single-line canvas text (baseline = top).
+const TEXT_LINE_HEIGHT: f64 = 1.2;
+
+fn text_font(font_size: f64) -> String {
+    format!("{font_size}px -apple-system, sans-serif")
+}
+
+/// Ratio-space (width, height) a text shape occupies on the current canvas,
+/// measured with the same font the renderer uses.
+fn text_extent(text: &str, font_size: f64) -> (f64, f64) {
+    let (cw, ch) = CANVAS_PX.with(|c| c.get());
+    // Before first layout (and in native unit tests) assume a typical window.
+    let (cw, ch) = if cw > 0.0 && ch > 0.0 {
+        (cw, ch)
+    } else {
+        (1280.0, 800.0)
+    };
+    let width_px = measure_text_px(text, font_size)
+        .unwrap_or_else(|| text.chars().count() as f64 * font_size * 0.55);
+    (
+        width_px.max(font_size * 0.5) / cw,
+        font_size * TEXT_LINE_HEIGHT / ch,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn measure_text_px(text: &str, font_size: f64) -> Option<f64> {
+    thread_local! {
+        static MEASURE_CTX: Option<CanvasRenderingContext2d> = window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.create_element("canvas").ok())
+            .and_then(|el| el.dyn_into::<HtmlCanvasElement>().ok())
+            .and_then(|c| canvas_context(&c));
+    }
+    MEASURE_CTX.with(|ctx| {
+        let ctx = ctx.as_ref()?;
+        ctx.set_font(&text_font(font_size));
+        ctx.measure_text(text).ok().map(|m| m.width())
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn measure_text_px(_text: &str, _font_size: f64) -> Option<f64> {
+    None
+}
+
 /// On-screen size of a resize handle, in CSS px.
 const HANDLE_PX: f64 = 9.0;
+/// Font-size range a text resize is clamped to, in px.
+const MIN_FONT_PX: f64 = 8.0;
+const MAX_FONT_PX: f64 = 160.0;
 /// Smallest width/height (ratio coords) a resize can shrink a shape to.
 const MIN_SHAPE_SIZE: f64 = 0.004;
 
-/// A grab point on the selected shape. Box-like shapes get four corners;
-/// lines/arrows get their two endpoints. Text has none — its size follows the
-/// stroke-width control instead.
+/// A grab point on the selected shape. Box-like shapes (including text)
+/// get four corners; lines/arrows get their two endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handle {
     Nw,
@@ -1915,7 +2093,6 @@ fn shape_handles(shape: &Shape) -> Vec<(Handle, (f64, f64))> {
         Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
             vec![(Handle::Start, *from), (Handle::End, *to)]
         }
-        Shape::Text { .. } => Vec::new(),
         _ => match shape_bounds(shape) {
             Some((x, y, w, h)) => vec![
                 (Handle::Nw, (x, y)),
@@ -1938,7 +2115,8 @@ fn handle_at(shape: &Shape, rx: f64, ry: f64, tol: (f64, f64)) -> Option<Handle>
 }
 
 /// Resize `original` by dragging `handle` to `p`. Corners keep the opposite
-/// corner anchored; images keep their aspect ratio; endpoints move freely.
+/// corner anchored; images and text scale uniformly (text by font size);
+/// endpoints move freely.
 fn resize_shape(original: &Shape, handle: Handle, p: (f64, f64)) -> Shape {
     match (original, handle) {
         (
@@ -1997,7 +2175,7 @@ fn resize_shape(original: &Shape, handle: Handle, p: (f64, f64)) -> Shape {
     };
     let mut nw = (p.0 - anchor.0).abs().max(MIN_SHAPE_SIZE);
     let mut nh = (p.1 - anchor.1).abs().max(MIN_SHAPE_SIZE);
-    if matches!(original, Shape::Image { .. }) && w > 0.0 && h > 0.0 {
+    if matches!(original, Shape::Image { .. } | Shape::Text { .. }) && w > 0.0 && h > 0.0 {
         let scale = (nw / w).max(nh / h);
         nw = w * scale;
         nh = h * scale;
@@ -2077,7 +2255,22 @@ fn fit_shape_to_bounds(
                 width: *width,
             }
         }
-        Shape::Line { .. } | Shape::Arrow { .. } | Shape::Text { .. } => shape.clone(),
+        Shape::Text {
+            text,
+            color,
+            font_size,
+            ..
+        } => {
+            let scale = if old.3 > 1e-9 { nh / old.3 } else { 1.0 };
+            Shape::Text {
+                x: nx,
+                y: ny,
+                text: text.clone(),
+                color: color.clone(),
+                font_size: (font_size * scale).clamp(MIN_FONT_PX, MAX_FONT_PX),
+            }
+        }
+        Shape::Line { .. } | Shape::Arrow { .. } => shape.clone(),
     }
 }
 
@@ -2144,14 +2337,16 @@ fn shape_style(shape: &Shape) -> Option<(String, Option<f64>)> {
 /// clamped to the image's own bounds. Produces a new data URL via an
 /// offscreen canvas and replaces the shape in place, recording an undo entry.
 async fn perform_crop(ctrl: &CanvasController, idx: usize, cx: f64, cy: f64, cw: f64, ch: f64) {
-    let shapes = ctrl.shapes.get_untracked();
-    let Some(Shape::Image {
+    let Some(original) = ctrl.shapes.with_untracked(|s| s.get(idx).cloned()) else {
+        return;
+    };
+    let Shape::Image {
         x: ix,
         y: iy,
         w: iw,
         h: ih,
         data_url,
-    }) = shapes.get(idx).cloned()
+    } = original.clone()
     else {
         return;
     };
@@ -2217,8 +2412,17 @@ async fn perform_crop(ctrl: &CanvasController, idx: usize, cx: f64, cy: f64, cw:
         y: ry0,
         w: rx1 - rx0,
         h: ry1 - ry0,
-        data_url: new_url,
+        data_url: new_url.into(),
     };
+    // The decode above is async: if the user undid, deleted or moved the
+    // image meanwhile, `idx` may now name a different shape — bail rather
+    // than overwrite it.
+    if ctrl
+        .shapes
+        .with_untracked(|s| s.get(idx) != Some(&original))
+    {
+        return;
+    }
     ctrl.replace_shape(idx, new_shape, true);
 }
 
@@ -2231,9 +2435,8 @@ pub fn ingest_image_data_url(ctrl: &CanvasController, data_url: String) {
         return;
     }
     ctrl.hint_dismissed.set(true);
-    if let Some(b64) = data_url.split(',').nth(1) {
-        ctrl.add_pasted_base64(b64.to_string());
-    }
+    // `pasted_base64` (thumbnails) is derived from image shapes when the
+    // shape below is committed, so it can never drift from the canvas.
     // Drop the image at its natural pixel size, centred. If it's larger than
     // the canvas we scale down to fit (keeping aspect ratio) so it stays
     // visible; otherwise we render it 1:1.
@@ -2251,7 +2454,7 @@ pub fn ingest_image_data_url(ctrl: &CanvasController, data_url: String) {
                     y: 0.3,
                     w: 0.4,
                     h: 0.4,
-                    data_url: data_for_resolve,
+                    data_url: data_for_resolve.into(),
                 });
                 return;
             }
@@ -2267,7 +2470,7 @@ pub fn ingest_image_data_url(ctrl: &CanvasController, data_url: String) {
                 y,
                 w: iw,
                 h: ih,
-                data_url: data_for_resolve,
+                data_url: data_for_resolve.into(),
             });
         } else {
             ctrl2.add_shape(Shape::Image {
@@ -2275,7 +2478,7 @@ pub fn ingest_image_data_url(ctrl: &CanvasController, data_url: String) {
                 y: 0.3,
                 w: 0.4,
                 h: 0.4,
-                data_url: data_for_resolve,
+                data_url: data_for_resolve.into(),
             });
         }
     });
@@ -2365,17 +2568,26 @@ fn install_keyboard_shortcuts(ctrl: CanvasController) {
             let Some(kev) = ev.dyn_ref::<KeyboardEvent>() else {
                 return;
             };
-            let cmd_or_ctrl = kev.meta_key() || kev.ctrl_key();
-            if cmd_or_ctrl && kev.key() == "z" && !kev.shift_key() {
-                ctrl.undo();
-                kev.prevent_default();
-                return;
-            }
-            // Skip single-letter tool shortcuts when the user is typing in an
-            // input / textarea / contenteditable — avoids hijacking feedback
-            // text entry or the canvas text-input box.
+            // Leave every shortcut — including Cmd+Z — to the field when the
+            // user is typing in an input / textarea / contenteditable, so
+            // undoing a typo in the description never undoes the drawing.
             if is_editable_target(kev) {
                 return;
+            }
+            let cmd_or_ctrl = kev.meta_key() || kev.ctrl_key();
+            let key_lower = kev.key().to_lowercase();
+            if cmd_or_ctrl && !kev.alt_key() {
+                let redo = (key_lower == "z" && kev.shift_key()) || key_lower == "y";
+                if redo {
+                    ctrl.redo();
+                    kev.prevent_default();
+                    return;
+                }
+                if key_lower == "z" {
+                    ctrl.undo();
+                    kev.prevent_default();
+                    return;
+                }
             }
             if kev.meta_key() || kev.ctrl_key() || kev.alt_key() {
                 return;
@@ -2415,8 +2627,7 @@ fn install_keyboard_shortcuts(ctrl: CanvasController) {
                     }
                 }
                 "Escape" => {
-                    ctrl.selected_idx.set(None);
-                    ctrl.poke_redraw();
+                    ctrl.select(None);
                 }
                 _ => {}
             }
@@ -2482,7 +2693,7 @@ mod tests {
         ));
         assert!(matches!(
             &restored[1],
-            Shape::Image { data_url, .. } if data_url == "data:image/png;base64,AAAA"
+            Shape::Image { data_url, .. } if &**data_url == "data:image/png;base64,AAAA"
         ));
     }
 
@@ -2621,6 +2832,104 @@ mod tests {
             data_url: "data:,".into(),
         };
         assert_eq!(restyle_shape(&img, Some("#fff"), Some(1.5)), img);
-        assert!(shape_handles(&text).is_empty());
+    }
+
+    fn snap(n: usize) -> Snapshot {
+        Snapshot {
+            shapes: (0..n)
+                .map(|i| rect(i as f64 * 0.1, 0.0, 0.05, 0.05))
+                .collect(),
+            selected: n.checked_sub(1),
+        }
+    }
+
+    #[test]
+    fn history_undo_redo_round_trip() {
+        let mut h = History::default();
+        h.record(snap(0));
+        h.record(snap(1));
+        // current state is snap(2)
+        assert_eq!(h.undo(snap(2)), Some(snap(1)));
+        assert_eq!(h.undo(snap(1)), Some(snap(0)));
+        assert_eq!(h.undo(snap(0)), None);
+        assert!(h.can_redo());
+        assert_eq!(h.redo(snap(0)), Some(snap(1)));
+        assert_eq!(h.redo(snap(1)), Some(snap(2)));
+        assert_eq!(h.redo(snap(2)), None);
+    }
+
+    #[test]
+    fn new_edit_clears_redo_branch() {
+        let mut h = History::default();
+        h.record(snap(0));
+        assert!(h.undo(snap(1)).is_some());
+        assert!(h.can_redo());
+        h.record(snap(0));
+        assert!(!h.can_redo());
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut h = History::default();
+        for i in 0..(HISTORY_LIMIT + 25) {
+            h.record(snap(i % 3));
+        }
+        assert_eq!(h.undo.len(), HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn text_bounds_grow_with_length_and_font() {
+        let short = Shape::Text {
+            x: 0.1,
+            y: 0.1,
+            text: "hi".into(),
+            color: "#000".into(),
+            font_size: 20.0,
+        };
+        let long = Shape::Text {
+            x: 0.1,
+            y: 0.1,
+            text: "a much longer annotation".into(),
+            color: "#000".into(),
+            font_size: 20.0,
+        };
+        let (_, _, sw, sh) = shape_bounds(&short).unwrap();
+        let (_, _, lw, lh) = shape_bounds(&long).unwrap();
+        assert!(lw > sw * 5.0);
+        assert!(approx(sh, lh));
+        // Clicking near the end of long text picks it.
+        assert_eq!(
+            pick_shape_at(&[long], 0.1 + lw * 0.95, 0.1 + lh / 2.0),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn text_corner_resize_scales_font_uniformly() {
+        let text = Shape::Text {
+            x: 0.1,
+            y: 0.1,
+            text: "resize me".into(),
+            color: "#000".into(),
+            font_size: 20.0,
+        };
+        assert_eq!(shape_handles(&text).len(), 4);
+        let (x, y, w, h) = shape_bounds(&text).unwrap();
+        let Shape::Text {
+            x: nx,
+            y: ny,
+            font_size,
+            ..
+        } = resize_shape(&text, Handle::Se, (x + w * 2.0, y + h * 2.0))
+        else {
+            panic!("not text")
+        };
+        assert!(approx(nx, x) && approx(ny, y));
+        assert!((font_size - 40.0).abs() < 1e-6);
+        // Never shrinks below the readable minimum.
+        let Shape::Text { font_size, .. } = resize_shape(&text, Handle::Se, (x, y)) else {
+            panic!("not text")
+        };
+        assert!(approx(font_size, MIN_FONT_PX));
     }
 }

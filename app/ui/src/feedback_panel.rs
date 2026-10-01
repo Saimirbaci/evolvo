@@ -8,7 +8,7 @@ use web_sys::{
     HtmlInputElement, HtmlTextAreaElement, PointerEvent,
 };
 
-use crate::canvas::{CanvasController, Shape};
+use crate::canvas::{CanvasController, History, Shape};
 use crate::interop;
 use crate::types::{
     AgentAvailability, AgentKind, EditableFeedbackScreen, FeedbackRecord, FeedbackScreenPayload,
@@ -31,7 +31,7 @@ struct StoryboardScreenDraft {
     description: String,
     intended_route: String,
     shapes: Vec<Shape>,
-    undo_stack: Vec<Vec<Shape>>,
+    history: History,
     pasted_base64: Vec<String>,
     annotation_data_url: Option<String>,
 }
@@ -44,7 +44,7 @@ impl StoryboardScreenDraft {
             description: String::new(),
             intended_route: route,
             shapes: Vec::new(),
-            undo_stack: Vec::new(),
+            history: History::default(),
             pasted_base64: Vec::new(),
             annotation_data_url: None,
         }
@@ -65,7 +65,7 @@ impl StoryboardScreenDraft {
             description: screen.description,
             intended_route: screen.intended_route,
             shapes,
-            undo_stack: Vec::new(),
+            history: History::default(),
             pasted_base64,
             annotation_data_url: None,
         }
@@ -81,7 +81,7 @@ fn save_active_screen(
     screens.update(|items| {
         if let Some(screen) = items.get_mut(idx) {
             screen.shapes = controller.shapes.get_untracked();
-            screen.undo_stack = controller.undo_stack.get_untracked();
+            screen.history = controller.history.get_untracked();
             screen.pasted_base64 = CanvasController::pasted_base64_for_shapes(&screen.shapes);
             screen.annotation_data_url = controller.to_png_data_url();
         }
@@ -89,12 +89,9 @@ fn save_active_screen(
 }
 
 fn load_active_screen(controller: &CanvasController, screen: &StoryboardScreenDraft) {
-    controller.shapes.set(screen.shapes.clone());
-    controller.undo_stack.set(screen.undo_stack.clone());
-    controller.pasted_base64.set(screen.pasted_base64.clone());
-    controller.selected_idx.set(None);
-    controller.text_input.set(None);
-    controller.poke_redraw();
+    // `load` also re-derives the thumbnails and clears any in-flight drag
+    // or inline text edit that belonged to the previous screen.
+    controller.load(screen.shapes.clone(), screen.history.clone());
 }
 
 #[component]
@@ -435,7 +432,7 @@ pub fn FeedbackPanel(
                             format!("Sent • queued as {}", record.id)
                         };
                         status.set(Some(Ok(msg)));
-                        ctrl_reset.clear_all();
+                        ctrl_reset.reset();
                         screens.set(vec![StoryboardScreenDraft::empty(1, route.get_untracked())]);
                         active_screen.set(0);
                         next_screen_number.set(2);
@@ -681,7 +678,7 @@ pub fn FeedbackPanel(
                                 class="revision-cancel"
                                 title="Discard this restored draft and start unrelated feedback"
                                 on:click=move |_| {
-                                    ctrl.clear_all();
+                                    ctrl.reset();
                                     let initial = StoryboardScreenDraft::empty(1, route.get_untracked());
                                     screens.set(vec![initial]);
                                     active_screen.set(0);
