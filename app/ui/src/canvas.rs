@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use leptos::html::Canvas;
+use leptos::html::{Canvas, Input};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::json;
@@ -34,7 +34,7 @@ pub enum DrawingTool {
 impl DrawingTool {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Select => "Select / Move",
+            Self::Select => "Select / Edit",
             Self::Pen => "Pen",
             Self::Line => "Line",
             Self::Arrow => "Arrow",
@@ -90,7 +90,7 @@ impl DrawingTool {
 
 /// Annotation stored in normalised ratio coordinates (0..1) so the canvas can
 /// be re-rendered at any size without distorting strokes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
     Path {
         points: Vec<(f64, f64)>,
@@ -332,6 +332,9 @@ pub struct TextInputState {
     pub client_y: f64,
     pub ratio_x: f64,
     pub ratio_y: f64,
+    /// Index of an existing `Shape::Text` being edited in place; `None`
+    /// when the input will create a new text shape.
+    pub editing: Option<usize>,
 }
 
 impl CanvasController {
@@ -374,7 +377,12 @@ impl CanvasController {
         if let Some(prev) = stack.pop() {
             self.shapes.set(prev);
             self.undo_stack.set(stack);
-            self.poke_redraw();
+            // Keep the toolbar pucks honest about the (restored) selection.
+            let selected = self
+                .selected_idx
+                .get_untracked()
+                .filter(|i| *i < self.shapes.with_untracked(Vec::len));
+            self.select(selected);
         }
     }
 
@@ -404,8 +412,13 @@ impl CanvasController {
     /// the canvas was the live render target.
     pub fn to_png_data_url(&self) -> Option<String> {
         self.canvas_node.with_value(|c| {
-            c.as_ref()
-                .and_then(|c| c.to_data_url_with_type("image/png").ok())
+            let c = c.as_ref()?;
+            // Selection box + handles are editing chrome, not annotation —
+            // keep them out of the submitted bitmap, then restore them.
+            render_shapes(c, self, None, false);
+            let url = c.to_data_url_with_type("image/png").ok();
+            render_all(c, self);
+            url
         })
     }
 
@@ -494,6 +507,46 @@ impl CanvasController {
             .unwrap_or(1);
         let next = ((idx as i32 + dir).rem_euclid(sizes.len() as i32)) as usize;
         self.stroke_width.set(sizes[next]);
+        self.restyle_selected(None, Some(sizes[next]));
+    }
+
+    /// Set the active color; when a shape is selected it is recolored too.
+    pub fn set_stroke_color(&self, color: String) {
+        self.stroke_color.set(color.clone());
+        self.restyle_selected(Some(&color), None);
+    }
+
+    /// Select a shape (or clear the selection) and sync the toolbar's color /
+    /// stroke pucks to the selected shape so they show what it looks like.
+    pub fn select(&self, idx: Option<usize>) {
+        self.selected_idx.set(idx);
+        let style = idx.and_then(|i| {
+            self.shapes
+                .with_untracked(|shapes| shapes.get(i).and_then(shape_style))
+        });
+        if let Some((color, width)) = style {
+            self.stroke_color.set(color);
+            if let Some(width) = width {
+                self.stroke_width.set(width);
+            }
+        }
+        self.poke_redraw();
+    }
+
+    fn restyle_selected(&self, color: Option<&str>, width: Option<f64>) {
+        let Some(idx) = self.selected_idx.get_untracked() else {
+            return;
+        };
+        let Some(current) = self
+            .shapes
+            .with_untracked(|shapes| shapes.get(idx).cloned())
+        else {
+            return;
+        };
+        let next = restyle_shape(&current, color, width);
+        if next != current {
+            self.replace_shape(idx, next, true);
+        }
     }
 
     pub fn delete_selected(&self) {
@@ -559,6 +612,9 @@ struct PointerState {
     drag_original: Option<(usize, Shape)>,
     /// For Crop tool: the selected image index and its current ratio bounds.
     crop_target: Option<usize>,
+    /// For Select tool: dragging a resize handle of shape `idx`; the shape
+    /// prior to the resize is kept so the gesture is one undo step.
+    resize: Option<(usize, Handle, Shape)>,
 }
 
 #[component]
@@ -566,6 +622,51 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
     let canvas_node: NodeRef<Canvas> = NodeRef::new();
     let pointer: StoredValue<PointerState> = StoredValue::new(PointerState::default());
     let text_input_value: RwSignal<String> = RwSignal::new(String::new());
+    // Select-tool hover feedback (resize / move cursors); falls back to the
+    // active tool's cursor when nothing editable is under the pointer.
+    let hover_cursor: RwSignal<Option<&'static str>> = RwSignal::new(None);
+    let text_input_node: NodeRef<Input> = NodeRef::new();
+
+    // `autofocus` is ignored for inputs inserted after page load, so focus
+    // the text box explicitly whenever it mounts. When editing existing text,
+    // preselect it so typing replaces the old words.
+    {
+        let ctrl = controller.clone();
+        Effect::new(move |_| {
+            if let Some(input) = text_input_node.get() {
+                let _ = input.focus();
+                let editing = ctrl
+                    .text_input
+                    .with_untracked(|s| s.as_ref().is_some_and(|s| s.editing.is_some()));
+                if editing {
+                    input.select();
+                }
+            }
+        });
+    }
+
+    // Open the inline text input on top of an existing text shape so it can
+    // be rewritten in place.
+    let begin_text_edit = {
+        let ctrl = controller.clone();
+        move |idx: usize, rect: &DomRect| {
+            let Some(Shape::Text { x, y, text, .. }) = ctrl
+                .shapes
+                .with_untracked(|shapes| shapes.get(idx).cloned())
+            else {
+                return;
+            };
+            ctrl.select(Some(idx));
+            ctrl.text_input.set(Some(TextInputState {
+                client_x: x * rect.width(),
+                client_y: y * rect.height(),
+                ratio_x: x,
+                ratio_y: y,
+                editing: Some(idx),
+            }));
+            text_input_value.set(text);
+        }
+    };
 
     // Keep controller in sync with the mounted canvas element. Fit immediately,
     // then once more next frame (layout may not be final on the very first mount),
@@ -630,6 +731,7 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
     let on_mousedown = {
         let ctrl = controller.clone();
         let text_input_value = text_input_value;
+        let begin_text_edit = begin_text_edit.clone();
         move |ev: MouseEvent| {
             if !ctrl.hint_dismissed.get_untracked() {
                 ctrl.hint_dismissed.set(true);
@@ -645,6 +747,14 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
 
             if tool == DrawingTool::Text {
                 ev.prevent_default();
+                // Clicking existing text with the Text tool edits it.
+                let shapes = ctrl.shapes.get_untracked();
+                if let Some(idx) = pick_shape_at(&shapes, rx, ry)
+                    .filter(|i| matches!(shapes.get(*i), Some(Shape::Text { .. })))
+                {
+                    begin_text_edit(idx, &rect);
+                    return;
+                }
                 // Input is absolutely positioned inside .stage, which does
                 // not start at viewport (0,0) — the app bar sits above it.
                 // Store stage-relative coords so CSS left/top puts the input
@@ -655,22 +765,40 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                     client_y: ev.client_y() as f64 - rect.top(),
                     ratio_x: rx,
                     ratio_y: ry,
+                    editing: None,
                 }));
                 text_input_value.set(String::new());
                 return;
             }
 
             if tool == DrawingTool::Select {
-                let picked = pick_shape_at(&ctrl.shapes.get_untracked(), rx, ry);
-                ctrl.selected_idx.set(picked);
+                let shapes = ctrl.shapes.get_untracked();
+                // A handle of the already-selected shape wins over picking,
+                // so corners that overlap other shapes stay grabbable.
+                let resize = ctrl.selected_idx.get_untracked().and_then(|i| {
+                    let shape = shapes.get(i)?;
+                    handle_at(shape, rx, ry, handle_tolerance(&rect))
+                        .map(|handle| (i, handle, shape.clone()))
+                });
+                let picked = match &resize {
+                    Some((i, _, _)) => Some(*i),
+                    None => pick_shape_at(&shapes, rx, ry),
+                };
+                if resize.is_none() {
+                    ctrl.select(picked);
+                }
                 pointer.update_value(|state| {
                     state.is_down = true;
                     state.start = (rx, ry);
                     state.current = vec![(rx, ry)];
                     state.preview = None;
-                    state.drag_original = picked
-                        .and_then(|i| ctrl.shapes.get_untracked().get(i).cloned().map(|s| (i, s)));
+                    state.drag_original = if resize.is_some() {
+                        None
+                    } else {
+                        picked.and_then(|i| shapes.get(i).cloned().map(|s| (i, s)))
+                    };
                     state.crop_target = None;
+                    state.resize = resize;
                 });
                 ctrl.poke_redraw();
                 return;
@@ -691,6 +819,7 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                     state.preview = None;
                     state.drag_original = None;
                     state.crop_target = target;
+                    state.resize = None;
                 });
                 return;
             }
@@ -702,6 +831,7 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                 state.preview = None;
                 state.drag_original = None;
                 state.crop_target = None;
+                state.resize = None;
             });
 
             if tool == DrawingTool::Eraser {
@@ -722,7 +852,18 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
             let color = ctrl.stroke_color.get_untracked();
             let width = ctrl.stroke_width.get_untracked();
             let is_down = pointer.with_value(|s| s.is_down);
-            if !is_down || tool == DrawingTool::Text {
+            if !is_down {
+                let cursor = if tool == DrawingTool::Select {
+                    select_hover_cursor(&ctrl, rx, ry, handle_tolerance(&rect))
+                } else {
+                    None
+                };
+                if hover_cursor.get_untracked() != cursor {
+                    hover_cursor.set(cursor);
+                }
+                return;
+            }
+            if tool == DrawingTool::Text {
                 return;
             }
 
@@ -732,6 +873,11 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
             }
 
             if tool == DrawingTool::Select {
+                if let Some((idx, handle, original)) = pointer.with_value(|s| s.resize.clone()) {
+                    // Live update without pushing undo; undo is recorded on mouseup.
+                    ctrl.replace_shape(idx, resize_shape(&original, handle, (rx, ry)), false);
+                    return;
+                }
                 let (start, orig) = pointer.with_value(|s| (s.start, s.drag_original.clone()));
                 if let Some((idx, original)) = orig {
                     let dx = rx - start.0;
@@ -828,11 +974,23 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
 
             if tool == DrawingTool::Select {
                 let drag = pointer.with_value(|s| s.drag_original.clone());
+                let resize = pointer.with_value(|s| s.resize.clone());
                 pointer.update_value(|state| {
                     state.is_down = false;
                     state.drag_original = None;
                     state.preview = None;
+                    state.resize = None;
                 });
+                if let Some((idx, _, original)) = resize {
+                    let resized = ctrl
+                        .shapes
+                        .with_untracked(|shapes| shapes.get(idx).cloned());
+                    if let Some(resized) = resized.filter(|r| *r != original) {
+                        // Same rollback-then-commit trick as a move: one undo step.
+                        ctrl.replace_shape(idx, original, false);
+                        ctrl.replace_shape(idx, resized, true);
+                    }
+                }
                 if let Some((idx, original)) = drag {
                     let dx = rx - pointer.with_value(|s| s.start.0);
                     let dy = ry - pointer.with_value(|s| s.start.1);
@@ -975,6 +1133,39 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
             };
             let text = value.get_untracked().trim().to_string();
             ctrl.text_input.set(None);
+            if let Some(idx) = state.editing {
+                let current = ctrl
+                    .shapes
+                    .with_untracked(|shapes| shapes.get(idx).cloned());
+                let Some(Shape::Text {
+                    x,
+                    y,
+                    color,
+                    font_size,
+                    text: old,
+                }) = current
+                else {
+                    return;
+                };
+                if text.is_empty() {
+                    // Clearing the text removes the shape (undoable).
+                    ctrl.selected_idx.set(Some(idx));
+                    ctrl.delete_selected();
+                } else if text != old {
+                    ctrl.replace_shape(
+                        idx,
+                        Shape::Text {
+                            x,
+                            y,
+                            text,
+                            color,
+                            font_size,
+                        },
+                        true,
+                    );
+                }
+                return;
+            }
             if text.is_empty() {
                 return;
             }
@@ -984,7 +1175,7 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                 y: state.ratio_y,
                 text,
                 color: ctrl.stroke_color.get_untracked(),
-                font_size: 14.0 + width * 2.0,
+                font_size: text_font_size(width),
             });
         }
     };
@@ -1050,6 +1241,27 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
         ev.prevent_default();
     };
 
+    // Double-click a text shape with the Select tool to edit its words.
+    let on_dblclick = {
+        let ctrl = controller.clone();
+        move |ev: MouseEvent| {
+            if ctrl.active_tool.get_untracked() != DrawingTool::Select {
+                return;
+            }
+            let Some(el) = canvas_node.get() else { return };
+            let canvas: HtmlCanvasElement = el.into();
+            let rect = canvas.get_bounding_client_rect();
+            let (rx, ry) = event_ratio(&ev, &rect);
+            let shapes = ctrl.shapes.get_untracked();
+            if let Some(idx) = pick_shape_at(&shapes, rx, ry)
+                .filter(|i| matches!(shapes.get(*i), Some(Shape::Text { .. })))
+            {
+                ev.prevent_default();
+                begin_text_edit(idx, &rect);
+            }
+        }
+    };
+
     view! {
         <div
             class="stage"
@@ -1059,8 +1271,13 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
             <canvas
                 node_ref=canvas_node
                 class="canvas-surface"
-                style:cursor=move || controller.active_tool.get().cursor()
+                style:cursor=move || {
+                    hover_cursor
+                        .get()
+                        .unwrap_or_else(|| controller.active_tool.get().cursor())
+                }
                 on:mousedown=on_mousedown
+                on:dblclick=on_dblclick
                 on:mousemove=on_mousemove
                 on:mouseup=on_mouseup
             ></canvas>
@@ -1084,6 +1301,7 @@ pub fn CanvasSurface(controller: CanvasController) -> impl IntoView {
                             style:left=format!("{}px", state.client_x)
                             style:top=format!("{}px", state.client_y)
                             prop:value=move || text_input_value.get()
+                            node_ref=text_input_node
                             placeholder="Type…"
                             autofocus=true
                             on:input=move |ev| {
@@ -1115,6 +1333,7 @@ fn EmptyHint(controller: CanvasController) -> impl IntoView {
                     <div class="canvas-hint">
                         <div><strong>"Draw, type, paste, or speak"</strong></div>
                         <div>"Cmd/Ctrl+V pastes screenshots. Drag images in."</div>
+                        <div>"Press V to select a shape, then move, resize, or recolor it."</div>
                     </div>
                 }
                 .into_any()
@@ -1185,6 +1404,15 @@ fn render_all_with_preview(
     ctrl: &CanvasController,
     preview: Option<&Shape>,
 ) {
+    render_shapes(canvas, ctrl, preview, true);
+}
+
+fn render_shapes(
+    canvas: &HtmlCanvasElement,
+    ctrl: &CanvasController,
+    preview: Option<&Shape>,
+    show_selection: bool,
+) {
     // Keep bitmap in sync with displayed CSS box. This is a no-op whenever the
     // size hasn't drifted, but protects against cases where the ResizeObserver
     // hasn't caught up yet (first frame after mount, window resize mid-drag).
@@ -1199,17 +1427,46 @@ fn render_all_with_preview(
 
     let shapes = ctrl.shapes.get_untracked();
     let selected = ctrl.selected_idx.get_untracked();
-    for (i, shape) in shapes.iter().enumerate() {
+    for shape in shapes.iter() {
         render_shape(&ctx, shape, w, h);
-        if Some(i) == selected {
-            if let Some((bx, by, bw, bh)) = shape_bounds(shape) {
-                draw_selection_box(&ctx, bx * w, by * h, bw * w, bh * h);
-            }
+    }
+    // Selection chrome goes on top of every shape so handles stay grabbable.
+    if let Some(shape) = selected
+        .filter(|_| show_selection)
+        .and_then(|i| shapes.get(i))
+    {
+        if let Some((bx, by, bw, bh)) = shape_bounds(shape) {
+            draw_selection_box(&ctx, bx * w, by * h, bw * w, bh * h);
+        }
+        for (handle, (hx, hy)) in shape_handles(shape) {
+            draw_handle(&ctx, handle, hx * w, hy * h);
         }
     }
     if let Some(shape) = preview {
         render_shape(&ctx, shape, w, h);
     }
+}
+
+fn draw_handle(ctx: &CanvasRenderingContext2d, handle: Handle, x: f64, y: f64) {
+    ctx.save();
+    ctx.set_fill_style_str("#ffffff");
+    ctx.set_stroke_style_str("#2563eb");
+    ctx.set_line_width(1.5);
+    ctx.begin_path();
+    match handle {
+        Handle::Start | Handle::End => {
+            let _ = ctx.arc(x, y, HANDLE_PX / 2.0 + 1.0, 0.0, std::f64::consts::TAU);
+        }
+        _ => ctx.rect(
+            x - HANDLE_PX / 2.0,
+            y - HANDLE_PX / 2.0,
+            HANDLE_PX,
+            HANDLE_PX,
+        ),
+    }
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
 }
 
 fn draw_selection_box(ctx: &CanvasRenderingContext2d, x: f64, y: f64, w: f64, h: f64) {
@@ -1492,6 +1749,35 @@ fn pick_shape_at(shapes: &[Shape], rx: f64, ry: f64) -> Option<usize> {
     None
 }
 
+/// Handle hit radius in ratio coords for the canvas's on-screen size.
+fn handle_tolerance(rect: &DomRect) -> (f64, f64) {
+    (
+        HANDLE_PX / rect.width().max(1.0),
+        HANDLE_PX / rect.height().max(1.0),
+    )
+}
+
+/// Cursor for the Select tool hovering at (rx, ry): a resize cursor over a
+/// handle of the selected shape, `move` over any shape, otherwise `None`.
+fn select_hover_cursor(
+    ctrl: &CanvasController,
+    rx: f64,
+    ry: f64,
+    tol: (f64, f64),
+) -> Option<&'static str> {
+    ctrl.shapes.with_untracked(|shapes| {
+        let on_handle = ctrl
+            .selected_idx
+            .get_untracked()
+            .and_then(|i| shapes.get(i))
+            .and_then(|shape| handle_at(shape, rx, ry, tol));
+        match on_handle {
+            Some(handle) => Some(handle.cursor()),
+            None => pick_shape_at(shapes, rx, ry).map(|_| "move"),
+        }
+    })
+}
+
 fn translate_shape(shape: &Shape, dx: f64, dy: f64) -> Shape {
     let t = |(a, b): (f64, f64)| (a + dx, b + dy);
     match shape {
@@ -1589,6 +1875,268 @@ fn translate_shape(shape: &Shape, dx: f64, dy: f64) -> Shape {
             h: *h,
             data_url: data_url.clone(),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shape editing — resize handles + restyle (pure geometry, unit-tested)
+// ---------------------------------------------------------------------------
+
+/// On-screen size of a resize handle, in CSS px.
+const HANDLE_PX: f64 = 9.0;
+/// Smallest width/height (ratio coords) a resize can shrink a shape to.
+const MIN_SHAPE_SIZE: f64 = 0.004;
+
+/// A grab point on the selected shape. Box-like shapes get four corners;
+/// lines/arrows get their two endpoints. Text has none — its size follows the
+/// stroke-width control instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handle {
+    Nw,
+    Ne,
+    Se,
+    Sw,
+    Start,
+    End,
+}
+
+impl Handle {
+    fn cursor(self) -> &'static str {
+        match self {
+            Self::Nw | Self::Se => "nwse-resize",
+            Self::Ne | Self::Sw => "nesw-resize",
+            Self::Start | Self::End => "grab",
+        }
+    }
+}
+
+fn shape_handles(shape: &Shape) -> Vec<(Handle, (f64, f64))> {
+    match shape {
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            vec![(Handle::Start, *from), (Handle::End, *to)]
+        }
+        Shape::Text { .. } => Vec::new(),
+        _ => match shape_bounds(shape) {
+            Some((x, y, w, h)) => vec![
+                (Handle::Nw, (x, y)),
+                (Handle::Ne, (x + w, y)),
+                (Handle::Se, (x + w, y + h)),
+                (Handle::Sw, (x, y + h)),
+            ],
+            None => Vec::new(),
+        },
+    }
+}
+
+/// Which handle of `shape` (if any) lies under the pointer. `tol` is the
+/// hit radius in ratio coords per axis.
+fn handle_at(shape: &Shape, rx: f64, ry: f64, tol: (f64, f64)) -> Option<Handle> {
+    shape_handles(shape)
+        .into_iter()
+        .find(|(_, (hx, hy))| (rx - hx).abs() <= tol.0 && (ry - hy).abs() <= tol.1)
+        .map(|(handle, _)| handle)
+}
+
+/// Resize `original` by dragging `handle` to `p`. Corners keep the opposite
+/// corner anchored; images keep their aspect ratio; endpoints move freely.
+fn resize_shape(original: &Shape, handle: Handle, p: (f64, f64)) -> Shape {
+    match (original, handle) {
+        (
+            Shape::Line {
+                from,
+                to,
+                color,
+                width,
+            },
+            Handle::Start | Handle::End,
+        ) => {
+            let (from, to) = if handle == Handle::Start {
+                (p, *to)
+            } else {
+                (*from, p)
+            };
+            return Shape::Line {
+                from,
+                to,
+                color: color.clone(),
+                width: *width,
+            };
+        }
+        (
+            Shape::Arrow {
+                from,
+                to,
+                color,
+                width,
+            },
+            Handle::Start | Handle::End,
+        ) => {
+            let (from, to) = if handle == Handle::Start {
+                (p, *to)
+            } else {
+                (*from, p)
+            };
+            return Shape::Arrow {
+                from,
+                to,
+                color: color.clone(),
+                width: *width,
+            };
+        }
+        _ => {}
+    }
+    let Some(old @ (x, y, w, h)) = shape_bounds(original) else {
+        return original.clone();
+    };
+    let anchor = match handle {
+        Handle::Nw => (x + w, y + h),
+        Handle::Ne => (x, y + h),
+        Handle::Se => (x, y),
+        Handle::Sw => (x + w, y),
+        Handle::Start | Handle::End => return original.clone(),
+    };
+    let mut nw = (p.0 - anchor.0).abs().max(MIN_SHAPE_SIZE);
+    let mut nh = (p.1 - anchor.1).abs().max(MIN_SHAPE_SIZE);
+    if matches!(original, Shape::Image { .. }) && w > 0.0 && h > 0.0 {
+        let scale = (nw / w).max(nh / h);
+        nw = w * scale;
+        nh = h * scale;
+    }
+    let nx = if p.0 < anchor.0 {
+        anchor.0 - nw
+    } else {
+        anchor.0
+    };
+    let ny = if p.1 < anchor.1 {
+        anchor.1 - nh
+    } else {
+        anchor.1
+    };
+    fit_shape_to_bounds(original, old, (nx, ny, nw, nh))
+}
+
+/// Map a shape from its `old` bounding box onto `new`. Freehand paths are
+/// scaled point-by-point; a degenerate axis (e.g. a perfectly vertical
+/// stroke) is translated instead of scaled.
+fn fit_shape_to_bounds(
+    shape: &Shape,
+    old: (f64, f64, f64, f64),
+    new: (f64, f64, f64, f64),
+) -> Shape {
+    let (nx, ny, nw, nh) = new;
+    match shape {
+        Shape::Rect { color, width, .. } => Shape::Rect {
+            x: nx,
+            y: ny,
+            w: nw,
+            h: nh,
+            color: color.clone(),
+            width: *width,
+        },
+        Shape::Ellipse { color, width, .. } => Shape::Ellipse {
+            x: nx,
+            y: ny,
+            w: nw,
+            h: nh,
+            color: color.clone(),
+            width: *width,
+        },
+        Shape::Highlight { color, .. } => Shape::Highlight {
+            x: nx,
+            y: ny,
+            w: nw,
+            h: nh,
+            color: color.clone(),
+        },
+        Shape::Image { data_url, .. } => Shape::Image {
+            x: nx,
+            y: ny,
+            w: nw,
+            h: nh,
+            data_url: data_url.clone(),
+        },
+        Shape::Path {
+            points,
+            color,
+            width,
+        } => {
+            let (ox, oy, ow, oh) = old;
+            let map = |v: f64, o: f64, os: f64, n: f64, ns: f64| {
+                if os > 1e-6 {
+                    n + (v - o) / os * ns
+                } else {
+                    v - o + n
+                }
+            };
+            Shape::Path {
+                points: points
+                    .iter()
+                    .map(|(px, py)| (map(*px, ox, ow, nx, nw), map(*py, oy, oh, ny, nh)))
+                    .collect(),
+                color: color.clone(),
+                width: *width,
+            }
+        }
+        Shape::Line { .. } | Shape::Arrow { .. } | Shape::Text { .. } => shape.clone(),
+    }
+}
+
+/// Font size used for text drawn at a given stroke width.
+fn text_font_size(stroke_width: f64) -> f64 {
+    14.0 + stroke_width * 2.0
+}
+
+/// Apply a new color and/or stroke width to a shape. Images have no style;
+/// highlights have no stroke; text maps stroke width to font size.
+fn restyle_shape(shape: &Shape, new_color: Option<&str>, new_width: Option<f64>) -> Shape {
+    let mut next = shape.clone();
+    match &mut next {
+        Shape::Path { color, width, .. }
+        | Shape::Line { color, width, .. }
+        | Shape::Arrow { color, width, .. }
+        | Shape::Rect { color, width, .. }
+        | Shape::Ellipse { color, width, .. } => {
+            if let Some(c) = new_color {
+                *color = c.to_string();
+            }
+            if let Some(w) = new_width {
+                *width = w;
+            }
+        }
+        Shape::Highlight { color, .. } => {
+            if let Some(c) = new_color {
+                *color = c.to_string();
+            }
+        }
+        Shape::Text {
+            color, font_size, ..
+        } => {
+            if let Some(c) = new_color {
+                *color = c.to_string();
+            }
+            if let Some(w) = new_width {
+                *font_size = text_font_size(w);
+            }
+        }
+        Shape::Image { .. } => {}
+    }
+    next
+}
+
+/// The (color, stroke width) a shape was drawn with, so the toolbar can
+/// reflect the current selection. `None` for images.
+fn shape_style(shape: &Shape) -> Option<(String, Option<f64>)> {
+    match shape {
+        Shape::Path { color, width, .. }
+        | Shape::Line { color, width, .. }
+        | Shape::Arrow { color, width, .. }
+        | Shape::Rect { color, width, .. }
+        | Shape::Ellipse { color, width, .. } => Some((color.clone(), Some(*width))),
+        Shape::Highlight { color, .. } => Some((color.clone(), None)),
+        Shape::Text {
+            color, font_size, ..
+        } => Some((color.clone(), Some((font_size - 14.0) / 2.0))),
+        Shape::Image { .. } => None,
     }
 }
 
@@ -1951,5 +2499,128 @@ mod tests {
         let (restored, pasted) = CanvasController::restore_annotations(&annotations, &urls);
         assert_eq!(restored.len(), 2);
         assert_eq!(pasted, vec!["ONE", "TWO"]);
+    }
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> Shape {
+        Shape::Rect {
+            x,
+            y,
+            w,
+            h,
+            color: "#ef4444".into(),
+            width: 3.0,
+        }
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn corner_resize_keeps_opposite_corner_anchored() {
+        let resized = resize_shape(&rect(0.2, 0.2, 0.2, 0.2), Handle::Se, (0.6, 0.5));
+        let Shape::Rect { x, y, w, h, .. } = resized else {
+            panic!("not a rect")
+        };
+        assert!(approx(x, 0.2) && approx(y, 0.2) && approx(w, 0.4) && approx(h, 0.3));
+
+        let resized = resize_shape(&rect(0.2, 0.2, 0.2, 0.2), Handle::Nw, (0.1, 0.3));
+        let Shape::Rect { x, y, w, h, .. } = resized else {
+            panic!("not a rect")
+        };
+        assert!(approx(x, 0.1) && approx(y, 0.3) && approx(w, 0.3) && approx(h, 0.1));
+    }
+
+    #[test]
+    fn resize_past_anchor_flips_and_never_collapses() {
+        let resized = resize_shape(&rect(0.2, 0.2, 0.2, 0.2), Handle::Se, (0.2, 0.1));
+        let Shape::Rect { x, y, w, h, .. } = resized else {
+            panic!("not a rect")
+        };
+        assert!(approx(x, 0.2) && approx(w, MIN_SHAPE_SIZE));
+        assert!(approx(y, 0.1) && approx(h, 0.1));
+    }
+
+    #[test]
+    fn image_resize_preserves_aspect_ratio() {
+        let img = Shape::Image {
+            x: 0.0,
+            y: 0.0,
+            w: 0.4,
+            h: 0.2,
+            data_url: "data:,".into(),
+        };
+        let Shape::Image { w, h, .. } = resize_shape(&img, Handle::Se, (0.8, 0.25)) else {
+            panic!("not an image")
+        };
+        assert!(approx(w / h, 2.0));
+        assert!(approx(w, 0.8));
+    }
+
+    #[test]
+    fn path_scales_into_new_bounds() {
+        let path = Shape::Path {
+            points: vec![(0.1, 0.1), (0.3, 0.2)],
+            color: "#000".into(),
+            width: 1.5,
+        };
+        let Shape::Path { points, .. } = resize_shape(&path, Handle::Se, (0.5, 0.3)) else {
+            panic!("not a path")
+        };
+        assert!(approx(points[0].0, 0.1) && approx(points[0].1, 0.1));
+        assert!(approx(points[1].0, 0.5) && approx(points[1].1, 0.3));
+    }
+
+    #[test]
+    fn line_endpoints_move_independently() {
+        let arrow = Shape::Arrow {
+            from: (0.1, 0.1),
+            to: (0.5, 0.5),
+            color: "#000".into(),
+            width: 3.0,
+        };
+        assert_eq!(shape_handles(&arrow).len(), 2);
+        let Shape::Arrow { from, to, .. } = resize_shape(&arrow, Handle::End, (0.9, 0.2)) else {
+            panic!("not an arrow")
+        };
+        assert_eq!(from, (0.1, 0.1));
+        assert_eq!(to, (0.9, 0.2));
+        assert_eq!(
+            handle_at(&arrow, 0.502, 0.499, (0.01, 0.01)),
+            Some(Handle::End)
+        );
+        assert_eq!(handle_at(&arrow, 0.3, 0.3, (0.01, 0.01)), None);
+    }
+
+    #[test]
+    fn restyle_changes_color_and_width_but_not_images() {
+        let restyled = restyle_shape(&rect(0.0, 0.0, 0.1, 0.1), Some("#2563eb"), Some(6.0));
+        assert_eq!(
+            shape_style(&restyled),
+            Some(("#2563eb".to_string(), Some(6.0)))
+        );
+
+        let text = Shape::Text {
+            x: 0.0,
+            y: 0.0,
+            text: "hi".into(),
+            color: "#000".into(),
+            font_size: 20.0,
+        };
+        let restyled = restyle_shape(&text, None, Some(6.0));
+        assert_eq!(
+            shape_style(&restyled),
+            Some(("#000".to_string(), Some(6.0)))
+        );
+
+        let img = Shape::Image {
+            x: 0.0,
+            y: 0.0,
+            w: 0.1,
+            h: 0.1,
+            data_url: "data:,".into(),
+        };
+        assert_eq!(restyle_shape(&img, Some("#fff"), Some(1.5)), img);
+        assert!(shape_handles(&text).is_empty());
     }
 }

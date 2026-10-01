@@ -166,8 +166,8 @@ where
     view! {
         <button
             class="pill-btn pill-color"
-            title="Stroke color"
-            aria-label="Change stroke color"
+            title="Color — also recolors the selected shape"
+            aria-label="Change color"
             on:click=move |_| toggle(Popover::Color)
         >
             <span class="pill-color-dot" style:background-color=bg></span>
@@ -189,7 +189,7 @@ fn StrokeCycle(controller: CanvasController) -> impl IntoView {
     view! {
         <button
             class="pill-btn pill-stroke"
-            title="Stroke width (click to cycle, [ / ] keys)"
+            title="Stroke width — also applies to the selected shape (click to cycle, [ / ] keys)"
             aria-label="Stroke width"
             on:click={
                 let ctrl = controller.clone();
@@ -258,7 +258,7 @@ where
                         aria-label=format!("Color: {label}")
                         style:background-color=hex.clone()
                         on:click=move |_| {
-                            ctrl_click.stroke_color.set(hex_click.clone());
+                            ctrl_click.set_stroke_color(hex_click.clone());
                             close();
                         }
                     ></button>
