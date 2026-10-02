@@ -682,6 +682,15 @@ fn LineageDetail(
     revision_request: RwSignal<Option<FeedbackRevisionRequest>>,
 ) -> impl IntoView {
     let can_approve = record.status.can_approve();
+    // The primary action means different things per state: start the
+    // iteration (Pending), accept a paused plan (Planned + plan-review gate),
+    // or merge a finished build (BuildReady). Label it accordingly — the
+    // review banner tells the user to "Approve", so a button that only ever
+    // says "Evolve" reads as missing.
+    let awaiting_plan_approval = matches!(record.status, LineageJobStatus::Planned)
+        && record.pause_after_plan
+        && record.plan_approved_at_unix_ms.is_none();
+    let awaiting_merge = matches!(record.status, LineageJobStatus::BuildReady);
     let can_retry = record.status.can_retry();
     let can_run = record.status.can_run() && record.worktree_path.is_some();
     // Resume is offered when a multi-stage pipeline has progress on disk
@@ -772,6 +781,9 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
+    // Second handle for the plan-review "Reject plan" button; the original
+    // moves into the ⋯ menu closure.
+    let do_reject_plan = do_reject.clone();
     let do_run = move || {
         let id = run_id.clone();
         action_error.set(None);
@@ -1318,17 +1330,66 @@ fn LineageDetail(
                     }}
                 </div>
 
-                // Primary: Evolve — gated behind the dry-run modal so the
-                // reviewer sees what's about to happen before committing.
-                <button
-                    class="primary-btn lineage-evolve-btn"
-                    prop:disabled=!can_approve
-                    on:click=move |_| do_approve()
-                    aria-label="Evolve — plan and implement the next iteration"
-                    title="Preview, then plan & implement the next iteration from this feedback"
-                >
-                    "Evolve"
-                </button>
+                // Plan review: Reject sits next to Approve (it's otherwise
+                // buried in the ⋯ menu) so both answers to the banner's
+                // question are one click away.
+                {
+                    let do_reject = do_reject_plan.clone();
+                    awaiting_plan_approval.then(|| view! {
+                        <button
+                            class="secondary-btn lineage-reject-plan-btn"
+                            on:click=move |_| do_reject()
+                            aria-label="Reject this plan"
+                            title="Reject — stops this job for good. Resubmit the feedback with answers to the open questions."
+                        >
+                            "Reject plan"
+                        </button>
+                    })
+                }
+
+                // Primary action. Starting an iteration goes through the
+                // dry-run modal so the reviewer sees what's about to happen;
+                // approving a paused plan is a direct click — the plan and
+                // its open questions are already on screen.
+                {
+                    let confirm_now = confirm_evolve.clone();
+                    let (label, aria, title) = if awaiting_plan_approval {
+                        (
+                            "Approve plan",
+                            "Approve the plan and start implementation",
+                            "Accept the planner's assumptions above and start implementing",
+                        )
+                    } else if awaiting_merge {
+                        (
+                            "Approve & merge",
+                            "Approve the build and merge it into the source repo",
+                            "Preview, then merge this iteration's branch into the source repo (checks run after merge; rolled back on failure)",
+                        )
+                    } else {
+                        (
+                            "Evolve",
+                            "Evolve — plan and implement the next iteration",
+                            "Preview, then plan & implement the next iteration from this feedback",
+                        )
+                    };
+                    view! {
+                        <button
+                            class="primary-btn lineage-evolve-btn"
+                            prop:disabled=move || !can_approve || evolve_submitting.get()
+                            on:click=move |_| {
+                                if awaiting_plan_approval {
+                                    confirm_now();
+                                } else {
+                                    do_approve();
+                                }
+                            }
+                            aria-label=aria
+                            title=title
+                        >
+                            {move || if awaiting_plan_approval && evolve_submitting.get() { "Approving…" } else { label }}
+                        </button>
+                    }
+                }
             </div>
 
             {move || {
