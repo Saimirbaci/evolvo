@@ -19,8 +19,8 @@ plan; your job is to make it real in the worktree at `{{WORKTREE}}`.
 ## Your inputs
 
 1. **Read `{{PLAN_PATH}}` first**. Treat `backend.entities`,
-   `backend.commands`, `backend.tests`, `backend.storage`, and
-   `templates.useTemplates` as the spec. Do not improvise new commands; if
+   `backend.commands`, `backend.behaviors`, `backend.tests`,
+   `backend.storage`, and `templates.useTemplates` as the spec. Do not improvise new commands; if
    the plan is wrong, note it in `history` but implement what it says and
    let the validator catch drift.
 2. **Read the canvas PNG** at `{{CANVAS_PNG}}` whenever you are making a
@@ -147,6 +147,49 @@ plan's `bodySketch` says "call store.save_task", the `_impl` body
 must actually call `save_task`. Naming the function correctly is no
 longer enough.
 
+## Behaviors — make the app actually do things
+
+Every `backend.behaviors[]` entry is a process the user expects to see
+happen. Implement each one in `fn <implementedIn>` (plus an optional
+`<implementedIn>_impl`), and **wire it to its trigger**:
+
+- `userAction` — the command named in `triggeredBy` calls (or spawns) it.
+  Work longer than ~1s runs on `std::thread::spawn` so the command
+  returns immediately with the record in its "working" state
+  (`status: active`, `running`, …).
+- `timer` — start a loop thread once at app setup (e.g. from the
+  Tauri `setup` hook in `main.rs`/`lib.rs`) that sleeps for the cadence
+  and calls the behavior.
+- `backgroundWorker` — spawned by its triggering command; persists every
+  transition (`queued → running → done | failed`) so a reload mid-run
+  shows real progress, and records failures on the entity instead of
+  swallowing them.
+- `externalEvent` — the listener (watcher, webhook template) calls it.
+
+After a behavior changes state, the UI must find out: emit a Tauri event
+(`app_handle.emit("app://changed", ...)`) that the frontend listens to,
+or document in `plan.history` that the frontend polls the relevant
+`list_*` command. Either is fine; silence is not.
+
+**`engine: "llm"` behaviors call a real model.** Copy
+`templates/integrations/claude_cli/` per its README (or `openrouter/`
+if the plan chose it) and call `engine.complete(...)` from the behavior.
+Keep the engine behind the template's `LlmEngine` trait held in app
+state, so `cargo test` uses its `ScriptedEngine` instead of the real CLI.
+A behavior that fabricates a reply string, picks from canned
+responses, or sleeps and flips a status is **simulated** — that is the
+mockup failure mode this stage exists to prevent. If the model call
+fails, persist the error on the entity (status `failed`, message) so
+the UI can show it.
+
+Seed data may fill an empty first run, but must never be the only way a
+drawn value appears: if the canvas shows "Build #118 ready for testing",
+the seed may show it once, and a behavior must be able to produce
+messages like it.
+
+Write at least one test per behavior that drives it through its `_impl`
+(with `ScriptedEngine` for llm behaviors) and asserts the state change.
+
 ## Persistence layer — every entity needs CRUD in store.rs
 
 For each entity in `plan.backend.entities`, the validator requires at
@@ -180,6 +223,11 @@ The `validate_backend_impl` validator runs after you finish and checks:
 - `cargo check -p evolvo_desktop` and `cargo test -p evolvo_desktop --lib`
   both exit 0.
 - No stub smells in `commands.rs`.
+- Every planned behavior: `fn <implementedIn>` exists anywhere in the host
+  crate, its body (or `_impl`'s) contains one of the planned `anchors`,
+  something other than its own definition references it (registration,
+  call, spawn), and `llm` behaviors have the `claude_cli` / `openrouter`
+  integration in the crate.
 
 Run these yourself before you exit:
 

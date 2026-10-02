@@ -57,7 +57,10 @@ Fill in these sections of `plan.json` (camelCase on wire):
   deliberate name if needed.
 - `templates.useTemplates` — list every template from
   `templates/integrations/` that the app will pull in. If the app has any
-  LLM surface, include `openrouter`. If it needs auth with Google, include
+  LLM work — chat, agents, assistants, generated text, summaries, replies —
+  include **`claude_cli`** (runs the user's local `claude` CLI: no API key,
+  works offline from setup) or `openrouter` (needs an API key) when the user
+  asked for multi-provider models. If it needs auth with Google, include
   `google_oauth`. Empty is allowed only when none apply.
 - `templates.declined` — for every template you considered and rejected,
   add `{ name, reason }` so the validator sees you thought about it.
@@ -114,6 +117,9 @@ Fill in these sections of `plan.json` (camelCase on wire):
   persistence roundtrip test, one edge case.
 - `backend.storage` — `kind` (`json_per_entity` unless you have a reason),
   `path` relative to `EVOLVO_WORKSPACE_ROOT`.
+- `backend.behaviors` — **what the app does**, not just what it stores.
+  See the next section; this is where most "it's just a mockup" failures
+  come from.
 
 ## Floor vs ceiling — the budget is the floor, not the target
 
@@ -142,6 +148,68 @@ on this app?" Then translate every clickable element to a command.**
 
 Do not "save work for later" — later stages can ADD to these lists,
 but they cannot cover for a missing backend plan.
+
+## Behaviors — the app must DO what the drawing shows
+
+Commands cover what the user clicks. Behaviors cover **what happens
+because of it, or on its own**. A plan with CRUD commands and no
+behaviors ships a data-entry form wearing the drawing's clothes: the
+screen looks right on first launch (because of seed data) and nothing
+ever moves. That is a mockup, and it is a failed iteration.
+
+Walk the canvas again and, for **every drawn element that shows state
+that changes** — a status ("running", "waiting", "idle", "failed"), a
+progress indicator, a count, a timestamp ("2m ago", "now"), a message
+thread, a reply, an arrow between actors, a log, a notification, a
+chart over time — ask: *what process produces this change in the real
+app?* Each answer is a behavior:
+
+```json
+{
+  "name": "agent_replies_to_message",
+  "trigger": "userAction",
+  "triggeredBy": "send_message",
+  "effect": "The target agent works on the message with a real model; its reply lands in the message bus addressed back to the sender, and its status goes active → idle.",
+  "changesState": ["AgentMessage.*", "Agent.status", "Agent.activity"],
+  "engine": "llm",
+  "implementedIn": "run_agent_turn",
+  "bodySketch": "1. Mark agent active via store.save_agent.\n2. Build prompt from agent.role + recent messages.\n3. engine.complete(&LlmRequest{..}) via the claude_cli integration.\n4. Persist reply via store.save_agent_message, set status idle, save_agent.\n5. Emit `app://changed` so the UI refreshes.",
+  "anchors": ["complete", "save_agent_message"],
+  "motivatedByRegions": ["R3"]
+}
+```
+
+Rules:
+
+- `trigger` is one of `userAction` (fired by a command — `triggeredBy`
+  names it), `timer` (a periodic tick — `triggeredBy` is the cadence),
+  `backgroundWorker` (a long-running job started by a command, e.g. a
+  task executing to completion), `externalEvent` (a webhook, file
+  watcher, sync).
+- `engine` is `deterministic` (plain code: timers, state machines,
+  calculations) or `llm` (a real model call through `claude_cli` /
+  `openrouter`, which must then be in `templates.useTemplates`).
+- `implementedIn` is the host fn that does the work. The validator
+  checks it exists, contains your `anchors`, and that something calls
+  it (a registered command, a spawned worker, a timer loop). Long work
+  runs on a background thread so commands return immediately; the
+  worker persists every state transition (so a reload shows progress)
+  and the UI refreshes — via a Tauri event or by polling `list_*`.
+- **AI-shaped requests run a real model.** If the drawing or text is
+  about agents, assistants, copilots, chatbots, or model-generated
+  content, at least one behavior must use `engine: "llm"`. Agents are
+  not bookkeeping records that a human flips between statuses — sending
+  an agent work makes it do the work. The validator enforces this when
+  the request mentions agents/assistants/AI.
+- **Seed data is not behavior.** You may seed a first-run example so
+  the screen isn't empty, but every value the drawing shows changing
+  must also be producible by a behavior. If you catch yourself planning
+  "seed the exact strings from the canvas", stop and plan the process
+  that would produce them.
+- **Static apps are the exception, not an escape hatch.** Only when
+  nothing on screen changes on its own (a reference page, a pure form)
+  set `backend.staticApp: {"reason": "…"}` instead of behaviors. That
+  always pauses the job for the user to confirm.
 
 ## Golden examples
 
@@ -209,9 +277,28 @@ This is the **smallest** acceptable plan:
     {"name": "toggle_missing_returns_err", "module": "commands::tests", "covers": "edge: toggling a nonexistent id errors"}
   ],
   "storage": {"kind": "json_per_entity", "path": "tasks"},
-  "budget": {"minEntities": 1, "minCommands": 4, "minTests": 3}
+  "budget": {"minEntities": 1, "minCommands": 4, "minTests": 3},
+  "behaviors": [
+    {
+      "name": "toggle_updates_remaining_count",
+      "trigger": "userAction",
+      "triggeredBy": "toggle_task",
+      "effect": "Checking a task strikes it through and the 'N left' counter drops by one.",
+      "changesState": ["Task.done"],
+      "engine": "deterministic",
+      "implementedIn": "toggle_task_impl",
+      "bodySketch": "1. load_task(id).\n2. Flip done.\n3. save_task(&rec).\n4. UI recomputes remaining from list_tasks.",
+      "anchors": ["load_task", "save_task"],
+      "motivatedByRegions": ["R1"]
+    }
+  ]
 }
 ```
+
+A simple app's behaviors can live in a command's own `_impl` — the
+point is to name the observable change and hold the code to it, not to
+invent background machinery. Nothing here runs on its own, so a todo
+app needs no timer or worker.
 
 Every command cites `R1` because the user's one drawing motivates the
 whole CRUD surface. Each `bodySketch` names the store method the
@@ -500,6 +587,43 @@ materialises charges into transactions. **That's planning at the
 ceiling — every drawn element produces commands until the canvas is
 fully covered.**
 
+### Golden 4 — AI-shaped canvas: agents that actually work
+
+A user drew an "Agent Manager": an agent roster with statuses, a task
+queue, a communication graph between Planner/Coder/Reviewer/Tester, and a
+message bus with a "Message an agent…" composer. The **wrong** plan is
+17 CRUD commands plus a seed that copies the drawn strings — it passes
+every count and looks right, and no agent ever does anything.
+
+The right plan keeps the CRUD and adds the processes the screen depicts:
+
+```json
+"templates": {"useTemplates": ["claude_cli"], "declined": [{"name": "openrouter", "reason": "local claude CLI covers model calls without an API key"}]},
+"backend": {
+  "behaviors": [
+    {"name": "agent_replies_to_message", "trigger": "userAction", "triggeredBy": "send_message",
+     "effect": "Target agent answers with a real model; reply appears in the bus; status active → idle.",
+     "changesState": ["AgentMessage.*", "Agent.status"], "engine": "llm", "implementedIn": "run_agent_turn",
+     "bodySketch": "1. save_agent(status=active).\n2. engine.complete(role + thread).\n3. save_agent_message(reply).\n4. save_agent(status=idle).",
+     "anchors": ["complete", "save_agent_message"], "motivatedByRegions": ["R3"]},
+    {"name": "assigned_task_executes", "trigger": "backgroundWorker", "triggeredBy": "assign_task",
+     "effect": "The assignee works the task with a real model; queued → running → done (or failed with the error), result posted to the bus, hand-off message to the next role.",
+     "changesState": ["AgentTask.status", "AgentTask.result", "AgentMessage.*", "Agent.status"], "engine": "llm", "implementedIn": "execute_task",
+     "bodySketch": "1. Mark task running + agent active (save_task, save_agent).\n2. engine.complete(task title + agent role).\n3. Save result, status done; on Err status failed.\n4. save_agent_message hand-off to the next role.",
+     "anchors": ["complete", "save_task"], "motivatedByRegions": ["R2"]},
+    {"name": "graph_edges_follow_traffic", "trigger": "userAction", "triggeredBy": "communication_graph",
+     "effect": "Edges and labels are derived from real message history, so new hand-offs appear as new arrows.",
+     "changesState": ["CommunicationGraph (derived)"], "engine": "deterministic", "implementedIn": "communication_graph_impl",
+     "bodySketch": "1. list_agent_messages().\n2. Group by (from,to) → edge with latest label.\n3. Return nodes + edges.",
+     "anchors": ["list_agent_messages"], "motivatedByRegions": ["R4"]}
+  ]
+}
+```
+
+The e2e plan then asserts effects the user didn't type: after sending
+"Summarise the spec" to Coder, a reply *from* Coder appears; after
+assigning a task, it reaches `done` with a result.
+
 ## Open questions — record your guesses
 
 Whenever the canvas / text / voice leave a real ambiguity and you had to
@@ -517,6 +641,11 @@ State the guess you made inside the question. The reviewer reads these at
 the plan-review pause; a wrong guess corrected here costs a re-plan, not a
 full implementation run. Do NOT pad the list — an empty array means
 "nothing was ambiguous" and that is a fine answer.
+
+**A guess that the app can be simulated is not yours to make.** If a
+question says the behavior is simulated / mocked / bookkeeping-only /
+placeholder, the pipeline automatically pauses the job for the user to
+decide before anything is built. Prefer planning the real behavior.
 
 ## When finished
 

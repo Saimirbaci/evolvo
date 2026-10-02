@@ -759,6 +759,19 @@ pub fn run_pipeline<D: StageDispatcher>(
         if !ok {
             break;
         }
+        if stage == StageKind::BackendPlan {
+            // A plan that opts out of live behaviour (static app) or guesses
+            // the app can be simulated is a product decision: stop for the
+            // reviewer even if they didn't ask for plan review.
+            if let Some(reason) = forced_plan_review_reason(store, job_dir, job_id) {
+                if engine.request_plan_review(job_id).is_ok() {
+                    let _ = engine.append_note(
+                        job_id,
+                        &format!("plan review required — {reason}. Approve to build it as planned, or Reject and resubmit with clearer intent."),
+                    );
+                }
+            }
+        }
         if stage == StageKind::BackendPlan && should_pause_for_plan_review(store, job_id) {
             let _ = engine.append_note(
                 job_id,
@@ -777,6 +790,22 @@ pub fn run_pipeline<D: StageDispatcher>(
         stages: job.stages,
         paused_for_plan_review,
     })
+}
+
+/// Why the validated plan must be reviewed before implementation even when
+/// the job didn't request it — `None` once the reviewer approved the plan
+/// (so a resume never re-pauses) or when nothing needs a decision.
+fn forced_plan_review_reason(store: &Store, job_dir: &Path, job_id: &str) -> Option<String> {
+    let approved = store
+        .load_lineage_job(job_id)
+        .ok()
+        .flatten()
+        .is_some_and(|j| j.plan_approved_at_unix_ms.is_some());
+    if approved {
+        return None;
+    }
+    let plan = load_plan(job_dir).ok().flatten()?;
+    crate::plan::plan_review_required_reason(&plan)
 }
 
 /// The plan-review gate fires only while the job both requested it and has
@@ -984,6 +1013,20 @@ mod tests {
                         anchors: vec!["save_task".into()],
                     });
                 }
+                plan.backend.behaviors.push(crate::plan::BehaviorPlan {
+                    name: "overdue_tasks_flagged".into(),
+                    trigger: "timer".into(),
+                    triggered_by: "every 60s".into(),
+                    effect: "tasks past their due date show as overdue".into(),
+                    changes_state: vec!["Task.overdue".into()],
+                    engine: "deterministic".into(),
+                    implemented_in: "flag_overdue_tasks".into(),
+                    body_sketch:
+                        "List tasks, set overdue when due < now, persist via store.save_task."
+                            .into(),
+                    anchors: vec!["save_task".into()],
+                    motivated_by_regions: vec!["R1".into()],
+                });
                 for t in ["create_persists", "list_returns_all", "delete_removes"] {
                     plan.backend.tests.push(crate::plan::TestPlan {
                         name: t.into(),
@@ -1329,6 +1372,60 @@ mod tests {
             StageStatus::Pending,
             "BackendImpl must have been attempted after approval"
         );
+    }
+
+    #[test]
+    fn simulated_assumption_forces_plan_review_until_approved() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+        // The job did NOT ask for plan review; the planner guesses the app
+        // can be a simulation — that decision belongs to the user.
+        let mut plan = load_plan(&job_dir).unwrap().unwrap();
+        plan.open_questions
+            .push("Agents are bookkeeping records only — assumed simulated?".into());
+        save_plan(&job_dir, &plan).unwrap();
+
+        let dispatcher = ScriptedDispatcher {
+            job_dir: job_dir.clone(),
+            fix_on_attempt: 1,
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let run = run_pipeline(&store, &engine, &dispatcher, &worktree, &job_dir, &job_id).unwrap();
+        assert!(run.paused_for_plan_review, "simulation guess must pause");
+        let job = store.load_lineage_job(&job_id).unwrap().unwrap();
+        assert_eq!(job.status, crate::types::LineageJobStatus::Planned);
+        assert!(
+            job.pause_after_plan,
+            "approve path must treat it as a plan review"
+        );
+        assert!(job.notes.iter().any(|n| n.contains("plan review required")));
+
+        engine.mark_plan_approved(&job_id).unwrap();
+        let run = run_pipeline(&store, &engine, &dispatcher, &worktree, &job_dir, &job_id).unwrap();
+        assert!(
+            !run.paused_for_plan_review,
+            "approved plan must not re-pause"
+        );
+    }
+
+    #[test]
+    fn clean_plan_without_review_request_does_not_pause() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+        let dispatcher = ScriptedDispatcher {
+            job_dir: job_dir.clone(),
+            fix_on_attempt: 1,
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let run = run_pipeline(&store, &engine, &dispatcher, &worktree, &job_dir, &job_id).unwrap();
+        assert!(!run.paused_for_plan_review);
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {

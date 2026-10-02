@@ -108,6 +108,11 @@ Build the UI described in `plan.frontend` inside the worktree at
   validator greps for those.
 - **State survives reload.** Do not hold list state only in a local
   `RwSignal`. Load from the backend on mount, refresh after writes.
+  Also refresh when **behaviors** change state on their own: listen for
+  the backend's `app://changed` event (via `interop.rs`) or poll the
+  affected `list_*` while anything is in flight, and render in-progress
+  and failed states — otherwise agents replying, tasks finishing and
+  timers firing are invisible and the app reads as a mockup.
 - **Accessibility.** Icon-only buttons get `aria-label` + `title`.
 - **Feature list every web-sys type you reach for** in
   `app/ui/Cargo.toml`.

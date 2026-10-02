@@ -243,6 +243,8 @@ pub fn validate_backend_plan(plan: &IterationPlan) -> StageReport {
         },
     );
 
+    validate_behavior_plan(&mut r, plan);
+
     // Every region has at least one backend owner when plans mention any.
     if !plan.canvas.regions.is_empty() {
         let owned: std::collections::HashSet<String> =
@@ -266,6 +268,135 @@ pub fn validate_backend_plan(plan: &IterationPlan) -> StageReport {
     }
 
     r.finalize()
+}
+
+/// Minimum length for a `staticApp.reason` — a real sentence, not "n/a".
+const MIN_STATIC_REASON_CHARS: usize = 20;
+
+/// Behaviour-first planning checks: a plan must say what the app *does*
+/// (or explicitly justify being static), every behaviour must be concrete
+/// enough to hold the implementer to, and AI-shaped requests must run a
+/// real model instead of shipping bookkeeping records.
+fn validate_behavior_plan(r: &mut StageReport, plan: &IterationPlan) {
+    use crate::plan::{BEHAVIOR_ENGINES, BEHAVIOR_TRIGGERS, LLM_TEMPLATES};
+    let behaviors = &plan.backend.behaviors;
+    let static_reason = plan
+        .backend
+        .static_app
+        .as_ref()
+        .map(|s| s.reason.trim().to_string());
+    let static_ok = static_reason
+        .as_ref()
+        .is_some_and(|reason| reason.chars().count() >= MIN_STATIC_REASON_CHARS);
+    r.push(
+        "plan declares live behaviors (or justifies a static app)",
+        !behaviors.is_empty() || static_ok,
+        if !behaviors.is_empty() {
+            format!("{} behaviors", behaviors.len())
+        } else if static_reason.is_some() {
+            format!(
+                "backend.staticApp.reason must explain why nothing on screen changes on its own (>= {MIN_STATIC_REASON_CHARS} chars)"
+            )
+        } else {
+            "backend.behaviors is empty — every drawn element showing changing state \
+             (statuses, \"running\", counts, timestamps, threads, replies, progress) needs a \
+             behavior that really produces that change; set backend.staticApp only if the app \
+             truly has none"
+                .to_string()
+        },
+    );
+
+    let command_names: std::collections::HashSet<&str> = plan
+        .backend
+        .commands
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    let mut incomplete: Vec<String> = Vec::new();
+    for b in behaviors {
+        let mut problems: Vec<&str> = Vec::new();
+        if !is_snake_case(&b.name) {
+            problems.push("name not snake_case");
+        }
+        if !BEHAVIOR_TRIGGERS.contains(&b.trigger.as_str()) {
+            problems.push("trigger not one of userAction|timer|backgroundWorker|externalEvent");
+        }
+        if b.trigger == "userAction" && !command_names.contains(b.triggered_by.trim()) {
+            problems.push("userAction triggeredBy must name a planned command");
+        }
+        if b.trigger != "userAction" && b.triggered_by.trim().is_empty() {
+            problems.push("triggeredBy empty");
+        }
+        if !BEHAVIOR_ENGINES.contains(&b.engine.as_str()) {
+            problems.push("engine not deterministic|llm");
+        }
+        if b.effect.trim().is_empty() {
+            problems.push("effect empty");
+        }
+        if b.changes_state.is_empty() {
+            problems.push("changesState empty");
+        }
+        if !is_snake_case(&b.implemented_in) {
+            problems.push("implementedIn must be a snake_case fn name");
+        }
+        if b.body_sketch.trim().len() < 30 {
+            problems.push("bodySketch < 30 chars");
+        }
+        if anchors_or_sketch(&b.anchors, &b.body_sketch).is_empty() {
+            problems.push("no anchors");
+        }
+        if !problems.is_empty() {
+            incomplete.push(format!("{}: {}", b.name, problems.join(", ")));
+        }
+    }
+    r.push(
+        "every behavior is concrete (trigger, effect, state, engine, implementedIn, sketch)",
+        incomplete.is_empty(),
+        if incomplete.is_empty() {
+            "ok".to_string()
+        } else {
+            incomplete.join(" | ")
+        },
+    );
+
+    let llm_behaviors = behaviors.iter().filter(|b| b.engine == "llm").count();
+    let has_llm_template = plan
+        .templates
+        .use_templates
+        .iter()
+        .any(|t| LLM_TEMPLATES.contains(&t.as_str()));
+    if llm_behaviors > 0 {
+        r.push(
+            "llm behaviors pull in an LLM integration template",
+            has_llm_template,
+            if has_llm_template {
+                "ok".to_string()
+            } else {
+                format!(
+                    "{llm_behaviors} llm behavior(s) but templates.useTemplates has none of {LLM_TEMPLATES:?} \
+                     — prefer claude_cli (local CLI, no API key)"
+                )
+            },
+        );
+    }
+
+    let signals = crate::plan::ai_signals(plan);
+    if !signals.is_empty() && plan.backend.static_app.is_none() {
+        r.push(
+            "AI-shaped request runs a real model (>= 1 llm behavior)",
+            llm_behaviors > 0,
+            if llm_behaviors > 0 {
+                format!("{llm_behaviors} llm behavior(s); signals {signals:?}")
+            } else {
+                format!(
+                    "the request mentions {signals:?} — agents/assistants must actually do their \
+                     work through a model (engine \"llm\" + claude_cli template), not sit as \
+                     bookkeeping records. If the user really wants a non-AI app, set \
+                     backend.staticApp with the reason (the job will pause for review)."
+                )
+            },
+        );
+    }
 }
 
 pub fn validate_frontend_plan(plan: &IterationPlan) -> StageReport {
@@ -425,6 +556,44 @@ pub fn validate_e2e_plan(plan: &IterationPlan) -> StageReport {
         plan.e2e.persistence_smoke.is_some(),
         "required for every NewApp iteration",
     );
+
+    let behavior_names: std::collections::HashSet<&str> = plan
+        .backend
+        .behaviors
+        .iter()
+        .map(|b| b.name.as_str())
+        .collect();
+    let verified: std::collections::HashSet<&str> = plan
+        .e2e
+        .scenarios
+        .iter()
+        .flat_map(|s| s.verifies_behaviors.iter().map(String::as_str))
+        .collect();
+    let uncovered: Vec<&str> = plan
+        .backend
+        .behaviors
+        .iter()
+        .map(|b| b.name.as_str())
+        .filter(|name| !verified.contains(name))
+        .collect();
+    let unknown: Vec<&str> = verified
+        .iter()
+        .copied()
+        .filter(|name| !behavior_names.contains(name))
+        .collect();
+    r.push(
+        "every behavior has a scenario asserting its effect",
+        uncovered.is_empty() && unknown.is_empty(),
+        if uncovered.is_empty() && unknown.is_empty() {
+            format!("{} behaviors covered", behavior_names.len())
+        } else {
+            format!(
+                "uncovered behaviors: {uncovered:?}; unknown names in verifiesBehaviors: {unknown:?} \
+                 — add scenarios whose steps assert the effect the user did NOT type \
+                 (e.g. 'Expect a reply from Coder to appear in the message bus')"
+            )
+        },
+    );
     r.finalize()
 }
 
@@ -544,6 +713,8 @@ pub fn validate_backend_impl(plan: &IterationPlan, worktree: &Path) -> StageRepo
             },
         );
     }
+
+    push_behavior_impl_checks(&mut r, plan, &host_src_body, &invoke_body);
 
     // Every planned test must exist as a `fn <name>` in the worktree.
     let mut grep_tests_body = String::new();
@@ -1187,6 +1358,22 @@ pub fn validate_final(plan: &IterationPlan, worktree: &Path) -> StageReport {
     // have somewhere to read continuity from and somewhere to append to.
     // A missing/gutted DESIGN.md silently resets design memory to zero
     // every iteration, which defeats the entire point of Part C.
+    // Mockup gate: every planned behaviour must still exist and be wired
+    // after all later stages (frontend / e2e work can orphan a worker).
+    if !plan.backend.behaviors.is_empty() {
+        let host_src_body = collect_host_rs_files(worktree)
+            .iter()
+            .map(|p| read(p))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let invoke_body = format!(
+            "{}\n{}",
+            read(&worktree.join("app/src-tauri/src/lib.rs")),
+            read(&worktree.join("app/src-tauri/src/main.rs"))
+        );
+        push_behavior_impl_checks(&mut r, plan, &host_src_body, &invoke_body);
+    }
+
     let (design_ok, design_detail) = check_design_md(&worktree.join("DESIGN.md"));
     r.push(
         "DESIGN.md exists and has a decision log",
@@ -1319,15 +1506,18 @@ fn is_snake_case(s: &str) -> bool {
 /// `body_sketch`. We filter common stopwords / Rust keywords so the
 /// extraction doesn't anchor on noise like "the", "and", "Self".
 fn effective_anchors(cmd: &crate::plan::CommandPlan) -> Vec<String> {
-    if !cmd.anchors.is_empty() {
-        return cmd
-            .anchors
+    anchors_or_sketch(&cmd.anchors, &cmd.body_sketch)
+}
+
+fn anchors_or_sketch(anchors: &[String], body_sketch: &str) -> Vec<String> {
+    if !anchors.is_empty() {
+        return anchors
             .iter()
             .map(|a| a.trim().to_string())
             .filter(|a| !a.is_empty())
             .collect();
     }
-    extract_identifier_anchors(&cmd.body_sketch)
+    extract_identifier_anchors(body_sketch)
 }
 
 const ANCHOR_STOPWORDS: &[&str] = &[
@@ -1379,6 +1569,89 @@ fn extract_identifier_anchors(sketch: &str) -> Vec<String> {
 /// path. The CRUD integration check greps all of them so the agent
 /// can put persistence in any module (e.g. a new app-shape under
 /// `app_shapes/<name>.rs`) and still be credited.
+/// Count references to identifier `name` in `src` that are not its own
+/// `fn name` definition — i.e. call sites, registrations, spawns.
+fn count_non_definition_refs(src: &str, name: &str) -> usize {
+    let bytes = src.as_bytes();
+    let is_ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(rel) = src[start..].find(name) {
+        let pos = start + rel;
+        let end = pos + name.len();
+        let before_ok = pos == 0 || !is_ident(bytes[pos - 1]);
+        let after_ok = end >= bytes.len() || !is_ident(bytes[end]);
+        if before_ok && after_ok {
+            let is_def = src[..pos].trim_end().ends_with("fn");
+            if !is_def {
+                count += 1;
+            }
+        }
+        start = end;
+    }
+    count
+}
+
+/// Behaviour implementation checks, shared by `backend_impl` and the final
+/// review: each planned behaviour's function exists, its body contains the
+/// planned anchors, something actually invokes it, and llm behaviours have
+/// an LLM integration in the crate.
+fn push_behavior_impl_checks(
+    r: &mut StageReport,
+    plan: &IterationPlan,
+    host_src_body: &str,
+    invoke_body: &str,
+) {
+    for b in &plan.backend.behaviors {
+        let fn_name = b.implemented_in.trim();
+        let body = extract_function_body(host_src_body, fn_name);
+        r.push(
+            &format!("behavior `{}` implemented in `fn {}`", b.name, fn_name),
+            body.is_some(),
+            "search every .rs under app/src-tauri/src",
+        );
+        let Some(body) = body else { continue };
+        let impl_body =
+            extract_function_body(host_src_body, &format!("{fn_name}_impl")).unwrap_or_default();
+        let combined = format!("{body}\n{impl_body}");
+        let anchors = anchors_or_sketch(&b.anchors, &b.body_sketch);
+        let hit = anchors.is_empty() || anchors.iter().any(|a| combined.contains(a.as_str()));
+        r.push(
+            &format!("behavior `{}` body references an anchor", b.name),
+            hit,
+            if hit {
+                "ok".to_string()
+            } else {
+                format!("`{fn_name}` mentions none of {anchors:?} — possible simulated behavior")
+            },
+        );
+        let registered = invoke_body.contains(&format!("commands::{fn_name}"));
+        let reachable = registered || count_non_definition_refs(host_src_body, fn_name) > 0;
+        r.push(
+            &format!("behavior `{}` is reachable", b.name),
+            reachable,
+            if reachable {
+                "ok".to_string()
+            } else {
+                format!(
+                    "nothing calls `{fn_name}` — wire it to its trigger ({} via {})",
+                    b.trigger, b.triggered_by
+                )
+            },
+        );
+        if b.engine == "llm" {
+            let wired = crate::plan::LLM_TEMPLATES
+                .iter()
+                .any(|t| host_src_body.contains(t));
+            r.push(
+                &format!("llm behavior `{}` has an LLM integration in the crate", b.name),
+                wired,
+                "copy templates/integrations/claude_cli (or openrouter) into app/src-tauri/src/integrations/",
+            );
+        }
+    }
+}
+
 fn collect_host_rs_files(worktree: &Path) -> Vec<std::path::PathBuf> {
     let root = worktree.join("app/src-tauri/src");
     let mut out = Vec::new();
@@ -1694,9 +1967,9 @@ fn push_tool_gate(r: &mut StageReport, name: &str, res: Result<ToolRun, String>)
 mod tests {
     use super::*;
     use crate::plan::{
-        AppIdentity, BackendBudget, BackendSection, CanvasReference, CanvasRegion, CommandPlan,
-        EntityPlan, FieldPlan, FrontendBudget, FrontendSection, IterationPlan, PlanStage,
-        RegionDesignNote, TestPlan, TokenOverride,
+        AppIdentity, BackendBudget, BackendSection, BehaviorPlan, CanvasReference, CanvasRegion,
+        CommandPlan, EntityPlan, FieldPlan, FrontendBudget, FrontendSection, IterationPlan,
+        PlanStage, RegionDesignNote, TestPlan, TokenOverride,
     };
 
     #[test]
@@ -1833,6 +2106,19 @@ mod tests {
                     min_commands: 4,
                     min_tests: 3,
                 },
+                behaviors: vec![BehaviorPlan {
+                    name: "stale_projects_archive".into(),
+                    trigger: "timer".into(),
+                    triggered_by: "every 60s".into(),
+                    effect: "projects untouched for 30 days flip to archived".into(),
+                    changes_state: vec!["Project.archived".into()],
+                    engine: "deterministic".into(),
+                    implemented_in: "archive_stale_projects".into(),
+                    body_sketch: "List projects via store.list_projects(), mark stale ones archived, save_project each.".into(),
+                    anchors: vec!["save_project".into()],
+                    motivated_by_regions: vec!["R1".into()],
+                }],
+                static_app: None,
             },
             frontend: FrontendSection {
                 budget: FrontendBudget {
@@ -1852,12 +2138,166 @@ mod tests {
         assert!(report.passed, "{:#?}", report);
     }
 
+    fn failed(report: &StageReport, needle: &str) -> bool {
+        report
+            .checks
+            .iter()
+            .any(|c| c.name.contains(needle) && !c.passed)
+    }
+
+    #[test]
+    fn backend_plan_requires_behaviors_or_a_justified_static_app() {
+        let mut plan = seed_plan();
+        plan.backend.behaviors.clear();
+        let report = validate_backend_plan(&plan);
+        assert!(failed(&report, "plan declares live behaviors"));
+
+        plan.backend.static_app = Some(crate::plan::StaticAppJustification {
+            reason: "n/a".into(),
+        });
+        assert!(failed(
+            &validate_backend_plan(&plan),
+            "plan declares live behaviors"
+        ));
+
+        plan.backend.static_app = Some(crate::plan::StaticAppJustification {
+            reason: "A read-only reference card: nothing on screen changes on its own.".into(),
+        });
+        let report = validate_backend_plan(&plan);
+        assert!(report.passed, "{report:#?}");
+    }
+
+    #[test]
+    fn backend_plan_rejects_vague_behaviors() {
+        let mut plan = seed_plan();
+        let b = &mut plan.backend.behaviors[0];
+        b.trigger = "whenever".into();
+        b.engine = "magic".into();
+        b.effect.clear();
+        let report = validate_backend_plan(&plan);
+        assert!(failed(&report, "every behavior is concrete"));
+
+        let mut plan = seed_plan();
+        let b = &mut plan.backend.behaviors[0];
+        b.trigger = "userAction".into();
+        b.triggered_by = "no_such_command".into();
+        assert!(failed(
+            &validate_backend_plan(&plan),
+            "every behavior is concrete"
+        ));
+        plan.backend.behaviors[0].triggered_by = "create_project".into();
+        assert!(validate_backend_plan(&plan).passed);
+    }
+
+    #[test]
+    fn ai_shaped_request_must_run_a_real_model() {
+        let mut plan = seed_plan();
+        plan.user_text = "An agent manager: assign tasks to agents".into();
+        let report = validate_backend_plan(&plan);
+        assert!(failed(&report, "AI-shaped request runs a real model"));
+
+        // An llm behaviour without an LLM template is still rejected.
+        plan.backend.behaviors[0].engine = "llm".into();
+        let report = validate_backend_plan(&plan);
+        assert!(failed(
+            &report,
+            "llm behaviors pull in an LLM integration template"
+        ));
+
+        plan.templates.use_templates = vec!["claude_cli".into()];
+        let report = validate_backend_plan(&plan);
+        assert!(report.passed, "{report:#?}");
+    }
+
+    #[test]
+    fn e2e_plan_must_cover_every_behavior() {
+        let mut plan = seed_plan();
+        plan.e2e.persistence_smoke = Some(crate::plan::PersistenceSmoke {
+            entity: "Project".into(),
+            expected_directory: "projects".into(),
+        });
+        plan.e2e.scenarios = vec![crate::plan::E2EScenario {
+            id: "crud".into(),
+            title: "crud".into(),
+            steps: vec!["Click".into()],
+            motivated_by_regions: vec![],
+            verifies_behaviors: vec![],
+        }];
+        assert!(failed(
+            &validate_e2e_plan(&plan),
+            "every behavior has a scenario"
+        ));
+        plan.e2e.scenarios[0].verifies_behaviors = vec!["typo_behavior".into()];
+        assert!(failed(
+            &validate_e2e_plan(&plan),
+            "every behavior has a scenario"
+        ));
+        plan.e2e.scenarios[0].verifies_behaviors = vec!["stale_projects_archive".into()];
+        assert!(validate_e2e_plan(&plan).passed);
+    }
+
+    #[test]
+    fn behavior_impl_checks_existence_anchor_and_reachability() {
+        let plan = seed_plan();
+        let invoke = "commands::create_project";
+        let mut r = StageReport::new("t");
+        push_behavior_impl_checks(&mut r, &plan, "fn other() {}", invoke);
+        assert!(failed(&r.finalize(), "implemented in"));
+
+        // Defined and anchored but never called → unreachable.
+        let src = "fn archive_stale_projects(store: &Store) { store.save_project(&p); }";
+        let mut r = StageReport::new("t");
+        push_behavior_impl_checks(&mut r, &plan, src, invoke);
+        let report = r.finalize();
+        assert!(failed(&report, "is reachable"));
+        assert!(!failed(&report, "body references an anchor"));
+
+        // Simulated body (no anchor) is flagged even when reachable.
+        let src =
+            "fn archive_stale_projects() { let _ = 1; }\nfn tick() { archive_stale_projects(); }";
+        let mut r = StageReport::new("t");
+        push_behavior_impl_checks(&mut r, &plan, src, invoke);
+        let report = r.finalize();
+        assert!(failed(&report, "body references an anchor"));
+        assert!(!failed(&report, "is reachable"));
+
+        let src = "fn archive_stale_projects(s: &Store) { s.save_project(&p); }\n\
+                   fn start_timer() { std::thread::spawn(|| archive_stale_projects(&s)); }";
+        let mut r = StageReport::new("t");
+        push_behavior_impl_checks(&mut r, &plan, src, invoke);
+        assert!(r.finalize().passed);
+    }
+
+    #[test]
+    fn llm_behavior_impl_requires_the_integration_in_the_crate() {
+        let mut plan = seed_plan();
+        plan.backend.behaviors[0].engine = "llm".into();
+        let src = "fn archive_stale_projects(s: &Store) { s.save_project(&p); }\nfn t() { archive_stale_projects(); }";
+        let mut r = StageReport::new("t");
+        push_behavior_impl_checks(&mut r, &plan, src, "");
+        assert!(failed(&r.finalize(), "has an LLM integration"));
+        let src = format!("{src}\nmod claude_cli {{}}");
+        let mut r = StageReport::new("t");
+        push_behavior_impl_checks(&mut r, &plan, &src, "");
+        assert!(r.finalize().passed);
+    }
+
+    #[test]
+    fn non_definition_refs_ignore_the_definition_and_longer_idents() {
+        let src = "fn run_turn() {}\nfn run_turn_impl() {}\nfn x() { run_turn(); }";
+        assert_eq!(count_non_definition_refs(src, "run_turn"), 1);
+        assert_eq!(count_non_definition_refs("fn run_turn() {}", "run_turn"), 0);
+    }
+
     #[test]
     fn backend_plan_validator_rejects_orphan_region() {
         let mut plan = seed_plan();
         plan.backend.entities[0].motivated_by_regions.clear();
         for c in &mut plan.backend.commands {
             c.motivated_by_regions.clear();
+        }
+        for b in &mut plan.backend.behaviors {
+            b.motivated_by_regions.clear();
         }
         let report = validate_backend_plan(&plan);
         assert!(!report.passed);

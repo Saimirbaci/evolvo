@@ -40,6 +40,14 @@ Prove the plan's scenarios pass on the real running app inside
 4. If any scenario fails, **fix the app** (edit code in the worktree),
    re-run, and update history. Do not rewrite the scenario to match
    broken behaviour.
+5. For scenarios with `verifiesBehaviors`, the pass condition is the
+   **effect** happening without you causing it directly (a reply from
+   the agent, a task reaching done, a timer-driven update). If the effect
+   never shows, the behavior is broken or not wired — fix the backend or
+   the UI refresh path; never satisfy the step by creating the expected
+   record yourself or by seeding it. For `llm` behaviors, a failure from
+   the model CLI (e.g. `claude` not installed / not logged in) must be
+   surfaced in the UI as an error state, and recorded in history.
 
 ## Do not
 

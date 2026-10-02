@@ -1,0 +1,8 @@
+# No new crates: serde, serde_json and tempfile are already host
+# dependencies of every Evolvo-derived app. Keep these lines if the
+# NewApp's Cargo.toml has dropped any of them.
+#
+# app/src-tauri/Cargo.toml:
+#   serde = { version = "1.0", features = ["derive"] }
+#   serde_json = "1.0"
+#   tempfile = "3.14"

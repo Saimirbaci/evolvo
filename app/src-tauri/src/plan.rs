@@ -303,6 +303,71 @@ pub struct BackendSection {
     pub storage: StoragePlan,
     #[serde(default)]
     pub budget: BackendBudget,
+    /// What the app *does*, not just what it stores: every process that
+    /// changes state the screen shows (agents replying, tasks progressing,
+    /// timers ticking, syncs landing). Commands cover what the user clicks;
+    /// behaviours cover what happens because of it — or on its own. A plan
+    /// with commands but no behaviours ships a data-entry mockup.
+    #[serde(default)]
+    pub behaviors: Vec<BehaviorPlan>,
+    /// Explicit opt-out for apps that genuinely have no live behaviour
+    /// (a static reference page, a pure form). Setting it requires a
+    /// reason and always pauses the job for plan review.
+    #[serde(default)]
+    pub static_app: Option<StaticAppJustification>,
+}
+
+/// Valid `BehaviorPlan::trigger` values.
+pub const BEHAVIOR_TRIGGERS: &[&str] =
+    &["userAction", "timer", "backgroundWorker", "externalEvent"];
+/// Valid `BehaviorPlan::engine` values. `llm` = a real model call through
+/// an LLM integration template (`claude_cli` or `openrouter`).
+pub const BEHAVIOR_ENGINES: &[&str] = &["deterministic", "llm"];
+/// Integration templates that satisfy an `llm` behaviour.
+pub const LLM_TEMPLATES: &[&str] = &["claude_cli", "openrouter"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BehaviorPlan {
+    /// snake_case identifier (e.g. `agent_replies_to_message`).
+    pub name: String,
+    /// One of [`BEHAVIOR_TRIGGERS`]. Strings, not an enum, so one sloppy
+    /// value fails a validator check instead of poisoning plan.json parse.
+    #[serde(default)]
+    pub trigger: String,
+    /// What fires it: the command name for `userAction`, the cadence for
+    /// `timer`, the event source for `externalEvent`.
+    #[serde(default)]
+    pub triggered_by: String,
+    /// One line: the observable effect ("the target agent's reply appears in
+    /// the message bus and its status returns to idle").
+    #[serde(default)]
+    pub effect: String,
+    /// `Entity.field` paths this behaviour writes.
+    #[serde(default)]
+    pub changes_state: Vec<String>,
+    /// One of [`BEHAVIOR_ENGINES`].
+    #[serde(default)]
+    pub engine: String,
+    /// Host function that performs the behaviour. Must exist in the host
+    /// crate and be reachable (registered command, or called from a
+    /// command / worker / timer).
+    #[serde(default)]
+    pub implemented_in: String,
+    #[serde(default)]
+    pub body_sketch: String,
+    /// Identifiers `implemented_in`'s body must contain (same contract as
+    /// `CommandPlan::anchors`).
+    #[serde(default)]
+    pub anchors: Vec<String>,
+    #[serde(default)]
+    pub motivated_by_regions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticAppJustification {
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -587,6 +652,10 @@ pub struct E2EScenario {
     pub steps: Vec<String>,
     #[serde(default)]
     pub motivated_by_regions: Vec<String>,
+    /// Behaviour names (from `backend.behaviors`) whose *effect* this
+    /// scenario asserts — something the user didn't directly type.
+    #[serde(default)]
+    pub verifies_behaviors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -985,6 +1054,9 @@ pub fn owned_region_ids(plan: &IterationPlan) -> Vec<String> {
     for c in &plan.backend.commands {
         ids.extend(c.motivated_by_regions.iter().cloned());
     }
+    for b in &plan.backend.behaviors {
+        ids.extend(b.motivated_by_regions.iter().cloned());
+    }
     for r in &plan.frontend.routes {
         ids.extend(r.motivated_by_regions.iter().cloned());
     }
@@ -997,6 +1069,103 @@ pub fn owned_region_ids(plan: &IterationPlan) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// Words that mark a request as AI-shaped: the drawn app is about agents,
+/// assistants or model output, so its behaviour has to call a real model.
+const AI_SIGNAL_WORDS: &[&str] = &[
+    "agent",
+    "agents",
+    "assistant",
+    "assistants",
+    "ai",
+    "llm",
+    "llms",
+    "chatbot",
+    "copilot",
+    "gpt",
+    "claude",
+    "gemini",
+    "prompt",
+    "prompts",
+];
+
+/// AI-signal words found in the user's own words and the canvas labels.
+/// The planner's own `app.oneLiner` / `domain` count too, since it often
+/// names the domain the drawing implies ("multi-agent orchestration").
+pub fn ai_signals(plan: &IterationPlan) -> Vec<String> {
+    let mut corpus = String::new();
+    corpus.push_str(&plan.user_text);
+    corpus.push(' ');
+    if let Some(v) = &plan.voice_transcript {
+        corpus.push_str(v);
+        corpus.push(' ');
+    }
+    corpus.push_str(&plan.app.one_liner);
+    corpus.push(' ');
+    corpus.push_str(&plan.app.domain);
+    for region in &plan.canvas.regions {
+        for label in &region.labels {
+            corpus.push(' ');
+            corpus.push_str(label);
+        }
+    }
+    let mut found: Vec<String> = corpus
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|w| AI_SIGNAL_WORDS.contains(&w.as_str()))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Phrases in `openQuestions` that mean "I guessed the app can be a
+/// simulation" — a product decision the reviewer must make, not the planner.
+const SIMULATION_PHRASES: &[&str] = &[
+    "simulat",
+    "mock",
+    "fake",
+    "bookkeeping",
+    "placeholder",
+    "stub",
+    "no real",
+    "not real",
+    "hardcod",
+    "hard-cod",
+    "static data",
+    "canned",
+];
+
+/// Open questions that assume a simulated / mocked app.
+pub fn simulation_assumptions(plan: &IterationPlan) -> Vec<String> {
+    plan.open_questions
+        .iter()
+        .filter(|q| {
+            let lower = q.to_ascii_lowercase();
+            SIMULATION_PHRASES.iter().any(|p| lower.contains(p))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Why this plan must stop for human review before implementation, if it
+/// must: the planner opted out of live behaviour, or assumed a simulation.
+pub fn plan_review_required_reason(plan: &IterationPlan) -> Option<String> {
+    if let Some(static_app) = &plan.backend.static_app {
+        return Some(format!(
+            "planner marked the app static (no live behaviour): {}",
+            static_app.reason.trim()
+        ));
+    }
+    let assumptions = simulation_assumptions(plan);
+    if !assumptions.is_empty() {
+        return Some(format!(
+            "planner assumed simulated behaviour — confirm before building: {}",
+            assumptions.join(" | ")
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1487,5 +1656,56 @@ mod tests {
         }"#;
         let plan: IterationPlan = serde_json::from_str(raw).unwrap();
         assert_eq!(plan.stage, PlanStage::BackendPlanned);
+    }
+
+    #[test]
+    fn ai_signals_match_whole_words_only() {
+        let mut plan = IterationPlan {
+            user_text: "A travel planner with a chat ASSISTANT; maintain lists".into(),
+            ..Default::default()
+        };
+        assert_eq!(ai_signals(&plan), vec!["assistant".to_string()]);
+        plan.user_text = "Maintain a paid ledger".into();
+        assert!(
+            ai_signals(&plan).is_empty(),
+            "substrings like 'maintain'/'paid' must not match"
+        );
+        plan.canvas.regions.push(CanvasRegion {
+            id: "R1".into(),
+            bbox: [0.0; 4],
+            stroke_count: 1,
+            dominant_color: None,
+            labels: vec!["Agents".into()],
+        });
+        assert_eq!(ai_signals(&plan), vec!["agents".to_string()]);
+    }
+
+    #[test]
+    fn plan_review_reason_flags_static_apps_and_simulation_guesses() {
+        let mut plan = IterationPlan::default();
+        assert!(plan_review_required_reason(&plan).is_none());
+        plan.open_questions = vec!["Monthly or weekly totals? Assumed monthly.".into()];
+        assert!(plan_review_required_reason(&plan).is_none());
+        plan.open_questions
+            .push("Agents are bookkeeping records — assumed SIMULATED.".into());
+        assert!(plan_review_required_reason(&plan)
+            .unwrap()
+            .contains("simulated behaviour"));
+        plan.backend.static_app = Some(StaticAppJustification {
+            reason: "pure reference page".into(),
+        });
+        assert!(plan_review_required_reason(&plan)
+            .unwrap()
+            .contains("static"));
+    }
+
+    #[test]
+    fn legacy_plans_without_behaviors_still_parse() {
+        let raw = r#"{"app": {"name": "x"}, "canvas": {}, "backend": {"commands": []},
+                      "e2e": {"scenarios": [{"id": "a", "title": "t", "steps": []}]}}"#;
+        let plan: IterationPlan = serde_json::from_str(raw).unwrap();
+        assert!(plan.backend.behaviors.is_empty());
+        assert!(plan.backend.static_app.is_none());
+        assert!(plan.e2e.scenarios[0].verifies_behaviors.is_empty());
     }
 }

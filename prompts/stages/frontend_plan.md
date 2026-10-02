@@ -37,6 +37,13 @@ Mutate `{{PLAN_PATH}}` to fill `frontend`:
   suffix, no prefix — the validator greps for exactly `fn <name>`).
 - `budget`: keep `{minRoutes: 1, minComponents: 2}` unless the plan
   deliberately wants more.
+- **Live state.** For every `backend.behaviors[]` entry, decide how the
+  screen learns about its effect — listen for the backend's
+  `app://changed` event or poll the relevant `list_*` command while
+  something is in flight — and show in-progress / failed states (an
+  agent "thinking…", a task "running", a model error). Name the
+  component that owns that refresh in its `summary`. A UI that only
+  re-reads data after the user's own clicks will hide every behavior.
 
 ### When `templates.useAppShape` is set
 

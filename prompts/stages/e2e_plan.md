@@ -23,7 +23,7 @@ app actually works from the user's point of view.
 
 In `{{PLAN_PATH}}` under `e2e`:
 
-- `scenarios[]` — each `{ id, title, steps[], motivatedByRegions[] }`:
+- `scenarios[]` — each `{ id, title, steps[], motivatedByRegions[], verifiesBehaviors[] }`:
   - `id`: short snake_case (`happy_path_crud`, `delete_restores_empty_state`,
     `persistence_after_reload`).
   - `steps[]`: ordered imperative instructions a human (or the next
@@ -32,6 +32,16 @@ In `{{PLAN_PATH}}` under `e2e`:
     'Buy milk'". No pseudocode, no "test that".
   - Cover at least: (a) the happy CRUD path, (b) one edge case, (c) one
     cross-region interaction (if >1 region).
+  - **Cover every `backend.behaviors[]` entry** by listing its `name` in
+    some scenario's `verifiesBehaviors`. That scenario's steps must assert
+    the behavior's *effect* — something the user did NOT type themselves:
+    "Send 'Summarise the spec' to Coder" → "Expect a new message *from*
+    Coder in the message bus within 60s"; "Assign 'Write tests' to Tester"
+    → "Expect the task to reach Done and show a result". Asserting that the
+    user's own input was stored does not verify a behavior. `llm`
+    behaviors call a real model, so give them a generous wait (≤ 120s)
+    and assert on presence/shape, not exact wording. The validator rejects
+    a plan where any behavior is uncovered.
 
 - `persistenceSmoke` — `{ entity, expectedDirectory }`: the smoke test
   closes the app after creating an entity and reopens it, expecting the

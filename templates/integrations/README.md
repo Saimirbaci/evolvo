@@ -16,6 +16,7 @@ Copy-in modules the NewApp agent can drop into `app/src-tauri/src/integrations/`
 
 | Template | Purpose | Secret model |
 |---|---|---|
+| `claude_cli/` | Real model calls for the app's own behaviour (agents, replies, summaries) via the local `claude` CLI; `LlmEngine` seam + test engine | None — uses the user's Claude Code login |
 | `openrouter/` | Multi-model LLM chat (OpenAI, Anthropic, Gemini, …) with persistent sessions | API key via OS keyring |
 | `google_oauth/` | Google Sign-In via OAuth2 PKCE + loopback redirect; unlocks Gmail / Drive / Calendar | Refresh token in keyring; ships a dev `client_id` the user must swap |
 | `http_json/` | Thin `reqwest` wrapper for arbitrary REST APIs | Bearer token in keyring (optional) |

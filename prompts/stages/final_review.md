@@ -35,6 +35,19 @@ the host Evolvo shell that came before it.
 3. `cargo check --workspace` and `cargo test -p evolvo_desktop --lib`
    pass on the worktree.
 4. The dev-server is running on port `{{PORT}}`.
+5. **Mockup check (load-bearing).** Look at the canvas PNG and list
+   every element that shows changing state (statuses, counts, "running",
+   timestamps, replies, progress, arrows between actors). For each one,
+   trace in the code the path that changes it: UI element → command or
+   event → behavior fn → store write. Record the trace per element in
+   `plan.history` (`{kind: "note", message: "live: <element> ← <fn>"}`).
+   If an element is only ever produced by seed data, hardcoded strings,
+   or a status the user must flip by hand while the drawing implies the
+   app does it, it is a mockup: fix it by implementing the missing
+   behavior (and adding it to `backend.behaviors`), or stop with
+   `STAGE_RESULT: fail: mockup — <element> has no live source`.
+   The validator independently re-checks that every planned behavior
+   still exists, is anchored, and is reachable.
 
 ## Rewrite the project guide for the new app (load-bearing)
 
