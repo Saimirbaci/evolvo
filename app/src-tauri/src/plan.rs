@@ -315,6 +315,12 @@ pub struct BackendSection {
     /// reason and always pauses the job for plan review.
     #[serde(default)]
     pub static_app: Option<StaticAppJustification>,
+    /// Behaviors the planner intends to fake (canned data, a status a human
+    /// flips by hand, no real model call) instead of implementing — each
+    /// entry names the behavior and why. Non-empty always pauses the job:
+    /// shipping a simulation is the user's call, not the planner's.
+    #[serde(default)]
+    pub simulated_behaviors: Vec<String>,
 }
 
 /// Valid `BehaviorPlan::trigger` values.
@@ -1120,21 +1126,30 @@ pub fn ai_signals(plan: &IterationPlan) -> Vec<String> {
     found
 }
 
-/// Phrases in `openQuestions` that mean "I guessed the app can be a
-/// simulation" — a product decision the reviewer must make, not the planner.
+/// Backstop for planners that bury a simulation guess in `openQuestions`
+/// instead of `backend.simulatedBehaviors`. Deliberately narrow: only
+/// wording that means *the app's behaviour is faked*. Generic words such as
+/// "placeholder", "stub" or "hardcoded" are excluded — they routinely
+/// describe legitimate assumptions ("generic placeholder thresholds",
+/// "hardcoded currency") and caused false pauses.
 const SIMULATION_PHRASES: &[&str] = &[
-    "simulat",
-    "mock",
-    "fake",
-    "bookkeeping",
-    "placeholder",
-    "stub",
-    "no real",
-    "not real",
-    "hardcod",
-    "hard-cod",
-    "static data",
-    "canned",
+    "simulated",
+    "simulate ",
+    "simulation",
+    "bookkeeping only",
+    "bookkeeping records",
+    "mocked",
+    "mock data",
+    "mock behavio",
+    "fake data",
+    "fake repl",
+    "faked",
+    "no real model",
+    "no real llm",
+    "no real execution",
+    "not actually run",
+    "canned repl",
+    "canned respons",
 ];
 
 /// Open questions that assume a simulated / mocked app.
@@ -1156,6 +1171,19 @@ pub fn plan_review_required_reason(plan: &IterationPlan) -> Option<String> {
         return Some(format!(
             "planner marked the app static (no live behaviour): {}",
             static_app.reason.trim()
+        ));
+    }
+    let declared: Vec<&str> = plan
+        .backend
+        .simulated_behaviors
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !declared.is_empty() {
+        return Some(format!(
+            "planner wants to simulate behavior instead of building it — confirm before building: {}",
+            declared.join(" | ")
         ));
     }
     let assumptions = simulation_assumptions(plan);
@@ -1697,6 +1725,36 @@ mod tests {
         assert!(plan_review_required_reason(&plan)
             .unwrap()
             .contains("static"));
+    }
+
+    #[test]
+    fn ordinary_assumptions_do_not_trigger_plan_review() {
+        let plan = IterationPlan {
+            open_questions: vec![
+                "Auditorium compliance thresholds are generic placeholders, not a specific jurisdiction's code — which code should apply?".into(),
+                "Currency hardcoded to a single currency (integer cents). Correct?".into(),
+                "Stub the PDF export for now? Assumed a CSV export instead.".into(),
+                "Matches the mockup layout — sidebar on the left. Correct?".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(plan_review_required_reason(&plan), None);
+    }
+
+    #[test]
+    fn declared_simulated_behaviors_always_trigger_plan_review() {
+        let mut plan = IterationPlan::default();
+        plan.backend.simulated_behaviors = vec!["   ".into()];
+        assert_eq!(
+            plan_review_required_reason(&plan),
+            None,
+            "blank entries ignored"
+        );
+        plan.backend.simulated_behaviors =
+            vec!["agent replies: canned text until a model is chosen".into()];
+        assert!(plan_review_required_reason(&plan)
+            .unwrap()
+            .contains("simulate behavior"));
     }
 
     #[test]

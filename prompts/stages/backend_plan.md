@@ -642,10 +642,15 @@ the plan-review pause; a wrong guess corrected here costs a re-plan, not a
 full implementation run. Do NOT pad the list — an empty array means
 "nothing was ambiguous" and that is a fine answer.
 
-**A guess that the app can be simulated is not yours to make.** If a
-question says the behavior is simulated / mocked / bookkeeping-only /
-placeholder, the pipeline automatically pauses the job for the user to
-decide before anything is built. Prefer planning the real behavior.
+**A guess that the app can be simulated is not yours to make.** Plan the
+real behavior. If you still believe some behavior must be faked for now
+(canned replies, a status a human flips by hand, no real model call),
+list each one in `backend.simulatedBehaviors` as
+`"<behavior>: <what is faked and why>"` — the pipeline then pauses the
+job for the user to decide before anything is built. Don't hide that
+decision inside `openQuestions`. Ordinary assumptions (thresholds,
+currency, layout, scope) belong in `openQuestions` and do NOT pause the
+job.
 
 ## When finished
 

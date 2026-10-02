@@ -2119,6 +2119,7 @@ mod tests {
                     motivated_by_regions: vec!["R1".into()],
                 }],
                 static_app: None,
+                simulated_behaviors: vec![],
             },
             frontend: FrontendSection {
                 budget: FrontendBudget {
