@@ -11,6 +11,7 @@ pub mod plan;
 pub mod proc;
 pub mod promotion;
 pub mod runner;
+pub mod sketch;
 pub mod stages;
 pub mod state;
 pub mod store;

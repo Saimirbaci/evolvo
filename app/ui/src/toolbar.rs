@@ -3,6 +3,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{Element, PointerEvent};
 
 use crate::canvas::{CanvasController, DrawingTool};
+use crate::sketch::{SketchPrompt, SketchState};
 
 const SWATCHES: &[(&str, &str)] = &[
     ("Red", "#ef4444"),
@@ -21,6 +22,7 @@ enum Popover {
     Tool,
     Color,
     More,
+    Sketch,
 }
 
 #[component]
@@ -28,6 +30,7 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
     let offset: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let drag_origin: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
     let open: RwSignal<Option<Popover>> = RwSignal::new(None);
+    let sketch_state = SketchState::new();
 
     let toggle = move |which: Popover| {
         open.update(|v| {
@@ -91,7 +94,7 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
                 aria-label="Undo"
                 disabled={
                     let ctrl = controller.clone();
-                    move || !ctrl.history.with(|h| h.can_undo())
+                    move || ctrl.sketch_busy.get() || !ctrl.history.with(|h| h.can_undo())
                 }
                 on:click={
                     let ctrl = controller.clone();
@@ -107,7 +110,7 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
                 aria-label="Redo"
                 disabled={
                     let ctrl = controller.clone();
-                    move || !ctrl.history.with(|h| h.can_redo())
+                    move || ctrl.sketch_busy.get() || !ctrl.history.with(|h| h.can_redo())
                 }
                 on:click={
                     let ctrl = controller.clone();
@@ -115,6 +118,20 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
                 }
             >
                 "↷"
+            </button>
+
+            <button
+                class="pill-btn pill-sketch"
+                title="Describe a sketch with AI (experimental)"
+                aria-label="Describe a sketch with AI"
+                class:active=move || open.get() == Some(Popover::Sketch)
+                class:busy={
+                    let ctrl = controller.clone();
+                    move || ctrl.sketch_busy.get()
+                }
+                on:click=move |_| toggle(Popover::Sketch)
+            >
+                "✦"
             </button>
 
             <button
@@ -139,6 +156,13 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
                     Some(Popover::Color) => view! {
                         <ColorPicker
                             controller=ctrl.clone()
+                            close=move || open.set(None)
+                        />
+                    }.into_any(),
+                    Some(Popover::Sketch) => view! {
+                        <SketchPrompt
+                            controller=ctrl.clone()
+                            state=sketch_state
                             close=move || open.set(None)
                         />
                     }.into_any(),

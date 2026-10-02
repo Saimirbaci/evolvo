@@ -715,3 +715,36 @@ mod design_contract_tests {
         assert_eq!(d.screens.len(), 1);
     }
 }
+
+/// Experimental AI sketch request (`generate_sketch` command). `shapes` are
+/// the canvas annotations in `Shape::to_json` form; ids are array indices.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SketchRequest {
+    pub prompt: String,
+    pub shapes: Vec<serde_json::Value>,
+    pub selected: Vec<usize>,
+    pub canvas_width: f64,
+    pub canvas_height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SketchOp {
+    pub op: String,
+    #[serde(default)]
+    pub id: Option<usize>,
+    #[serde(default)]
+    pub shape: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SketchResponse {
+    #[serde(default)]
+    pub ops: Vec<SketchOp>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+}

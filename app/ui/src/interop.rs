@@ -8,8 +8,8 @@ use web_sys::window;
 use crate::types::{
     AgentAvailability, AppHealth, DelegationSummary, DesignSummary, EditableDesign,
     EditableFeedback, FeedbackRecord, LineageArtifactsChanged, LineageJobRecord,
-    LineageJobUpserted, LocalDelegateAvailability, PreviewSummary, SaveDesignPayload, StageState,
-    SubmitFeedbackPayload,
+    LineageJobUpserted, LocalDelegateAvailability, PreviewSummary, SaveDesignPayload,
+    SketchRequest, SketchResponse, StageState, SubmitFeedbackPayload,
 };
 
 pub const LINEAGE_JOB_UPSERTED_EVENT: &str = "lineage://job-upserted";
@@ -241,6 +241,12 @@ pub async fn clear_design_draft() -> Result<bool, String> {
 
 pub async fn capture_window_png() -> Result<String, String> {
     invoke_command("capture_window_png").await
+}
+
+/// Experimental: describe a sketch (or a change to the current one) and get
+/// back add/update/delete ops for the canvas.
+pub async fn generate_sketch(request: &SketchRequest) -> Result<SketchResponse, String> {
+    invoke_command_with_args("generate_sketch", request).await
 }
 
 pub async fn list_job_stages(id: &str) -> Result<Vec<StageState>, String> {

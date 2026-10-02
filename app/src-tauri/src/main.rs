@@ -90,6 +90,7 @@ fn main() {
             commands::load_design_draft,
             commands::delete_design,
             commands::clear_design_draft,
+            commands::generate_sketch,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Evolvo desktop app");
