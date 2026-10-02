@@ -1,5 +1,6 @@
 mod app;
 mod canvas;
+mod design_bar;
 mod feedback_panel;
 mod interop;
 mod shell;

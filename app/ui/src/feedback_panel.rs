@@ -9,6 +9,7 @@ use web_sys::{
 };
 
 use crate::canvas::{CanvasController, History, Shape};
+use crate::design_bar::{DesignBar, DesignBindings};
 use crate::interop;
 use crate::types::{
     AgentAvailability, AgentKind, EditableFeedbackScreen, FeedbackRecord, FeedbackScreenPayload,
@@ -25,19 +26,19 @@ pub struct FeedbackRevisionRequest {
 }
 
 #[derive(Clone)]
-struct StoryboardScreenDraft {
-    id: String,
-    name: String,
-    description: String,
-    intended_route: String,
-    shapes: Vec<Shape>,
-    history: History,
-    pasted_base64: Vec<String>,
-    annotation_data_url: Option<String>,
+pub(crate) struct StoryboardScreenDraft {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) intended_route: String,
+    pub(crate) shapes: Vec<Shape>,
+    pub(crate) history: History,
+    pub(crate) pasted_base64: Vec<String>,
+    pub(crate) annotation_data_url: Option<String>,
 }
 
 impl StoryboardScreenDraft {
-    fn empty(number: usize, route: String) -> Self {
+    pub(crate) fn empty(number: usize, route: String) -> Self {
         Self {
             id: format!("screen-{number}"),
             name: format!("Screen {number}"),
@@ -50,11 +51,11 @@ impl StoryboardScreenDraft {
         }
     }
 
-    fn has_signal(&self) -> bool {
+    pub(crate) fn has_signal(&self) -> bool {
         !self.shapes.is_empty() || !self.pasted_base64.is_empty()
     }
 
-    fn from_editable(screen: EditableFeedbackScreen) -> Self {
+    pub(crate) fn from_editable(screen: EditableFeedbackScreen) -> Self {
         let (shapes, pasted_base64) = CanvasController::restore_annotations(
             &screen.annotations,
             &screen.pasted_image_data_urls,
@@ -88,7 +89,7 @@ fn save_active_screen(
     });
 }
 
-fn load_active_screen(controller: &CanvasController, screen: &StoryboardScreenDraft) {
+pub(crate) fn load_active_screen(controller: &CanvasController, screen: &StoryboardScreenDraft) {
     // `load` also re-derives the thumbnails and clears any in-flight drag
     // or inline text edit that belonged to the previous screen.
     controller.load(screen.shapes.clone(), screen.history.clone());
@@ -665,6 +666,18 @@ pub fn FeedbackPanel(
             </div>
 
             <div class="panel-body">
+                <DesignBar
+                    controller=controller.clone()
+                    bindings=DesignBindings {
+                        screens,
+                        active_screen,
+                        next_screen_number,
+                        text,
+                        feedback_type,
+                        route,
+                        revision_parent,
+                    }
+                />
                 {move || {
                     let ctrl = revision_ctrl.clone();
                     let voice = revision_voice.clone();
@@ -1188,7 +1201,7 @@ async fn load_image(src: &str) -> Option<HtmlImageElement> {
     Some(img)
 }
 
-fn window_size() -> (u32, u32) {
+pub(crate) fn window_size() -> (u32, u32) {
     let Some(win) = window() else {
         return (0, 0);
     };

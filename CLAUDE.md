@@ -20,6 +20,8 @@ Evolvo is a **Tauri 2** desktop app with a **Leptos 0.8 (CSR / WASM)** frontend.
 ~/.evolvo/evolvo_workspace/
 ├── feedback/           # {id}.json — FeedbackRecord
 ├── lineage_jobs/       # {id}.json — LineageJobRecord
+├── designs/            # {id}.json — DesignRecord (saved canvas designs; `draft.json` = autosave)
+│   └── {id}.assets/    # content-addressed images (<sha256-prefix>.png) for that design
 └── attachments/{feedback_id}/
     ├── canvas.png      # optional canvas screenshot
     ├── screen-NN.png   # ordered NewApp storyboard screens
@@ -74,6 +76,7 @@ See `app/src-tauri/src/commands.rs` and `lib.rs::run()` / `main.rs` for registra
 - `list_lineage_jobs` / `load_lineage_job`
 - `approve_lineage_job` / `reject_lineage_job` / `append_lineage_note`
 - `open_workspace_path`
+- `save_design` / `save_design_draft` / `list_designs` / `load_design` / `load_design_draft` / `delete_design` / `clear_design_draft` — saved canvas designs (logic in `designs.rs`, UI in `ui/src/design_bar.rs`). A design captures every storyboard screen (vector annotations + pasted images), the description and the feedback type; `load_design` returns screens in the same `EditableFeedbackScreen` shape as a feedback revision. Ids are host-minted `design-<ms>` plus the reserved `draft` (validated by `store::is_valid_design_id` before any path is built). Images are content-addressed and written before the record, unreferenced ones are collected after — a crash never leaves a record pointing at a missing image. The panel autosaves the draft (1.5s debounce) and restores it on the next launch if the panel is blank; it only clears the draft when the startup load succeeded.
 
 Every new command MUST be registered in the `invoke_handler` in `src-tauri/src/lib.rs` AND mirrored in `app/ui/src/interop.rs`.
 

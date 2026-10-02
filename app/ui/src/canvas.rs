@@ -552,6 +552,46 @@ impl CanvasController {
         })
     }
 
+    /// Small PNG preview of the current annotations (no selection chrome),
+    /// at most `max_width` px wide, as raw base64 (no `data:` prefix).
+    pub fn thumbnail_png_base64(&self, max_width: f64) -> Option<String> {
+        self.canvas_node.with_value(|c| {
+            let canvas = c.as_ref()?;
+            let (w, h) = (canvas.width() as f64, canvas.height() as f64);
+            if w < 1.0 || h < 1.0 {
+                return None;
+            }
+            render_shapes(canvas, self, None, false);
+            let scale = (max_width / w).min(1.0);
+            let thumb = window()?
+                .document()?
+                .create_element("canvas")
+                .ok()?
+                .dyn_into::<HtmlCanvasElement>()
+                .ok()?;
+            thumb.set_width((w * scale).round().max(1.0) as u32);
+            thumb.set_height((h * scale).round().max(1.0) as u32);
+            let drawn = canvas_context(&thumb).and_then(|ctx| {
+                // White backdrop: the live canvas is transparent by design,
+                // but a preview card needs to be legible on any theme.
+                ctx.set_fill_style_str("#ffffff");
+                ctx.fill_rect(0.0, 0.0, w * scale, h * scale);
+                ctx.draw_image_with_html_canvas_element_and_dw_and_dh(
+                    canvas,
+                    0.0,
+                    0.0,
+                    w * scale,
+                    h * scale,
+                )
+                .ok()
+            });
+            render_all(canvas, self);
+            drawn?;
+            let url = thumb.to_data_url_with_type("image/png").ok()?;
+            url.split_once(',').map(|(_, b64)| b64.to_string())
+        })
+    }
+
     pub fn annotations_json(&self) -> Vec<serde_json::Value> {
         Self::annotations_for_shapes(&self.shapes.get_untracked())
     }

@@ -6,9 +6,10 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
 use crate::types::{
-    AgentAvailability, AppHealth, DelegationSummary, EditableFeedback, FeedbackRecord,
-    LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted, LocalDelegateAvailability,
-    PreviewSummary, StageState, SubmitFeedbackPayload,
+    AgentAvailability, AppHealth, DelegationSummary, DesignSummary, EditableDesign,
+    EditableFeedback, FeedbackRecord, LineageArtifactsChanged, LineageJobRecord,
+    LineageJobUpserted, LocalDelegateAvailability, PreviewSummary, SaveDesignPayload, StageState,
+    SubmitFeedbackPayload,
 };
 
 pub const LINEAGE_JOB_UPSERTED_EVENT: &str = "lineage://job-upserted";
@@ -210,6 +211,34 @@ pub async fn open_external_url(url: &str) -> Result<(), String> {
 /// feedback panel to composite annotations onto the real page view, since
 /// the canvas overlay itself is transparent and would otherwise leave the
 /// submitted screenshot without any page context.
+pub async fn save_design(payload: &SaveDesignPayload) -> Result<DesignSummary, String> {
+    invoke_command_with_args("save_design", payload).await
+}
+
+pub async fn save_design_draft(payload: &SaveDesignPayload) -> Result<DesignSummary, String> {
+    invoke_command_with_args("save_design_draft", payload).await
+}
+
+pub async fn list_designs() -> Result<Vec<DesignSummary>, String> {
+    invoke_command("list_designs").await
+}
+
+pub async fn load_design(id: &str) -> Result<Option<EditableDesign>, String> {
+    invoke_command_with_args("load_design", &IdArg { id }).await
+}
+
+pub async fn load_design_draft() -> Result<Option<EditableDesign>, String> {
+    invoke_command("load_design_draft").await
+}
+
+pub async fn delete_design(id: &str) -> Result<bool, String> {
+    invoke_command_with_args("delete_design", &IdArg { id }).await
+}
+
+pub async fn clear_design_draft() -> Result<bool, String> {
+    invoke_command("clear_design_draft").await
+}
+
 pub async fn capture_window_png() -> Result<String, String> {
     invoke_command("capture_window_png").await
 }

@@ -609,3 +609,109 @@ pub struct RegionDesignNote {
     pub region: String,
     pub interpretation: String,
 }
+
+// --- Saved canvas designs (mirror of host types.rs) ----------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDesignPayload {
+    pub id: Option<String>,
+    pub name: String,
+    pub feedback_type: Option<FeedbackType>,
+    pub feedback_text: String,
+    pub screens: Vec<SaveDesignScreenPayload>,
+    pub thumbnail_png_base64: Option<String>,
+    pub source_design_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDesignScreenPayload {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub intended_route: String,
+    pub annotations: Vec<serde_json::Value>,
+    pub pasted_images_base64: Vec<String>,
+    pub window_width: u32,
+    pub window_height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub screen_count: usize,
+    #[serde(default)]
+    pub shape_count: usize,
+    #[serde(default)]
+    pub thumbnail_data_url: Option<String>,
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableDesign {
+    pub summary: DesignSummary,
+    #[serde(default)]
+    pub source_design_id: Option<String>,
+    #[serde(default)]
+    pub feedback_type: Option<FeedbackType>,
+    #[serde(default)]
+    pub feedback_text: String,
+    #[serde(default)]
+    pub screens: Vec<EditableFeedbackScreen>,
+}
+
+#[cfg(test)]
+mod design_contract_tests {
+    use super::*;
+
+    /// Wire contract with the host's `SaveDesignPayload` — the host has the
+    /// mirror test (`types::tests::save_design_payload_wire_contract`)
+    /// deserialising this exact literal.
+    const SAVE_DESIGN_JSON: &str = r#"{"id":null,"name":"Login","feedbackType":"new_app","feedbackText":"t","screens":[{"id":"screen-1","name":"Home","description":"d","intendedRoute":"/","annotations":[{"type":"rect"}],"pastedImagesBase64":["AAAA"],"windowWidth":1280,"windowHeight":800}],"thumbnailPngBase64":null,"sourceDesignId":"design-1"}"#;
+
+    #[test]
+    fn save_design_payload_serialises_to_the_host_contract() {
+        let payload = SaveDesignPayload {
+            id: None,
+            name: "Login".into(),
+            feedback_type: Some(FeedbackType::NewApp),
+            feedback_text: "t".into(),
+            screens: vec![SaveDesignScreenPayload {
+                id: "screen-1".into(),
+                name: "Home".into(),
+                description: "d".into(),
+                intended_route: "/".into(),
+                annotations: vec![serde_json::json!({"type": "rect"})],
+                pasted_images_base64: vec!["AAAA".into()],
+                window_width: 1280,
+                window_height: 800,
+            }],
+            thumbnail_png_base64: None,
+            source_design_id: Some("design-1".into()),
+        };
+        let ours: serde_json::Value = serde_json::to_value(&payload).unwrap();
+        let contract: serde_json::Value = serde_json::from_str(SAVE_DESIGN_JSON).unwrap();
+        assert_eq!(ours, contract);
+    }
+
+    #[test]
+    fn editable_design_deserialises_host_output() {
+        let raw = r#"{"summary":{"id":"design-1","name":"A","screenCount":1,"shapeCount":2,
+            "thumbnailDataUrl":null,"createdAtUnixMs":1,"updatedAtUnixMs":2},
+            "sourceDesignId":null,"feedbackType":"bug","feedbackText":"",
+            "screens":[{"id":"screen-1","name":"S","description":"","intendedRoute":"/",
+            "annotations":[],"pastedImageDataUrls":[],"windowWidth":1,"windowHeight":1}]}"#;
+        let d: EditableDesign = serde_json::from_str(raw).unwrap();
+        assert_eq!(d.summary.shape_count, 2);
+        assert_eq!(d.feedback_type, Some(FeedbackType::Bug));
+        assert_eq!(d.screens.len(), 1);
+    }
+}

@@ -3,12 +3,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::fsutil;
-use crate::types::{FeedbackRecord, LineageJobRecord};
+use crate::types::{DesignRecord, FeedbackRecord, LineageJobRecord};
 
 const WORKSPACE_DIR_NAME: &str = "evolvo_workspace";
 const FEEDBACK_DIR: &str = "feedback";
 const SANDBOX_JOBS_DIR: &str = "lineage_jobs";
 const ATTACHMENTS_DIR: &str = "attachments";
+const DESIGNS_DIR: &str = "designs";
+/// Per-design asset directory suffix: `designs/<id>.assets/`. Not a
+/// `.json` file, so `list_json_entities` never walks it as an entity.
+const DESIGN_ASSETS_SUFFIX: &str = ".assets";
 const ITERATION_FILE: &str = "iteration.json";
 /// Sibling directory (inside each entity dir) that unparseable JSON files
 /// get moved into instead of being silently skipped. Not a `.json` file
@@ -106,12 +110,17 @@ impl WorkspaceLayout {
         self.root.join(ATTACHMENTS_DIR).join(id)
     }
 
+    pub fn designs_dir(&self) -> PathBuf {
+        self.root.join(DESIGNS_DIR)
+    }
+
     pub fn directories(&self) -> Vec<PathBuf> {
         vec![
             self.root.clone(),
             self.feedback_dir(),
             self.lineage_jobs_dir(),
             self.root.join(ATTACHMENTS_DIR),
+            self.designs_dir(),
         ]
     }
 }
@@ -148,6 +157,7 @@ impl Store {
         // otherwise invisible clutter that accumulates forever.
         sweep_tmp_files(&self.layout.feedback_dir());
         sweep_tmp_files(&self.layout.lineage_jobs_dir());
+        sweep_tmp_files(&self.layout.designs_dir());
         Ok(())
     }
 
@@ -280,6 +290,127 @@ impl Store {
         Ok(safe)
     }
 
+    // --- Saved canvas designs ------------------------------------------
+    //
+    // `designs/<id>.json` holds the record; `designs/<id>.assets/` holds its
+    // images under content-addressed names (`<sha256-prefix>.<ext>`). An
+    // unchanged image is never rewritten (cheap autosave), and the record is
+    // only written after every asset it references exists — a crash at any
+    // point leaves the previous record and its assets intact. Unreferenced
+    // assets are collected after the new record lands.
+
+    fn design_path(&self, id: &str) -> Result<PathBuf, StoreError> {
+        ensure_design_id(id)?;
+        Ok(self.layout.designs_dir().join(format!("{id}.json")))
+    }
+
+    fn design_assets_dir(&self, id: &str) -> Result<PathBuf, StoreError> {
+        ensure_design_id(id)?;
+        Ok(self
+            .layout
+            .designs_dir()
+            .join(format!("{id}{DESIGN_ASSETS_SUFFIX}")))
+    }
+
+    pub fn save_design(&self, rec: &DesignRecord) -> Result<(), StoreError> {
+        self.init_workspace()?;
+        let json = serde_json::to_string_pretty(rec)?;
+        write_atomic(&self.design_path(&rec.id)?, json.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn load_design(&self, id: &str) -> Result<Option<DesignRecord>, StoreError> {
+        let path = self.design_path(id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    pub fn list_designs(&self) -> Result<Vec<DesignRecord>, StoreError> {
+        list_json_entities::<DesignRecord>(&self.layout.designs_dir())
+    }
+
+    pub fn delete_design(&self, id: &str) -> Result<bool, StoreError> {
+        let path = self.design_path(id)?;
+        let assets = self.design_assets_dir(id)?;
+        let existed = path.exists();
+        if existed {
+            fs::remove_file(&path)?;
+        }
+        if assets.exists() {
+            fs::remove_dir_all(&assets)?;
+        }
+        Ok(existed)
+    }
+
+    /// Store one design image; returns its content-addressed filename.
+    pub fn write_design_asset(
+        &self,
+        design_id: &str,
+        bytes: &[u8],
+        extension: &str,
+    ) -> Result<String, StoreError> {
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(StoreError::AttachmentTooLarge {
+                filename: format!("design image .{extension}"),
+                size: bytes.len(),
+                limit: MAX_ATTACHMENT_BYTES,
+            });
+        }
+        let ext = sanitise_filename(extension);
+        if ext.is_empty() {
+            return Err("design asset needs an extension".into());
+        }
+        let dir = self.design_assets_dir(design_id)?;
+        fsutil::create_dir_all_private(&dir)?;
+        let filename = format!("{}.{ext}", content_hash(bytes));
+        let path = dir.join(&filename);
+        if !path.exists() {
+            write_atomic(&path, bytes)?;
+        }
+        Ok(filename)
+    }
+
+    pub fn read_design_asset(
+        &self,
+        design_id: &str,
+        filename: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let safe = sanitise_filename(filename);
+        if safe.is_empty() {
+            return Ok(None);
+        }
+        let path = self.design_assets_dir(design_id)?.join(&safe);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read(&path)?))
+    }
+
+    /// Delete asset files the current record no longer references (and
+    /// stale `.tmp` debris). Best-effort per file: a failed delete only
+    /// leaves clutter, never breaks the design.
+    pub fn collect_design_assets(
+        &self,
+        design_id: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<usize, StoreError> {
+        let dir = self.design_assets_dir(design_id)?;
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for entry in fs::read_dir(&dir)?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !keep.contains(&name) && fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn read_attachment(
         &self,
         feedback_id: &str,
@@ -408,6 +539,32 @@ fn sweep_tmp_files(dir: &Path) {
             }
         }
     }
+}
+
+/// Design ids are minted by the host (`design-<unix_ms>`) plus the one
+/// reserved autosave slot (`draft`). Anything else is refused before it
+/// can become a path component.
+pub fn is_valid_design_id(id: &str) -> bool {
+    id == crate::types::DESIGN_DRAFT_ID
+        || id.strip_prefix("design-").is_some_and(|rest| {
+            !rest.is_empty() && rest.len() <= 20 && rest.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+fn ensure_design_id(id: &str) -> Result<(), StoreError> {
+    if is_valid_design_id(id) {
+        Ok(())
+    } else {
+        Err(StoreError::Other(format!("invalid design id: {id:?}")))
+    }
+}
+
+/// First 32 hex chars of the SHA-256 of `bytes` — a collision-safe,
+/// filesystem-safe asset name.
+fn content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 fn sanitise_filename(name: &str) -> String {

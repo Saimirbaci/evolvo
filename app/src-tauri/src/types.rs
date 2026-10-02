@@ -835,6 +835,37 @@ pub struct AppHealth {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn save_design_payload_wire_contract() {
+        // Exact JSON the UI's SaveDesignPayload serialises to (pinned by
+        // ui/src/types.rs::design_contract_tests).
+        let raw = r#"{"id":null,"name":"Login","feedbackType":"new_app","feedbackText":"t","screens":[{"id":"screen-1","name":"Home","description":"d","intendedRoute":"/","annotations":[{"type":"rect"}],"pastedImagesBase64":["AAAA"],"windowWidth":1280,"windowHeight":800}],"thumbnailPngBase64":null,"sourceDesignId":"design-1"}"#;
+        let p: SaveDesignPayload = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.name, "Login");
+        assert_eq!(p.feedback_type, Some(FeedbackType::NewApp));
+        assert_eq!(p.screens[0].intended_route, "/");
+        assert_eq!(p.screens[0].pasted_images_base64, vec!["AAAA".to_string()]);
+        assert_eq!(p.source_design_id.as_deref(), Some("design-1"));
+        let summary = serde_json::to_value(DesignSummary {
+            id: "design-1".into(),
+            name: "A".into(),
+            screen_count: 1,
+            shape_count: 2,
+            thumbnail_data_url: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        })
+        .unwrap();
+        for key in [
+            "screenCount",
+            "shapeCount",
+            "thumbnailDataUrl",
+            "updatedAtUnixMs",
+        ] {
+            assert!(summary.get(key).is_some(), "{key}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1047,4 +1078,126 @@ mod tests {
         assert_eq!(back.revision.number, 1);
         assert!(back.revision.parent_feedback_id.is_none());
     }
+}
+
+// --- Saved canvas designs -------------------------------------------------
+
+/// Reserved id of the single autosaved draft (hidden from the design list).
+pub const DESIGN_DRAFT_ID: &str = "draft";
+
+/// A saved canvas design: every storyboard screen (vector annotations +
+/// pasted images by reference), plus the description and feedback type the
+/// user had selected, so reopening it restores the panel exactly. Portable
+/// (I-P4): image references are filenames inside the design's own asset
+/// directory, never host paths.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub feedback_type: Option<FeedbackType>,
+    #[serde(default)]
+    pub feedback_text: String,
+    #[serde(default)]
+    pub screens: Vec<DesignScreenRecord>,
+    /// Asset filename of a small preview PNG, if one was provided.
+    #[serde(default)]
+    pub thumbnail: Option<String>,
+    /// For the autosaved draft: the saved design it is an unsaved edit of,
+    /// so reopening after a restart still saves back to the right design.
+    #[serde(default)]
+    pub source_design_id: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignScreenRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    /// Asset filenames, in the order `annotations[*].assetIndex` refers to.
+    #[serde(default)]
+    pub pasted_images: Vec<String>,
+    #[serde(default)]
+    pub window_width: u32,
+    #[serde(default)]
+    pub window_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDesignPayload {
+    /// `None` creates a new design; `Some(id)` overwrites that design.
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub feedback_type: Option<FeedbackType>,
+    #[serde(default)]
+    pub feedback_text: String,
+    #[serde(default)]
+    pub screens: Vec<SaveDesignScreenPayload>,
+    #[serde(default)]
+    pub thumbnail_png_base64: Option<String>,
+    #[serde(default)]
+    pub source_design_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDesignScreenPayload {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_images_base64: Vec<String>,
+    #[serde(default)]
+    pub window_width: u32,
+    #[serde(default)]
+    pub window_height: u32,
+}
+
+/// List-view row: enough to render a picker without loading images.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignSummary {
+    pub id: String,
+    pub name: String,
+    pub screen_count: usize,
+    pub shape_count: usize,
+    #[serde(default)]
+    pub thumbnail_data_url: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+/// A design hydrated for the editor: screens carry image data URLs in the
+/// same shape as a feedback revision, so the UI restores both the same way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableDesign {
+    pub summary: DesignSummary,
+    #[serde(default)]
+    pub source_design_id: Option<String>,
+    #[serde(default)]
+    pub feedback_type: Option<FeedbackType>,
+    #[serde(default)]
+    pub feedback_text: String,
+    pub screens: Vec<EditableFeedbackScreen>,
 }

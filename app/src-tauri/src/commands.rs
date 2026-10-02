@@ -1109,6 +1109,88 @@ pub fn append_lineage_note(
         .map_err(store_error)
 }
 
+// --- Saved canvas designs (logic in `designs.rs`) -------------------------
+// Async + spawn_blocking: saves decode and write images, which must not
+// stall the IPC/main thread while the user keeps drawing.
+
+async fn run_design<T: Send + 'static>(
+    store: crate::store::Store,
+    f: impl FnOnce(&crate::store::Store) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || f(&store))
+        .await
+        .map_err(|e| format!("design worker failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn save_design(
+    state: State<'_, AppState>,
+    payload: crate::types::SaveDesignPayload,
+) -> Result<crate::types::DesignSummary, String> {
+    run_design(state.store(), move |s| {
+        crate::designs::save_design_impl(s, payload)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn save_design_draft(
+    state: State<'_, AppState>,
+    payload: crate::types::SaveDesignPayload,
+) -> Result<crate::types::DesignSummary, String> {
+    run_design(state.store(), move |s| {
+        crate::designs::save_design_draft_impl(s, payload)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_designs(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::types::DesignSummary>, String> {
+    run_design(state.store(), crate::designs::list_designs_impl).await
+}
+
+#[tauri::command]
+pub async fn load_design(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<Option<crate::types::EditableDesign>, String> {
+    run_design(state.store(), move |s| {
+        crate::designs::load_design_impl(s, &payload.id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn load_design_draft(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::types::EditableDesign>, String> {
+    run_design(state.store(), |s| {
+        crate::designs::load_design_impl(s, crate::types::DESIGN_DRAFT_ID)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_design(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<bool, String> {
+    run_design(state.store(), move |s| {
+        crate::designs::delete_design_impl(s, &payload.id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn clear_design_draft(state: State<'_, AppState>) -> Result<bool, String> {
+    run_design(state.store(), |s| {
+        crate::designs::delete_design_impl(s, crate::types::DESIGN_DRAFT_ID)
+    })
+    .await
+}
+
 #[tauri::command]
 pub fn open_workspace_path(state: State<'_, AppState>) -> Result<String, String> {
     Ok(state.workspace_root_display())
