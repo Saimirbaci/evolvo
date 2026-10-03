@@ -135,6 +135,7 @@ pub fn seed_plan_from_feedback(
         e2e: Default::default(),
         history: Vec::new(),
         open_questions: Vec::new(),
+        answered_questions: Vec::new(),
     };
     save_plan(job_dir, &plan)?;
     Ok(plan)
@@ -772,6 +773,16 @@ pub fn run_pipeline<D: StageDispatcher>(
                 }
             }
         }
+        if stage == StageKind::BackendPlan && plan_settled_by_answers(store, job_dir, job_id) {
+            // "Answer & re-plan": every question the reviewer was asked now
+            // has an answer and nothing else needs a decision — continue.
+            if engine.mark_plan_approved(job_id).is_ok() {
+                let _ = engine.append_note(
+                    job_id,
+                    "re-plan validated — every open question is answered; continuing into implementation",
+                );
+            }
+        }
         if stage == StageKind::BackendPlan && should_pause_for_plan_review(store, job_id) {
             let _ = engine.append_note(
                 job_id,
@@ -806,6 +817,22 @@ fn forced_plan_review_reason(store: &Store, job_dir: &Path, job_id: &str) -> Opt
     }
     let plan = load_plan(job_dir).ok().flatten()?;
     crate::plan::plan_review_required_reason(&plan)
+}
+
+/// True when a paused-for-review job's re-plan has settled every question
+/// (see `plan::plan_review_settled_by_answers`). Only applies before
+/// approval; an approved job never re-enters the gate anyway.
+fn plan_settled_by_answers(store: &Store, job_dir: &Path, job_id: &str) -> bool {
+    let awaiting = store
+        .load_lineage_job(job_id)
+        .ok()
+        .flatten()
+        .is_some_and(|j| j.pause_after_plan && j.plan_approved_at_unix_ms.is_none());
+    awaiting
+        && load_plan(job_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|plan| crate::plan::plan_review_settled_by_answers(&plan))
 }
 
 /// The plan-review gate fires only while the job both requested it and has
@@ -1410,6 +1437,75 @@ mod tests {
             !run.paused_for_plan_review,
             "approved plan must not re-pause"
         );
+    }
+
+    #[test]
+    fn answer_and_replan_continues_when_every_question_is_answered() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+        engine.request_plan_review(&job_id).unwrap();
+        let mut plan = load_plan(&job_dir).unwrap().unwrap();
+        plan.open_questions = vec!["Currency single? Assumed USD.".into()];
+        save_plan(&job_dir, &plan).unwrap();
+
+        let dispatcher = ScriptedDispatcher {
+            job_dir: job_dir.clone(),
+            fix_on_attempt: 1,
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let run = run_pipeline(&store, &engine, &dispatcher, &worktree, &job_dir, &job_id).unwrap();
+        assert!(run.paused_for_plan_review);
+
+        // Reviewer answers and re-plans (what answer_plan_questions does).
+        let mut plan = load_plan(&job_dir).unwrap().unwrap();
+        crate::plan::record_answers(
+            &mut plan,
+            &[("Currency single? Assumed USD.".into(), "EUR".into())],
+            1,
+        );
+        plan.stage = PlanStage::Seeded;
+        save_plan(&job_dir, &plan).unwrap();
+        let calls_before = dispatcher.calls.borrow().len();
+
+        let run = run_pipeline(&store, &engine, &dispatcher, &worktree, &job_dir, &job_id).unwrap();
+        assert!(
+            dispatcher.calls.borrow().len() > calls_before,
+            "planner re-dispatched"
+        );
+        assert!(
+            !run.paused_for_plan_review,
+            "all answered → no second pause"
+        );
+        let job = store.load_lineage_job(&job_id).unwrap().unwrap();
+        assert!(job.plan_approved_at_unix_ms.is_some());
+        assert!(job
+            .notes
+            .iter()
+            .any(|n| n.contains("every open question is answered")));
+    }
+
+    #[test]
+    fn answer_and_replan_pauses_again_when_a_question_is_left_open() {
+        let tmp = tempdir().unwrap();
+        let (store, job_id, job_dir) = pipeline_fixture(tmp.path());
+        let engine = LineageEngine::new(&store);
+        engine.request_plan_review(&job_id).unwrap();
+        let mut plan = load_plan(&job_dir).unwrap().unwrap();
+        plan.open_questions = vec!["Q1? Assumed A.".into(), "Q2? Assumed B.".into()];
+        crate::plan::record_answers(&mut plan, &[("Q1? Assumed A.".into(), "C".into())], 1);
+        save_plan(&job_dir, &plan).unwrap();
+        let dispatcher = ScriptedDispatcher {
+            job_dir: job_dir.clone(),
+            fix_on_attempt: 1,
+            calls: Default::default(),
+        };
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let run = run_pipeline(&store, &engine, &dispatcher, &worktree, &job_dir, &job_id).unwrap();
+        assert!(run.paused_for_plan_review, "Q2 is still unanswered");
     }
 
     #[test]

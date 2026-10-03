@@ -659,6 +659,136 @@ pub fn resume_lineage_job(
     Ok(updated)
 }
 
+/// Record the reviewer's answers to a paused plan's open questions and, for
+/// "Answer & re-plan", rewind `plan.stage` so the BackendPlan stage actually
+/// re-runs (a plan marked planned would only be re-validated). Returns the
+/// job and whether a re-plan should start. Pure state change — the wrapper
+/// launches the pipeline so tests can drive this without a worktree.
+pub fn answer_plan_questions_impl(
+    store: &crate::store::Store,
+    payload: crate::types::AnswerPlanQuestionsPayload,
+) -> Result<(LineageJobRecord, bool), String> {
+    use crate::types::{MAX_PLAN_ANSWERS, MAX_PLAN_ANSWER_CHARS};
+    let engine = LineageEngine::new(store);
+    let job = store
+        .load_lineage_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
+    let awaiting = job.status == LineageJobStatus::Planned
+        && job.pause_after_plan
+        && job.plan_approved_at_unix_ms.is_none();
+    if !awaiting {
+        return Err("this job is not waiting for plan review".into());
+    }
+    if payload.answers.len() > MAX_PLAN_ANSWERS {
+        return Err(format!("at most {MAX_PLAN_ANSWERS} answers per request"));
+    }
+
+    // Serialise concurrent answer calls for this job while plan.json is
+    // read-modified-written. Released before `append_note`, which takes the
+    // same (non-reentrant) per-job lock.
+    let lock = crate::lineage::job_write_lock(&job.id);
+    let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let job_dir = runner::job_workspace_dir(store.layout().root(), &job.id);
+    let mut plan = crate::plan::load_plan(&job_dir)
+        .map_err(store_error)?
+        .ok_or_else(|| "no plan.json for this job".to_string())?;
+
+    let known: std::collections::HashSet<String> = plan
+        .open_questions
+        .iter()
+        .map(|q| q.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let mut answers: Vec<(String, String)> = Vec::new();
+    for a in payload.answers {
+        let question = a.question.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !known.contains(&question) {
+            return Err(format!(
+                "not one of this plan's open questions: {:?}",
+                question.chars().take(80).collect::<String>()
+            ));
+        }
+        if a.answer.chars().count() > MAX_PLAN_ANSWER_CHARS {
+            return Err(format!(
+                "answers are limited to {MAX_PLAN_ANSWER_CHARS} characters"
+            ));
+        }
+        answers.push((question, a.answer));
+    }
+    let stored = crate::plan::record_answers(&mut plan, &answers, current_time_unix_ms());
+    if payload.replan && stored == 0 {
+        return Err(
+            "answer at least one question to re-plan (or Approve to accept the planner's guesses)"
+                .into(),
+        );
+    }
+    if stored > 0 {
+        plan.history.push(crate::plan::HistoryEntry {
+            at_unix_ms: current_time_unix_ms(),
+            stage: "backend_plan".into(),
+            kind: crate::plan::HistoryKind::Note,
+            message: format!(
+                "reviewer answered {stored} open question(s){}",
+                if payload.replan {
+                    " — re-planning"
+                } else {
+                    ""
+                }
+            ),
+        });
+    }
+    if payload.replan {
+        // Runtime-owned field: rewind so run_stage dispatches the planner
+        // instead of re-validating the old plan.
+        plan.stage = crate::plan::PlanStage::Seeded;
+    }
+    crate::plan::save_plan(&job_dir, &plan).map_err(store_error)?;
+    drop(guard);
+    if stored > 0 {
+        let _ = engine.append_note(
+            &job.id,
+            &format!(
+                "reviewer answered {stored} of {} open question(s){}",
+                plan.open_questions.len(),
+                if payload.replan {
+                    "; re-planning with the answers"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+    let job = store
+        .load_lineage_job(&job.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
+    Ok((job, payload.replan))
+}
+
+/// "Answer & re-plan" / record answers before Approve.
+#[tauri::command]
+pub fn answer_plan_questions(
+    state: State<'_, AppState>,
+    payload: crate::types::AnswerPlanQuestionsPayload,
+) -> Result<LineageJobRecord, String> {
+    let store = state.store();
+    let (job, replan) = answer_plan_questions_impl(&store, payload)?;
+    if !replan {
+        return Ok(job);
+    }
+    let engine = LineageEngine::new(&store);
+    let updated = engine
+        .force_status(&job.id, LineageJobStatus::Implementing)
+        .map_err(store_error)?;
+    if let Err(err) = runner::resume_pipeline(store.clone(), job.id.clone()) {
+        // Never leave the job "Implementing" with nothing running.
+        crate::lineage::force_status_with_retry(&engine, &job.id, LineageJobStatus::Planned);
+        let _ = engine.append_note(&job.id, &format!("re-plan could not start: {err}"));
+        return Err(format!("re-plan could not start: {err}"));
+    }
+    Ok(updated)
+}
+
 /// "Advance" button entry point. Behaviour depends on the job's current
 /// status:
 /// - `Pending` → fork the source repo into a lineage worktree, spawn
@@ -1360,6 +1490,171 @@ mod tests {
             local_delegate: None,
             parent_feedback_id: None,
         }
+    }
+
+    /// A job parked at the plan-review gate with two open questions.
+    fn paused_job(root: &std::path::Path) -> (crate::store::Store, String) {
+        let store = crate::store::Store::new(root.to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = FeedbackRecord {
+            id: "fb-q".into(),
+            feedback_type: FeedbackType::NewApp,
+            status: crate::types::FeedbackStatus::New,
+            page_route: "/".into(),
+            feedback_text: "suite".into(),
+            annotations: vec![],
+            pasted_images: vec![],
+            screenshot_filename: None,
+            screens: vec![],
+            voice_filename: None,
+            voice_transcript: None,
+            window_width: 1,
+            window_height: 1,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            lineage_job_id: None,
+            local_delegate: None,
+            revision: Default::default(),
+        };
+        store.save_feedback(&fb).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
+        engine.request_plan_review(&job.id).unwrap();
+        engine
+            .force_status(&job.id, LineageJobStatus::Planned)
+            .unwrap();
+        let plan = crate::plan::IterationPlan {
+            stage: crate::plan::PlanStage::BackendPlanned,
+            open_questions: vec![
+                "Currency assumed single (integer cents). Correct?".into(),
+                "Auth assumed api tokens. Acceptable?".into(),
+            ],
+            ..Default::default()
+        };
+        crate::plan::save_plan(&runner::job_workspace_dir(root, &job.id), &plan).unwrap();
+        (store, job.id)
+    }
+
+    fn answer(q: &str, a: &str) -> crate::types::PlanAnswerPayload {
+        crate::types::PlanAnswerPayload {
+            question: q.into(),
+            answer: a.into(),
+        }
+    }
+
+    fn plan_of(root: &std::path::Path, id: &str) -> crate::plan::IterationPlan {
+        crate::plan::load_plan(&runner::job_workspace_dir(root, id))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn answering_records_answers_without_replanning() {
+        let tmp = tempdir().unwrap();
+        let (store, id) = paused_job(tmp.path());
+        let (job, replan) = answer_plan_questions_impl(
+            &store,
+            crate::types::AnswerPlanQuestionsPayload {
+                id: id.clone(),
+                answers: vec![
+                    answer(
+                        "Currency assumed single (integer cents). Correct?",
+                        "Yes, but store a currency code",
+                    ),
+                    answer("Auth assumed api tokens. Acceptable?", "  "),
+                ],
+                replan: false,
+            },
+        )
+        .unwrap();
+        assert!(!replan);
+        assert_eq!(
+            job.status,
+            LineageJobStatus::Planned,
+            "recording alone keeps the pause"
+        );
+        let plan = plan_of(tmp.path(), &id);
+        assert_eq!(
+            plan.answered_questions.len(),
+            1,
+            "blank answer = accept the guess"
+        );
+        assert_eq!(plan.stage, crate::plan::PlanStage::BackendPlanned);
+        assert!(job.notes.iter().any(|n| n.contains("answered 1 of 2")));
+    }
+
+    #[test]
+    fn replan_rewinds_the_plan_stage_so_the_planner_reruns() {
+        let tmp = tempdir().unwrap();
+        let (store, id) = paused_job(tmp.path());
+        let (_, replan) = answer_plan_questions_impl(
+            &store,
+            crate::types::AnswerPlanQuestionsPayload {
+                id: id.clone(),
+                // Whitespace differences still match the planner's question.
+                answers: vec![answer(
+                    "Auth  assumed api tokens.\nAcceptable?",
+                    "Tokens hashed, admin can revoke",
+                )],
+                replan: true,
+            },
+        )
+        .unwrap();
+        assert!(replan);
+        let plan = plan_of(tmp.path(), &id);
+        assert_eq!(plan.stage, crate::plan::PlanStage::Seeded);
+        assert_eq!(
+            plan.answered_questions[0].answer,
+            "Tokens hashed, admin can revoke"
+        );
+        assert!(plan
+            .history
+            .iter()
+            .any(|h| h.message.contains("re-planning")));
+    }
+
+    #[test]
+    fn answer_rejections_leave_the_plan_untouched() {
+        let tmp = tempdir().unwrap();
+        let (store, id) = paused_job(tmp.path());
+        let before = plan_of(tmp.path(), &id);
+        let call = |answers, replan| {
+            answer_plan_questions_impl(
+                &store,
+                crate::types::AnswerPlanQuestionsPayload {
+                    id: id.clone(),
+                    answers,
+                    replan,
+                },
+            )
+        };
+        // Not one of the plan's questions.
+        assert!(call(vec![answer("Invented question?", "x")], false).is_err());
+        // Re-plan with nothing answered.
+        assert!(call(
+            vec![answer("Auth assumed api tokens. Acceptable?", "")],
+            true
+        )
+        .is_err());
+        // Oversized answer.
+        let long = "x".repeat(crate::types::MAX_PLAN_ANSWER_CHARS + 1);
+        assert!(call(
+            vec![answer("Auth assumed api tokens. Acceptable?", &long)],
+            false
+        )
+        .is_err());
+        assert_eq!(plan_of(tmp.path(), &id), before);
+
+        // A job that isn't paused for review refuses answers.
+        LineageEngine::new(&store).mark_plan_approved(&id).unwrap();
+        let err = call(
+            vec![answer("Auth assumed api tokens. Acceptable?", "ok")],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not waiting for plan review"));
     }
 
     fn state_with_tmp() -> (tempfile::TempDir, AppState) {

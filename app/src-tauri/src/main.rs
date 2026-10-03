@@ -66,6 +66,7 @@ fn main() {
             commands::list_lineage_jobs,
             commands::load_lineage_job,
             commands::approve_lineage_job,
+            commands::answer_plan_questions,
             commands::reject_lineage_job,
             commands::retry_lineage_job,
             commands::run_lineage_job,

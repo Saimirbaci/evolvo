@@ -1928,6 +1928,56 @@ button {
     background: color-mix(in srgb, var(--accent) 6%, transparent);
 }
 
+/* Answer & re-plan: an answer box under each question at plan review. */
+.plan-questions-list li + li {
+    margin-top: var(--space-2);
+}
+
+.plan-question-text {
+    display: block;
+}
+
+.plan-answer {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: var(--space-1);
+    resize: vertical;
+    min-height: 2.6em;
+    font: inherit;
+    font-size: var(--text-sm);
+}
+
+.plan-answer-given {
+    display: block;
+    margin-top: 2px;
+    color: var(--success);
+    font-weight: var(--weight-medium);
+}
+
+.plan-answered {
+    margin-top: var(--space-2);
+    font-size: var(--text-sm);
+}
+
+.plan-answered summary {
+    cursor: pointer;
+    color: var(--muted);
+}
+
+.plan-answer-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-3);
+}
+
+.plan-answer-count {
+    font-size: var(--text-xs);
+    color: var(--muted);
+}
+
 /* Planner's design intent — layout/density badges, theme overrides, and
    canvas-mark interpretations recorded in plan.json's frontend.design.
    Rendered alongside .plan-questions in the same review-gate panel. */

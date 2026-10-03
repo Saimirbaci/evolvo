@@ -691,6 +691,21 @@ fn LineageDetail(
         && record.pause_after_plan
         && record.plan_approved_at_unix_ms.is_none();
     let awaiting_merge = matches!(record.status, LineageJobStatus::BuildReady);
+    // Reviewer's draft answers to the planner's open questions, keyed by
+    // question text. Blank = accept the planner's guess.
+    let plan_answers: RwSignal<std::collections::HashMap<String, String>> =
+        RwSignal::new(std::collections::HashMap::new());
+    let collect_answers = move || -> Vec<crate::types::PlanAnswerPayload> {
+        plan_answers.with_untracked(|m| {
+            m.iter()
+                .filter(|(_, a)| !a.trim().is_empty())
+                .map(|(q, a)| crate::types::PlanAnswerPayload {
+                    question: q.clone(),
+                    answer: a.trim().to_string(),
+                })
+                .collect()
+        })
+    };
     let can_retry = record.status.can_retry();
     let can_run = record.status.can_run() && record.worktree_path.is_some();
     // Resume is offered when a multi-stage pipeline has progress on disk
@@ -771,6 +786,47 @@ fn LineageDetail(
         action_error.set(None);
         open_evolve_modal();
     };
+
+    // Plan review: save any typed answers, then either approve (build as
+    // planned + answers) or re-plan with them.
+    let answer_id = approve_id.clone();
+    let submit_plan_review = move |replan: bool| {
+        if evolve_submitting.get_untracked() {
+            return;
+        }
+        let answers = collect_answers();
+        if replan && answers.is_empty() {
+            action_error.set(Some(
+                "Type an answer to at least one question to re-plan — or Approve plan to accept the guesses."
+                    .into(),
+            ));
+            return;
+        }
+        evolve_submitting.set(true);
+        action_error.set(None);
+        let id = answer_id.clone();
+        spawn_local(async move {
+            let saved = if answers.is_empty() {
+                Ok(())
+            } else {
+                interop::answer_plan_questions(&id, answers, replan)
+                    .await
+                    .map(|_| ())
+            };
+            let result = match saved {
+                Ok(()) if !replan => interop::approve_lineage_job(&id).await.map(|_| ()),
+                other => other,
+            };
+            if let Err(e) = result {
+                action_error.set(Some(e));
+            } else {
+                plan_answers.set(std::collections::HashMap::new());
+            }
+            evolve_submitting.set(false);
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+    let replan_from_banner = submit_plan_review.clone();
     let do_reject = move || {
         let id = reject_id.clone();
         action_error.set(None);
@@ -898,6 +954,8 @@ fn LineageDetail(
     // survives into implementation. The scoped watcher refreshes this only
     // when an artifact for the selected job changes.
     let open_questions: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    // Answers the reviewer already gave in an earlier "Answer & re-plan".
+    let answered_questions: RwSignal<Vec<(String, String)>> = RwSignal::new(Vec::new());
     // Planner's design intent — layout pattern, density, theme overrides,
     // and its interpretation of ambiguous canvas marks. Lives at
     // `plan.frontend.design` in the same plan.json payload as
@@ -923,6 +981,21 @@ fn LineageDetail(
                     })
                     .unwrap_or_default();
                 open_questions.set(qs);
+                let answered: Vec<(String, String)> = plan
+                    .get("answeredQuestions")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| {
+                                Some((
+                                    e.get("question")?.as_str()?.to_string(),
+                                    e.get("answer")?.as_str()?.to_string(),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                answered_questions.set(answered);
 
                 let design: DesignPlan = plan
                     .get("frontend")
@@ -991,7 +1064,8 @@ fn LineageDetail(
 
             {move || {
                 let qs = open_questions.get();
-                if qs.is_empty() {
+                let answered = answered_questions.get();
+                if qs.is_empty() && answered.is_empty() {
                     return view! { <span></span> }.into_any();
                 }
                 let class = if awaiting_plan_review {
@@ -999,19 +1073,90 @@ fn LineageDetail(
                 } else {
                     "plan-questions"
                 };
+                let hint = if awaiting_plan_approval {
+                    "The plan is paused for your review. Answer any question where the planner guessed wrong (leave it blank to accept the guess), then Answer & re-plan — or Approve plan to build it as planned."
+                } else if awaiting_plan_review {
+                    "The plan is paused for your review. These are the guesses the planner made on ambiguous points."
+                } else {
+                    "Guesses the planner recorded on ambiguous points in this iteration's plan."
+                };
+                let replan = replan_from_banner.clone();
                 view! {
                     <section class=class aria-label="Planner's open questions">
                         <h4>"Planner's open questions"</h4>
-                        <p class="plan-questions-hint">
-                            {if awaiting_plan_review {
-                                "The plan is paused for your review. These are the guesses the planner made on ambiguous points — Approve to accept them, or Reject and resubmit feedback with answers."
-                            } else {
-                                "Guesses the planner recorded on ambiguous points in this iteration's plan."
-                            }}
-                        </p>
+                        <p class="plan-questions-hint">{hint}</p>
                         <ul class="plan-questions-list">
-                            {qs.into_iter().map(|q| view! { <li>{q}</li> }).collect_view()}
+                            {qs.into_iter().enumerate().map(|(idx, q)| {
+                                let key = q.clone();
+                                let key_input = q.clone();
+                                let input_id = format!("plan-answer-{idx}");
+                                view! {
+                                    <li>
+                                        <span class="plan-question-text">{q}</span>
+                                        {awaiting_plan_approval.then(|| view! {
+                                            <textarea
+                                                id=input_id.clone()
+                                                class="input plan-answer"
+                                                rows="2"
+                                                maxlength="2000"
+                                                aria-label="Your answer (leave blank to accept the planner's guess)"
+                                                placeholder="Your answer — leave blank to accept the planner's guess"
+                                                prop:value=move || plan_answers.with(|m| m.get(&key).cloned().unwrap_or_default())
+                                                on:input=move |ev| {
+                                                    let value = event_target::<web_sys::HtmlTextAreaElement>(&ev).value();
+                                                    let key = key_input.clone();
+                                                    plan_answers.update(|m| {
+                                                        if value.trim().is_empty() {
+                                                            m.remove(&key);
+                                                        } else {
+                                                            m.insert(key, value);
+                                                        }
+                                                    });
+                                                }
+                                            ></textarea>
+                                        })}
+                                    </li>
+                                }
+                            }).collect_view()}
                         </ul>
+                        {(!answered.is_empty()).then(|| view! {
+                            <details class="plan-answered" open=awaiting_plan_approval>
+                                <summary>{format!("Your earlier answers ({})", answered.len())}</summary>
+                                <ul class="plan-questions-list">
+                                    {answered.into_iter().map(|(q, a)| view! {
+                                        <li>
+                                            <span class="plan-question-text">{q}</span>
+                                            <span class="plan-answer-given">{a}</span>
+                                        </li>
+                                    }).collect_view()}
+                                </ul>
+                            </details>
+                        })}
+                        {awaiting_plan_approval.then(|| {
+                            let replan = replan.clone();
+                            view! {
+                                <div class="plan-answer-actions">
+                                    <span class="plan-answer-count">
+                                        {move || {
+                                            let n = plan_answers.with(|m| m.len());
+                                            if n == 0 {
+                                                "No answers yet".to_string()
+                                            } else {
+                                                format!("{n} answered")
+                                            }
+                                        }}
+                                    </span>
+                                    <button
+                                        class="secondary-btn plan-replan-btn"
+                                        prop:disabled=move || evolve_submitting.get() || plan_answers.with(|m| m.is_empty())
+                                        title="Re-run the planner with your answers. It continues straight into implementation if nothing is left to decide, otherwise it pauses here again."
+                                        on:click=move |_| replan(true)
+                                    >
+                                        {move || if evolve_submitting.get() { "Working…" } else { "Answer & re-plan" }}
+                                    </button>
+                                </div>
+                            }
+                        })}
                     </section>
                 }.into_any()
             }}
@@ -1352,12 +1497,12 @@ fn LineageDetail(
                 // approving a paused plan is a direct click — the plan and
                 // its open questions are already on screen.
                 {
-                    let confirm_now = confirm_evolve.clone();
+                    let submit_plan_review = submit_plan_review.clone();
                     let (label, aria, title) = if awaiting_plan_approval {
                         (
                             "Approve plan",
                             "Approve the plan and start implementation",
-                            "Accept the planner's assumptions above and start implementing",
+                            "Start implementing — with your answers where you gave them, the planner's guesses elsewhere",
                         )
                     } else if awaiting_merge {
                         (
@@ -1378,7 +1523,7 @@ fn LineageDetail(
                             prop:disabled=move || !can_approve || evolve_submitting.get()
                             on:click=move |_| {
                                 if awaiting_plan_approval {
-                                    confirm_now();
+                                    submit_plan_review(false);
                                 } else {
                                     do_approve();
                                 }

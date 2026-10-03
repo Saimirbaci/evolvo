@@ -703,6 +703,25 @@ mod design_contract_tests {
     }
 
     #[test]
+    fn answer_plan_payload_matches_host_contract() {
+        // Host mirror: types::tests::answer_plan_payload_wire_contract.
+        let p = AnswerPlanQuestionsPayload {
+            id: "job-1".into(),
+            answers: vec![PlanAnswerPayload {
+                question: "Q?".into(),
+                answer: "A".into(),
+            }],
+            replan: true,
+        };
+        let ours = serde_json::to_value(&p).unwrap();
+        let contract: serde_json::Value = serde_json::from_str(
+            r#"{"id":"job-1","answers":[{"question":"Q?","answer":"A"}],"replan":true}"#,
+        )
+        .unwrap();
+        assert_eq!(ours, contract);
+    }
+
+    #[test]
     fn editable_design_deserialises_host_output() {
         let raw = r#"{"summary":{"id":"design-1","name":"A","screenCount":1,"shapeCount":2,
             "thumbnailDataUrl":null,"createdAtUnixMs":1,"updatedAtUnixMs":2},
@@ -747,4 +766,21 @@ pub struct SketchResponse {
     pub model: String,
     #[serde(default)]
     pub duration_ms: u64,
+}
+
+// --- Plan review answers (mirror of host types.rs) -----------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanAnswerPayload {
+    pub question: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerPlanQuestionsPayload {
+    pub id: String,
+    pub answers: Vec<PlanAnswerPayload>,
+    pub replan: bool,
 }

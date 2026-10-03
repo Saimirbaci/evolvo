@@ -624,6 +624,26 @@ The e2e plan then asserts effects the user didn't type: after sending
 "Summarise the spec" to Coder, a reply *from* Coder appears; after
 assigning a task, it reaches `done` with a result.
 
+## Answered questions — the reviewer's decisions are binding
+
+If `plan.answeredQuestions` is non-empty, this is a **re-plan**: the
+reviewer paused at plan review and answered some of your previous
+`openQuestions`. Each entry is `{question, answer}`.
+
+- Treat every answer as a binding requirement from the user — the same
+  authority as the feedback text. Update entities, commands, behaviors,
+  templates and storage to match (e.g. "store a currency code on every
+  amount" means a new field on every money-bearing entity).
+- **Rewrite `openQuestions`**: remove every question that now has an
+  answer, keep questions the reviewer left blank (they accepted your
+  guess) only if they still matter, and add genuinely NEW ambiguities the
+  answers created. If nothing is ambiguous anymore, leave it empty — the
+  pipeline then continues straight into implementation.
+- Never re-ask an answered question in different words, and never
+  silently override an answer; if an answer conflicts with a product
+  invariant, follow the invariant and say so in a new open question.
+- Do not edit `answeredQuestions` — it is the reviewer's record.
+
 ## Open questions — record your guesses
 
 Whenever the canvas / text / voice leave a real ambiguity and you had to

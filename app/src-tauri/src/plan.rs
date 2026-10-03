@@ -147,6 +147,79 @@ pub struct IterationPlan {
     /// append here; an empty list means "nothing was ambiguous".
     #[serde(default)]
     pub open_questions: Vec<String>,
+    /// The reviewer's answers to `open_questions`, given at the plan-review
+    /// pause ("Answer & re-plan"). Binding user decisions: the planner
+    /// re-plans around them and every later stage reads them. Append-only
+    /// per question (a newer answer to the same question replaces the old).
+    #[serde(default)]
+    pub answered_questions: Vec<AnsweredQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweredQuestion {
+    pub question: String,
+    pub answer: String,
+    #[serde(default)]
+    pub answered_at_unix_ms: u64,
+}
+
+/// Normalise a question for matching (planners sometimes re-flow
+/// whitespace when they rewrite the list).
+fn question_key(q: &str) -> String {
+    q.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Upsert reviewer answers keyed by question text. Blank answers are
+/// ignored (= "accept the planner's guess"). Returns how many were stored.
+pub fn record_answers(
+    plan: &mut IterationPlan,
+    answers: &[(String, String)],
+    now_ms: u64,
+) -> usize {
+    let mut stored = 0;
+    for (question, answer) in answers {
+        let (question, answer) = (question.trim(), answer.trim());
+        if question.is_empty() || answer.is_empty() {
+            continue;
+        }
+        let key = question_key(question);
+        plan.answered_questions
+            .retain(|a| question_key(&a.question) != key);
+        plan.answered_questions.push(AnsweredQuestion {
+            question: question.to_string(),
+            answer: answer.to_string(),
+            answered_at_unix_ms: now_ms,
+        });
+        stored += 1;
+    }
+    stored
+}
+
+/// Open questions the reviewer has not answered yet.
+pub fn unanswered_open_questions(plan: &IterationPlan) -> Vec<String> {
+    let answered: std::collections::HashSet<String> = plan
+        .answered_questions
+        .iter()
+        .map(|a| question_key(&a.question))
+        .collect();
+    plan.open_questions
+        .iter()
+        .filter(|q| !answered.contains(&question_key(q)))
+        .cloned()
+        .collect()
+}
+
+/// After an "Answer & re-plan" round, the review is settled when every
+/// open question has an answer and nothing else needs a human decision —
+/// the pipeline may then continue without pausing again.
+pub fn plan_review_settled_by_answers(plan: &IterationPlan) -> bool {
+    !plan.answered_questions.is_empty()
+        && unanswered_open_questions(plan).is_empty()
+        && plan_review_required_reason(plan).is_none()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1755,6 +1828,63 @@ mod tests {
         assert!(plan_review_required_reason(&plan)
             .unwrap()
             .contains("simulate behavior"));
+    }
+
+    #[test]
+    fn answers_upsert_by_question_and_ignore_blanks() {
+        let mut plan = IterationPlan {
+            open_questions: vec![
+                "Currency single? Assumed USD.".into(),
+                "Auth: tokens?".into(),
+            ],
+            ..Default::default()
+        };
+        let n = record_answers(
+            &mut plan,
+            &[
+                (
+                    "Currency single? Assumed USD.".into(),
+                    "EUR, store a code".into(),
+                ),
+                ("Auth: tokens?".into(), "   ".into()),
+            ],
+            1,
+        );
+        assert_eq!(n, 1);
+        assert_eq!(
+            unanswered_open_questions(&plan),
+            vec!["Auth: tokens?".to_string()]
+        );
+        assert!(!plan_review_settled_by_answers(&plan));
+
+        // Re-answering replaces; whitespace/case differences still match.
+        record_answers(
+            &mut plan,
+            &[("currency  single? assumed USD.".into(), "USD".into())],
+            2,
+        );
+        assert_eq!(plan.answered_questions.len(), 1);
+        assert_eq!(plan.answered_questions[0].answer, "USD");
+
+        record_answers(
+            &mut plan,
+            &[("Auth: tokens?".into(), "yes, hashed".into())],
+            3,
+        );
+        assert!(plan_review_settled_by_answers(&plan));
+    }
+
+    #[test]
+    fn settled_requires_answers_and_no_forced_reason() {
+        let mut plan = IterationPlan::default();
+        assert!(
+            !plan_review_settled_by_answers(&plan),
+            "no answers = no settlement"
+        );
+        record_answers(&mut plan, &[("q".into(), "a".into())], 1);
+        assert!(plan_review_settled_by_answers(&plan));
+        plan.backend.simulated_behaviors = vec!["replies: canned".into()];
+        assert!(!plan_review_settled_by_answers(&plan));
     }
 
     #[test]

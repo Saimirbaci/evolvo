@@ -836,6 +836,18 @@ pub struct AppHealth {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn answer_plan_payload_wire_contract() {
+        // Exact JSON the UI sends (pinned by ui/src/types.rs).
+        let p: AnswerPlanQuestionsPayload = serde_json::from_str(
+            r#"{"id":"job-1","answers":[{"question":"Q?","answer":"A"}],"replan":true}"#,
+        )
+        .unwrap();
+        assert_eq!(p.id, "job-1");
+        assert_eq!(p.answers[0].answer, "A");
+        assert!(p.replan);
+    }
+
+    #[test]
     fn save_design_payload_wire_contract() {
         // Exact JSON the UI's SaveDesignPayload serialises to (pinned by
         // ui/src/types.rs::design_contract_tests).
@@ -1078,6 +1090,32 @@ mod tests {
         assert_eq!(back.revision.number, 1);
         assert!(back.revision.parent_feedback_id.is_none());
     }
+}
+
+// --- Plan review: answer the planner's open questions ----------------------
+
+/// Max answers per call and max characters per answer.
+pub const MAX_PLAN_ANSWERS: usize = 50;
+pub const MAX_PLAN_ANSWER_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanAnswerPayload {
+    pub question: String,
+    #[serde(default)]
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerPlanQuestionsPayload {
+    pub id: String,
+    #[serde(default)]
+    pub answers: Vec<PlanAnswerPayload>,
+    /// `true` = re-run the planner with the answers ("Answer & re-plan");
+    /// `false` = just record them (e.g. right before Approve).
+    #[serde(default)]
+    pub replan: bool,
 }
 
 // --- Saved canvas designs -------------------------------------------------

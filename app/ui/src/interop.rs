@@ -6,10 +6,10 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
 use crate::types::{
-    AgentAvailability, AppHealth, DelegationSummary, DesignSummary, EditableDesign,
-    EditableFeedback, FeedbackRecord, LineageArtifactsChanged, LineageJobRecord,
-    LineageJobUpserted, LocalDelegateAvailability, PreviewSummary, SaveDesignPayload,
-    SketchRequest, SketchResponse, StageState, SubmitFeedbackPayload,
+    AgentAvailability, AnswerPlanQuestionsPayload, AppHealth, DelegationSummary, DesignSummary,
+    EditableDesign, EditableFeedback, FeedbackRecord, LineageArtifactsChanged, LineageJobRecord,
+    LineageJobUpserted, LocalDelegateAvailability, PlanAnswerPayload, PreviewSummary,
+    SaveDesignPayload, SketchRequest, SketchResponse, StageState, SubmitFeedbackPayload,
 };
 
 pub const LINEAGE_JOB_UPSERTED_EVENT: &str = "lineage://job-upserted";
@@ -174,6 +174,24 @@ pub async fn list_lineage_jobs() -> Result<Vec<LineageJobRecord>, String> {
 
 pub async fn approve_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
     invoke_command_with_args("approve_lineage_job", &IdArg { id }).await
+}
+
+/// Record answers to a paused plan's open questions; `replan` re-runs the
+/// planner with them ("Answer & re-plan").
+pub async fn answer_plan_questions(
+    id: &str,
+    answers: Vec<PlanAnswerPayload>,
+    replan: bool,
+) -> Result<LineageJobRecord, String> {
+    invoke_command_with_args(
+        "answer_plan_questions",
+        &AnswerPlanQuestionsPayload {
+            id: id.to_string(),
+            answers,
+            replan,
+        },
+    )
+    .await
 }
 
 pub async fn reject_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
