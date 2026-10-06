@@ -180,6 +180,54 @@ pub struct FeedbackRecord {
     pub local_delegate: Option<LocalDelegateConfig>,
     #[serde(default)]
     pub revision: FeedbackRevision,
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    #[serde(default)]
+    pub background_filename: Option<String>,
+}
+
+/// External application a desktop-overlay capture was drawn on. Mirrors
+/// `types::TargetApp` on the host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetApp {
+    pub name: String,
+    #[serde(default)]
+    pub window_title: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub repo_source: String,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    /// `""`, `"resolving"`, `"resolved"` or `"failed"`.
+    #[serde(default)]
+    pub repo_status: String,
+    #[serde(default)]
+    pub repo_error: Option<String>,
+}
+
+/// Frozen desktop frame the overlay window displays (`desktop.rs` on host).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSession {
+    pub screenshot_base64: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    pub captured_at_unix_ms: u64,
+    /// "Revise on Canvas": the feedback whose annotations to restore.
+    #[serde(default)]
+    pub revision_of: Option<String>,
+    #[serde(default)]
+    pub revision_agent: Option<AgentKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,6 +578,13 @@ pub struct SubmitFeedbackPayload {
     /// Opt-in local-model worker. `None` keeps historical behaviour.
     #[serde(default)]
     pub local_delegate: Option<LocalDelegateConfig>,
+    /// Set by the desktop overlay: the external app the capture shows.
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    /// Desktop overlay: the clean frozen frame (no annotations), so a later
+    /// revision can redraw over the original screen.
+    #[serde(default)]
+    pub background_base64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

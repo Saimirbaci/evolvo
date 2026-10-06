@@ -922,7 +922,25 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
+    let feedback_record: RwSignal<Option<FeedbackRecord>> = RwSignal::new(None);
     let do_revise = move || {
+        // Desktop feedback was drawn over another app's frozen screen —
+        // revise it in the desktop overlay over that same frame, not on
+        // Evolvo's own canvas where the screen it describes isn't visible.
+        let is_desktop = feedback_record
+            .get_untracked()
+            .is_some_and(|f| f.target_app.is_some());
+        if is_desktop {
+            let request = revise_request.clone();
+            spawn_local(async move {
+                if let Err(e) =
+                    interop::open_desktop_revision(&request.feedback_id, request.agent).await
+                {
+                    action_error.set(Some(e));
+                }
+            });
+            return;
+        }
         revision_request.set(Some(revise_request.clone()));
         view_sig.set(View::Home);
         panel_open.set(true);
@@ -940,13 +958,43 @@ fn LineageDetail(
     let stages = record.stages.clone();
     let agent_label = record.agent.label();
 
-    let feedback_record: RwSignal<Option<FeedbackRecord>> = RwSignal::new(None);
     let feedback_id = record.feedback_id.clone();
-    spawn_local(async move {
-        if let Ok(Some(feedback)) = interop::load_feedback(&feedback_id).await {
-            feedback_record.set(Some(feedback));
-        }
+    // Re-read on every lineage reload: an external app's repo resolution
+    // updates the feedback's `targetApp` (resolving → resolved/failed) while
+    // this detail stays open.
+    Effect::new(move |_| {
+        reload.track();
+        artifact_reload.track();
+        let feedback_id = feedback_id.clone();
+        spawn_local(async move {
+            if let Ok(Some(feedback)) = interop::load_feedback(&feedback_id).await {
+                feedback_record.set(Some(feedback));
+            }
+        });
     });
+    let repo_input: RwSignal<String> = RwSignal::new(String::new());
+    let repo_busy: RwSignal<bool> = RwSignal::new(false);
+    let resolve_job_id = record.id.clone();
+    let can_change_repo = matches!(
+        record.status,
+        LineageJobStatus::Pending | LineageJobStatus::Failed
+    );
+    let resolve_repo = move |repo: Option<String>| {
+        if repo_busy.get_untracked() {
+            return;
+        }
+        repo_busy.set(true);
+        action_error.set(None);
+        let id = resolve_job_id.clone();
+        spawn_local(async move {
+            match interop::resolve_target_repo(&id, repo.as_deref()).await {
+                Ok(_) => repo_input.set(String::new()),
+                Err(e) => action_error.set(Some(e)),
+            }
+            repo_busy.set(false);
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
 
     // Planner's open questions from plan.json — the guesses it recorded on
     // ambiguous points. Most important while the job is parked in `Planned`
@@ -1043,6 +1091,84 @@ fn LineageDetail(
             </header>
 
             <p class="lineage-detail-summary">{summary}</p>
+
+            // Desktop-overlay feedback about another application: which app it
+            // targets, where its source repo is (resolved automatically —
+            // local checkout or cloned upstream), and a manual override.
+            {move || feedback_record.get().and_then(|feedback| feedback.target_app).map(|app| {
+                let title = if app.window_title.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", app.window_title)
+                };
+                let (repo_line, unresolved) = match (app.repo_status.as_str(), app.repo_path.clone()) {
+                    ("resolving", _) => ("Finding the source repo… (see notes below)".to_string(), false),
+                    (_, Some(p)) => {
+                        let how = match app.repo_source.as_str() {
+                            "executable" => "next to the running app",
+                            "remembered" => "remembered",
+                            "local" => "local checkout",
+                            "cloned" => "cloned upstream",
+                            "user" => "chosen by you",
+                            _ => "resolved",
+                        };
+                        (format!("Source repo: {p} ({how})"), false)
+                    }
+                    ("failed", None) => (
+                        format!(
+                            "Source repo not found — {}",
+                            app.repo_error.clone().unwrap_or_else(|| "unknown error".into())
+                        ),
+                        true,
+                    ),
+                    _ => ("Source repo not resolved yet — Evolve finds it first".to_string(), true),
+                };
+                let upstream = app.repo_url.clone();
+                let resolving = app.repo_status == "resolving";
+                let use_repo = resolve_repo.clone();
+                let find_repo = resolve_repo.clone();
+                view! {
+                    <div class="lineage-target-card">
+                        <div>
+                            <span class="lineage-target-label">"External app"</span>
+                            <strong>{app.name}</strong>
+                            <span>{title}</span>
+                        </div>
+                        <span class="lineage-target-repo" class:lineage-target-unresolved=unresolved>
+                            {repo_line}
+                        </span>
+                        {upstream.map(|u| view! { <span class="lineage-target-note">{format!("Upstream: {u}")}</span> })}
+                        {(can_change_repo && !resolving).then(|| view! {
+                            <div class="lineage-target-actions">
+                                <input
+                                    class="input lineage-target-input"
+                                    type="text"
+                                    placeholder="Local path or https git URL"
+                                    aria-label="Source repo path or git URL"
+                                    prop:value=move || repo_input.get()
+                                    on:input=move |ev| repo_input.set(event_target_value(&ev))
+                                />
+                                <button
+                                    class="btn"
+                                    title="Use this local checkout or clone this URL as the app's source"
+                                    disabled=move || repo_busy.get() || repo_input.get().trim().is_empty()
+                                    on:click=move |_| use_repo(Some(repo_input.get_untracked()))
+                                >
+                                    "Use"
+                                </button>
+                                <button
+                                    class="btn btn-ghost"
+                                    title="Search local code folders and the web for this app's source, cloning it if needed"
+                                    disabled=move || repo_busy.get()
+                                    on:click=move |_| find_repo(None)
+                                >
+                                    "Find automatically"
+                                </button>
+                            </div>
+                        })}
+                    </div>
+                }
+            })}
 
             {move || feedback_record.get().and_then(|feedback| {
                 let revision = feedback.revision;

@@ -528,7 +528,7 @@ fn prompts_override_dir() -> Option<PathBuf> {
     None
 }
 
-fn load_prompt(rel: &str, embedded: &str) -> String {
+pub(crate) fn load_prompt(rel: &str, embedded: &str) -> String {
     if let Some(dir) = prompts_override_dir() {
         let path = dir.join(rel);
         if let Ok(s) = fs::read_to_string(&path) {
@@ -559,7 +559,7 @@ fn trim_trailing_newline(s: String) -> String {
 /// Only call this on text a human typed/spoke/drew. Never call it on
 /// pipeline-generated content (ids, paths, plan.json excerpts) — those are
 /// trusted and fencing them would just be noise.
-fn fence_user_content(raw: &str) -> String {
+pub(crate) fn fence_user_content(raw: &str) -> String {
     // Match "</user-content>" tolerating internal whitespace around the tag
     // name and slash (e.g. "</ user-content >", "</user-content\n>") so a
     // reformatted or whitespace-padded variant can't sneak through either.
@@ -920,6 +920,10 @@ pub struct PreparedRun {
     /// Read by `launch_agent_session` to set `EVOLVO_DELEGATE_*` env
     /// vars on the supervisor command.
     pub local_delegate: Option<PreparedDelegate>,
+    /// True when the job targets another application's repo (desktop
+    /// overlay feedback). Selects `external::validate_external_gates`
+    /// instead of Evolvo's cargo gates after the agent exits.
+    pub external: bool,
 }
 
 /// Resolved spawn-time wiring for local-model delegation: the absolute
@@ -1014,12 +1018,33 @@ pub fn prepare_run(
         store.save_lineage_job(&job)?;
     }
     let job = &job;
-    let source = resolve_source_repo().ok_or_else(|| {
-        StoreError::Other(
-            "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
-                .to_string(),
-        )
-    })?;
+    // Desktop-overlay feedback about another app runs against that app's
+    // resolved repo; everything else forks Evolvo itself.
+    let external_target = feedback.target_app.as_ref();
+    let source = match external_target {
+        Some(target) => {
+            let path = target.repo_path.as_deref().map(PathBuf::from).ok_or_else(|| {
+                StoreError::Other(format!(
+                    "no source repo resolved yet for external app '{}'",
+                    target.name
+                ))
+            })?;
+            if !crate::external::is_git_checkout(&path) {
+                return Err(StoreError::Other(format!(
+                    "source repo for '{}' is not a git checkout: {}",
+                    target.name,
+                    path.display()
+                )));
+            }
+            path
+        }
+        None => resolve_source_repo().ok_or_else(|| {
+            StoreError::Other(
+                "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
+                    .to_string(),
+            )
+        })?,
+    };
 
     let root = store.layout().root().to_path_buf();
     let job_dir = job_workspace_dir(&root, &job.id);
@@ -1051,18 +1076,41 @@ pub fn prepare_run(
     // same project guide under the name it expects. Best-effort; failures
     // are swallowed because the worktree is already usable without them.
     let backend = backend_for(agent);
-    let aliases = materialise_context_files(&worktree, backend.as_ref());
-
-    // Each iteration gets its own dev-server port so users can run multiple
-    // iterations side-by-side without collision. Rewrite the worktree's port
-    // config before the agent starts so `cargo tauri dev` "just works".
     let port = iteration_port(job.iteration);
-    let _ = rewrite_iteration_port(&worktree, port);
-
-    let prompt = build_implementation_prompt_for(feedback, job, &attachments, &log_file, agent);
+    // External repos are not Evolvo-shaped: no CLAUDE.md aliases (they would
+    // show up as stray files in the foreign repo) and no port rewrite.
+    let (aliases, prompt) = match external_target {
+        Some(target) => (
+            Vec::new(),
+            crate::external::build_external_prompt(
+                feedback,
+                target,
+                &job.id,
+                &branch,
+                &attachments,
+            ),
+        ),
+        None => {
+            let aliases = materialise_context_files(&worktree, backend.as_ref());
+            // Each iteration gets its own dev-server port so users can run
+            // multiple iterations side-by-side without collision. Rewrite the
+            // worktree's port config before the agent starts so `cargo tauri
+            // dev` "just works".
+            let _ = rewrite_iteration_port(&worktree, port);
+            let prompt =
+                build_implementation_prompt_for(feedback, job, &attachments, &log_file, agent);
+            (aliases, prompt)
+        }
+    };
     fs::write(&prompt_file, &prompt)?;
 
-    let local_delegate = resolve_delegate(feedback, &source, &job_dir);
+    // The delegate wrapper lives in Evolvo's repo, not the target's.
+    let local_delegate = match external_target {
+        Some(_) => {
+            resolve_source_repo().and_then(|evolvo| resolve_delegate(feedback, &evolvo, &job_dir))
+        }
+        None => resolve_delegate(feedback, &source, &job_dir),
+    };
 
     let metadata = serde_json::json!({
         "job_id": job.id,
@@ -1082,6 +1130,7 @@ pub fn prepare_run(
             "path": a.path.display().to_string(),
         })).collect::<Vec<_>>(),
         "permission_mode": "dangerously-skip-permissions",
+        "target_app": external_target,
         "started_at_unix_ms": crate::types::current_time_unix_ms(),
     });
     fs::write(&metadata_file, serde_json::to_string_pretty(&metadata)?)?;
@@ -1097,6 +1146,7 @@ pub fn prepare_run(
         base_branch,
         prompt,
         local_delegate,
+        external: external_target.is_some(),
     })
 }
 
@@ -1248,7 +1298,11 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                         agent.label()
                     ),
                 );
-                let gates = crate::validators::validate_build_gates(&prepared.worktree);
+                let gates = if prepared.external {
+                    crate::external::validate_external_gates(&prepared.worktree)
+                } else {
+                    crate::validators::validate_build_gates(&prepared.worktree)
+                };
                 if gates.passed {
                     let _ = engine
                         .append_note(&job_id, &format!("build gates passed — {}", gates.headline));
@@ -2627,6 +2681,8 @@ mod tests {
             lineage_job_id: Some("job-42".into()),
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         }
     }
 

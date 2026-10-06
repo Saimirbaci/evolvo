@@ -40,9 +40,32 @@ fn main() {
         });
     }
 
+    let desktop_shortcut = evolvo_desktop::desktop::shortcut_from_env();
+
     tauri::Builder::default()
         .manage(app_state)
+        .manage(evolvo_desktop::desktop::DesktopState::default())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        evolvo_desktop::desktop::trigger(app);
+                    }
+                })
+                .build(),
+        )
         .setup(move |app| {
+            // Desktop overlay ("evolve any app"): a failure to grab the
+            // shortcut (taken by another app, bad accelerator in
+            // EVOLVO_DESKTOP_SHORTCUT) must not stop Evolvo opening.
+            {
+                use tauri_plugin_global_shortcut::GlobalShortcutExt;
+                if let Err(err) = app.global_shortcut().register(desktop_shortcut.as_str()) {
+                    eprintln!(
+                        "evolvo: could not register desktop overlay shortcut {desktop_shortcut}: {err}"
+                    );
+                }
+            }
             evolvo_desktop::lineage_events::install_tauri_sink(
                 app.handle().clone(),
                 watcher_root.clone(),
@@ -73,6 +96,10 @@ fn main() {
             commands::append_lineage_note,
             commands::open_workspace_path,
             commands::capture_window_png,
+            commands::take_desktop_capture,
+            commands::close_desktop_overlay,
+            commands::open_desktop_revision,
+            commands::resolve_target_repo,
             commands::open_external_url,
             commands::list_job_stages,
             commands::read_job_plan,

@@ -68,6 +68,21 @@ fn portable_job(mut job: LineageJobRecord) -> LineageJobRecord {
     job
 }
 
+/// Desktop-overlay feedback names the external app it targets. Its local
+/// checkout path and process id are host state (I-P4); the upstream URL,
+/// bundle id and app name are self-describing and stay, so the importing
+/// side can re-resolve the repo.
+fn portable_feedback(mut fb: FeedbackRecord) -> FeedbackRecord {
+    if let Some(target) = fb.target_app.as_mut() {
+        target.repo_path = None;
+        target.pid = None;
+        target.repo_source = String::new();
+        target.repo_status = String::new();
+        target.repo_error = None;
+    }
+    fb
+}
+
 /// Build a `.evolvo-bundle` zip in memory for the given lineage job.
 ///
 /// Returns the raw zip bytes plus the manifest used (the manifest is also
@@ -130,7 +145,7 @@ pub fn build_bundle_bytes(
     zip.write_all(&job_json)?;
 
     for fb in &feedback_records {
-        let fb_json = serde_json::to_vec_pretty(fb)?;
+        let fb_json = serde_json::to_vec_pretty(&portable_feedback(fb.clone()))?;
         zip.start_file(format!("feedback/{}.json", fb.id), opts)
             .map_err(|e| StoreError::Other(e.to_string()))?;
         zip.write_all(&fb_json)?;
@@ -326,6 +341,8 @@ mod tests {
             lineage_job_id: Some("job-1".into()),
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         };
         store.save_feedback(&fb).unwrap();
         store
@@ -401,8 +418,7 @@ mod tests {
         child_job.feedback_id = "fb-2".into();
         store.save_lineage_job(&child_job).unwrap();
 
-        let (bytes, manifest) =
-            build_bundle_bytes(&store, "job-2", "Evolvo", "0.1.0").unwrap();
+        let (bytes, manifest) = build_bundle_bytes(&store, "job-2", "Evolvo", "0.1.0").unwrap();
         assert_eq!(manifest.feedback_ids, vec!["fb-2", "fb-1"]);
 
         let bundle_dir = tempdir().unwrap();

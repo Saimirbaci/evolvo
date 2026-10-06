@@ -4,6 +4,8 @@ pub mod commands;
 pub mod concurrency;
 pub mod delegation;
 pub mod designs;
+pub mod desktop;
+pub mod external;
 pub mod fsutil;
 pub mod lineage;
 pub mod lineage_events;
@@ -28,5 +30,5 @@ pub use types::{
     DelegationSummary, EditableFeedback, EditableFeedbackScreen, EntityIdPayload, FeedbackRecord,
     FeedbackRevision, FeedbackStatus, FeedbackType, LineageJobRecord, LineageJobStatus,
     LocalDelegateAvailability, LocalDelegateConfig, PreviewSummary, StageKind, StageState,
-    StageStatus, SubmitFeedbackPayload,
+    StageStatus, SubmitFeedbackPayload, TargetApp,
 };

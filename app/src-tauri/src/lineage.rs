@@ -442,6 +442,8 @@ mod tests {
             lineage_job_id: None,
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         }
     }
 

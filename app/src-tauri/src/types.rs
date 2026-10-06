@@ -198,6 +198,55 @@ pub struct FeedbackRecord {
     /// original canvas/text payload.
     #[serde(default)]
     pub revision: FeedbackRevision,
+    /// Set when the feedback was captured by the desktop overlay on top of
+    /// another application (global shortcut) rather than inside Evolvo.
+    /// `None` means the feedback is about Evolvo / the NewApp itself.
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    /// Desktop captures: the frozen frame *without* annotations
+    /// (`frame.png`). Revisions reopen this as the backdrop so the user
+    /// redraws over the original screen, not over their old strokes.
+    #[serde(default)]
+    pub background_filename: Option<String>,
+}
+
+/// The external application a desktop-overlay capture was taken over.
+/// Everything here is best-effort metadata read from the OS at shortcut
+/// time; agents use it to recognise the app and locate its source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetApp {
+    pub name: String,
+    #[serde(default)]
+    pub window_title: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
+    /// Local git checkout believed to hold the app's source. Only set when
+    /// resolved (auto-detected from the executable path or chosen by the
+    /// user); `None` means the job needs a source repo before it can run.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    /// How `repo_path` was obtained: `"executable"` (walked up from the
+    /// running binary), `"remembered"` (an earlier resolution for the same
+    /// app), `"local"` (found under the user's code folders), `"cloned"`
+    /// (upstream located and cloned into the workspace) or `"user"`.
+    /// Empty when unresolved.
+    #[serde(default)]
+    pub repo_source: String,
+    /// Upstream clone URL when known (self-describing, survives export —
+    /// unlike `repo_path`, which is a host path).
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    /// `""` (not attempted), `"resolving"`, `"resolved"` or `"failed"`.
+    #[serde(default)]
+    pub repo_status: String,
+    /// Why the last resolution attempt failed, for the Lineage card.
+    #[serde(default)]
+    pub repo_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -726,6 +775,12 @@ pub struct SubmitFeedbackPayload {
     /// never choose the revision number themselves.
     #[serde(default)]
     pub parent_feedback_id: Option<String>,
+    /// Desktop-overlay captures carry the external app they were drawn on.
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    /// Desktop captures: the clean frozen frame (no annotations), base64.
+    #[serde(default)]
+    pub background_base64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -993,6 +1048,8 @@ mod tests {
             lineage_job_id: None,
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"feedbackType\":\"bug\""));

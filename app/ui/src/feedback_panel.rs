@@ -10,6 +10,7 @@ use web_sys::{
 
 use crate::canvas::{CanvasController, History, Shape};
 use crate::design_bar::{DesignBar, DesignBindings};
+use crate::desktop_overlay::DesktopCaptureContext;
 use crate::interop;
 use crate::types::{
     AgentAvailability, AgentKind, EditableFeedbackScreen, FeedbackRecord, FeedbackScreenPayload,
@@ -95,6 +96,51 @@ pub(crate) fn load_active_screen(controller: &CanvasController, screen: &Storybo
     controller.load(screen.shapes.clone(), screen.history.clone());
 }
 
+/// "Target: <app>" line shown at the top of the panel in the desktop
+/// overlay so the user sees which app (and repo) the feedback is about.
+#[component]
+fn DesktopTargetBanner(ctx: DesktopCaptureContext) -> impl IntoView {
+    view! {
+        <div class="desktop-target" role="status">
+            {move || match ctx.session.get().and_then(|s| s.target_app) {
+                Some(app) => {
+                    let title = if app.window_title.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", app.window_title)
+                    };
+                    let repo = app
+                        .repo_path
+                        .clone()
+                        .map(|p| format!("Source: {p}"))
+                        .unwrap_or_else(|| "Source repo: unresolved".to_string());
+                    view! {
+                        <div class="desktop-target-app">
+                            <span class="desktop-target-label">"Target"</span>
+                            <strong>{app.name.clone()}</strong>
+                            <span class="desktop-target-title">{title}</span>
+                        </div>
+                        <div
+                            class="desktop-target-repo"
+                            class:desktop-target-unresolved=app.repo_path.is_none()
+                        >
+                            {repo}
+                        </div>
+                    }
+                    .into_any()
+                }
+                None => view! {
+                    <div class="desktop-target-app">
+                        <span class="desktop-target-label">"Target"</span>
+                        <strong>"Unknown app"</strong>
+                    </div>
+                }
+                .into_any(),
+            }}
+        </div>
+    }
+}
+
 #[component]
 pub fn FeedbackPanel(
     controller: CanvasController,
@@ -140,6 +186,10 @@ pub fn FeedbackPanel(
     // pipeline park in `Planned` after the backend plan validates so the
     // user can read plan.json before implementation burns a worktree.
     let pause_after_plan = RwSignal::new(false);
+    // Present only when this panel is mounted by the desktop overlay: the
+    // frozen frame replaces the in-app window capture and the target app
+    // rides along on the submission.
+    let desktop = use_context::<DesktopCaptureContext>();
 
     // A Lineage action opens this panel with a one-shot request. Hydration
     // restores the complete storyboard and then clears the request while
@@ -208,7 +258,9 @@ pub fn FeedbackPanel(
     Effect::new(move |_| {
         let ft = feedback_type.get();
         if !auto_evolve_user_set.get_untracked() {
-            auto_evolve.set(matches!(ft, FeedbackType::NewApp));
+            // Desktop overlay: "draw on any app" means find the app's repo and
+            // start building straight away, so auto-evolve defaults on.
+            auto_evolve.set(desktop.is_some() || matches!(ft, FeedbackType::NewApp));
         }
     });
 
@@ -338,16 +390,31 @@ pub fn FeedbackPanel(
             let text_v = text.get_untracked();
             let voice_b64 = voice.base64.get_untracked();
             let voice_mime = voice.mime_type.get_untracked();
+            let desktop_session = desktop.and_then(|d| d.session.get_untracked());
 
             let ctrl_reset = ctrl.clone();
             let voice_reset = voice.clone();
             spawn_local(async move {
-                // Hide overlays so the screenshot captures the underlying page
-                // without the canvas surface or this feedback panel obscuring it.
-                let hidden = hide_overlays_for_capture();
-                wait_two_frames().await;
-                let page_b64 = interop::capture_window_png().await.ok();
-                restore_overlays(&hidden);
+                let page_b64 = match desktop_session.as_ref() {
+                    // Desktop overlay: the frame was frozen before the
+                    // overlay appeared, so there is nothing to hide.
+                    Some(session) => Some(session.screenshot_base64.clone()),
+                    None => {
+                        // Hide overlays so the screenshot captures the underlying
+                        // page without the canvas surface or this panel obscuring it.
+                        let hidden = hide_overlays_for_capture();
+                        wait_two_frames().await;
+                        let page_b64 = interop::capture_window_png().await.ok();
+                        restore_overlays(&hidden);
+                        page_b64
+                    }
+                };
+                // Keep the clean frame too, so "Revise on Canvas" can reopen the
+                // original screen without the old strokes baked in.
+                let background_base64 = desktop_session
+                    .as_ref()
+                    .map(|session| session.screenshot_base64.clone());
+                let target_app = desktop_session.and_then(|session| session.target_app);
 
                 // Composite: page as backdrop, annotation PNG stretched on top.
                 let screenshot = match (page_b64.as_deref(), anno_url.as_deref()) {
@@ -421,6 +488,8 @@ pub fn FeedbackPanel(
                     pause_after_plan: pause_after_plan_v,
                     parent_feedback_id: parent_feedback_id_v.clone(),
                     local_delegate: delegate_v,
+                    target_app,
+                    background_base64,
                 };
 
                 match interop::submit_feedback(&payload).await {
@@ -452,6 +521,7 @@ pub fn FeedbackPanel(
     };
 
     let disabled_ctrl = controller.clone();
+    let design_ctrl = controller.clone();
     let thumbs_ctrl = controller.clone();
     let voice_view = voice.clone();
 
@@ -666,18 +736,25 @@ pub fn FeedbackPanel(
             </div>
 
             <div class="panel-body">
-                <DesignBar
-                    controller=controller.clone()
-                    bindings=DesignBindings {
-                        screens,
-                        active_screen,
-                        next_screen_number,
-                        text,
-                        feedback_type,
-                        route,
-                        revision_parent,
-                    }
-                />
+                {move || match desktop {
+                    // Desktop captures are one-shot: no saved designs and no
+                    // draft autosave, which would clobber the in-app draft.
+                    Some(ctx) => view! { <DesktopTargetBanner ctx=ctx /> }.into_any(),
+                    None => view! {
+                        <DesignBar
+                            controller=design_ctrl.clone()
+                            bindings=DesignBindings {
+                                screens,
+                                active_screen,
+                                next_screen_number,
+                                text,
+                                feedback_type,
+                                route,
+                                revision_parent,
+                            }
+                        />
+                    }.into_any(),
+                }}
                 {move || {
                     let ctrl = revision_ctrl.clone();
                     let voice = revision_voice.clone();

@@ -6,15 +6,19 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
 use crate::types::{
-    AgentAvailability, AnswerPlanQuestionsPayload, AppHealth, DelegationSummary, DesignSummary,
-    EditableDesign, EditableFeedback, FeedbackRecord, LineageArtifactsChanged, LineageJobRecord,
-    LineageJobUpserted, LocalDelegateAvailability, PlanAnswerPayload, PreviewSummary,
-    SaveDesignPayload, SketchRequest, SketchResponse, StageState, SubmitFeedbackPayload,
+    AgentAvailability, AgentKind, AnswerPlanQuestionsPayload, AppHealth, DelegationSummary,
+    DesignSummary, DesktopSession, EditableDesign, EditableFeedback, FeedbackRecord,
+    LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted, LocalDelegateAvailability,
+    PlanAnswerPayload, PreviewSummary, SaveDesignPayload, SketchRequest, SketchResponse,
+    StageState, SubmitFeedbackPayload,
 };
 
 pub const LINEAGE_JOB_UPSERTED_EVENT: &str = "lineage://job-upserted";
 pub const LINEAGE_ARTIFACTS_CHANGED_EVENT: &str = "lineage://artifacts-changed";
 pub const LINEAGE_SNAPSHOT_INVALIDATED_EVENT: &str = "lineage://snapshot-invalidated";
+/// Emitted by the host to the desktop overlay window when a fresh capture
+/// is ready (payload: capture timestamp). See `desktop.rs`.
+pub const DESKTOP_CAPTURE_EVENT: &str = "evolvo://desktop-capture";
 
 fn js_error(v: JsValue) -> String {
     v.as_string()
@@ -259,6 +263,59 @@ pub async fn clear_design_draft() -> Result<bool, String> {
 
 pub async fn capture_window_png() -> Result<String, String> {
     invoke_command("capture_window_png").await
+}
+
+/// Frozen desktop frame + target app for the overlay, if one is pending.
+pub async fn take_desktop_capture() -> Result<Option<DesktopSession>, String> {
+    invoke_command("take_desktop_capture").await
+}
+
+/// Hide the desktop overlay window and hand focus back to the captured app.
+pub async fn close_desktop_overlay() -> Result<(), String> {
+    invoke_command("close_desktop_overlay").await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveTargetRepoPayload<'a> {
+    id: &'a str,
+    repo: Option<&'a str>,
+}
+
+/// (Re-)resolve an external-app job's source repo, optionally from a
+/// user-supplied local path or https clone URL.
+pub async fn resolve_target_repo(
+    job_id: &str,
+    repo: Option<&str>,
+) -> Result<LineageJobRecord, String> {
+    invoke_command_with_args(
+        "resolve_target_repo",
+        &ResolveTargetRepoPayload { id: job_id, repo },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenDesktopRevisionPayload<'a> {
+    feedback_id: &'a str,
+    agent: AgentKind,
+}
+
+/// "Revise on Canvas" for desktop feedback: reopen the desktop overlay with
+/// the original frozen screen behind the restored annotations.
+pub async fn open_desktop_revision(feedback_id: &str, agent: AgentKind) -> Result<(), String> {
+    invoke_command_with_args(
+        "open_desktop_revision",
+        &OpenDesktopRevisionPayload { feedback_id, agent },
+    )
+    .await
+}
+
+pub async fn listen_desktop_capture(
+    handler: impl FnMut(u64) + 'static,
+) -> Result<TauriEventListener, String> {
+    listen_event(DESKTOP_CAPTURE_EVENT, handler).await
 }
 
 /// Experimental: describe a sketch (or a change to the current one) and get

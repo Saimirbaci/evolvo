@@ -213,6 +213,19 @@ pub fn submit_feedback(
         _ => None,
     };
 
+    let background_filename = match payload.background_base64.as_deref() {
+        Some(b64) if !b64.is_empty() => {
+            let bytes = decode_base64("background frame", b64)?;
+            budget.add("background frame", bytes.len())?;
+            Some(
+                store
+                    .save_attachment(&id, "frame.png", &bytes)
+                    .map_err(store_error)?,
+            )
+        }
+        _ => None,
+    };
+
     let first_screen = screens.first();
     let mut record = FeedbackRecord {
         id: id.clone(),
@@ -247,6 +260,8 @@ pub fn submit_feedback(
             .as_ref()
             .map(next_feedback_revision)
             .unwrap_or_default(),
+        target_app: payload.target_app.clone(),
+        background_filename,
     };
 
     store.save_feedback(&record).map_err(store_error)?;
@@ -288,10 +303,40 @@ pub fn submit_feedback(
     // job by `start_implementation_run` itself (note + status=Failed),
     // which the user can then see on the Lineage tab.
     if payload.auto_evolve {
+        // External apps resolve their repo first; `start_implementation_run`
+        // kicks that off and starts the agent when it finishes.
         let _ = start_implementation_run(&store, &engine, &job);
+    } else if let Some(target) = record.target_app.as_ref() {
+        // Not auto-starting, but find/clone the repo now so it's ready when
+        // the reviewer clicks Evolve.
+        if target.repo_path.is_none() {
+            crate::external::start_resolution(
+                store.clone(),
+                job.id.clone(),
+                record.clone(),
+                None,
+                None,
+            );
+        }
     }
 
     Ok(record)
+}
+
+/// Continuation handed to `external::start_resolution`: once the repo is
+/// known, start the job's agent run if it is still waiting to start.
+fn run_after_resolution(job_id: String) -> crate::external::OnResolved {
+    Box::new(move |store: &crate::store::Store| {
+        let engine = LineageEngine::new(store);
+        match store.load_lineage_job(&job_id) {
+            Ok(Some(job)) if job.status == LineageJobStatus::Pending => {
+                if let Err(e) = start_implementation_run(store, &engine, &job) {
+                    let _ = engine.append_note(&job_id, &format!("could not start agent: {e}"));
+                }
+            }
+            _ => {}
+        }
+    })
 }
 
 fn next_feedback_revision(parent: &FeedbackRecord) -> FeedbackRevision {
@@ -857,6 +902,40 @@ fn start_implementation_run(
         .map_err(store_error)?
         .ok_or_else(|| format!("feedback {} not found for job {}", job.feedback_id, job.id))?;
 
+    // External app (desktop overlay): the agent can only start once the
+    // app's source repo is known. Resolve (and clone) it first; the run
+    // starts automatically when resolution succeeds.
+    let is_external = feedback.target_app.is_some();
+    if let Some(target) = feedback.target_app.as_ref() {
+        if target.repo_path.is_none() {
+            if crate::external::is_resolving(&feedback.id) {
+                let _ = engine.append_note(
+                    &job.id,
+                    "source repo is still being resolved — the agent starts automatically once it is ready",
+                );
+            } else {
+                let _ = engine.append_note(
+                    &job.id,
+                    &format!(
+                        "resolving the source repo for '{}' before starting the agent",
+                        target.name
+                    ),
+                );
+                crate::external::start_resolution(
+                    store.clone(),
+                    job.id.clone(),
+                    feedback.clone(),
+                    None,
+                    Some(run_after_resolution(job.id.clone())),
+                );
+            }
+            return store
+                .load_lineage_job(&job.id)
+                .map_err(store_error)?
+                .ok_or_else(|| format!("lineage job not found: {}", job.id));
+        }
+    }
+
     let prepared = runner::prepare_run(store, job, &feedback, job.agent).map_err(|e| {
         // Record the failure on the job so the reviewer sees why nothing
         // happened, then surface the error to the frontend.
@@ -882,7 +961,9 @@ fn start_implementation_run(
         .force_status(&job.id, LineageJobStatus::Implementing)
         .map_err(store_error)?;
 
-    if runner::is_multi_stage_candidate(&feedback) {
+    // External repos get a single agent session: the multi-stage NewApp
+    // pipeline and its validators are specific to Evolvo-shaped apps.
+    if !is_external && runner::is_multi_stage_candidate(&feedback) {
         runner::launch_pipeline(store.clone(), job.id.clone(), feedback, prepared, job.agent);
     } else {
         runner::launch_agent_session(store.clone(), job.id.clone(), prepared, job.agent);
@@ -990,10 +1071,15 @@ pub fn retry_lineage_job(
         }
     }
 
-    let source = runner::resolve_source_repo().ok_or_else(|| {
-        "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
-            .to_string()
-    })?;
+    // Tear down against the repo the worktree was forked from — another
+    // application's repo for desktop-overlay jobs.
+    let source = match job.source_repo.as_deref().map(std::path::PathBuf::from) {
+        Some(p) if p.is_dir() => p,
+        _ => runner::resolve_source_repo().ok_or_else(|| {
+            "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
+                .to_string()
+        })?,
+    };
     runner::cleanup_previous_run(&source, &workspace_root, &job.id).map_err(|e| {
         let msg = store_error(e);
         let _ = engine.append_note(&job.id, &format!("retry cleanup failed: {msg}"));
@@ -1366,6 +1452,133 @@ pub fn capture_window_png(window: tauri::WebviewWindow) -> Result<String, String
     Ok(STANDARD.encode(&buf))
 }
 
+/// The frozen desktop frame + target app the overlay is currently showing.
+/// `None` when no capture is pending (overlay closed). See `desktop.rs`.
+#[tauri::command]
+pub fn take_desktop_capture(
+    state: State<'_, crate::desktop::DesktopState>,
+) -> Result<Option<crate::desktop::DesktopSession>, String> {
+    Ok(state.current())
+}
+
+/// Hide the desktop overlay and return focus to the captured app.
+#[tauri::command]
+pub fn close_desktop_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    crate::desktop::close_overlay(&app);
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveTargetRepoPayload {
+    /// Lineage job id.
+    pub id: String,
+    /// Optional local path or https clone URL chosen by the user. `None`
+    /// re-runs automatic resolution.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// (Re-)resolve the source repo of an external-app job, optionally from a
+/// user-supplied path or URL. Runs in the background; progress lands as
+/// job notes and on the feedback's `targetApp`.
+#[tauri::command]
+pub fn resolve_target_repo(
+    state: State<'_, AppState>,
+    payload: ResolveTargetRepoPayload,
+) -> Result<LineageJobRecord, String> {
+    resolve_target_repo_impl(&state.store(), payload)
+}
+
+pub fn resolve_target_repo_impl(
+    store: &crate::store::Store,
+    payload: ResolveTargetRepoPayload,
+) -> Result<LineageJobRecord, String> {
+    let job = store
+        .load_lineage_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
+    let mut feedback = store
+        .load_feedback(&job.feedback_id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("feedback {} not found", job.feedback_id))?;
+    let Some(target) = feedback.target_app.as_mut() else {
+        return Err("this job is about Evolvo itself, not an external app".into());
+    };
+    if !matches!(
+        job.status,
+        LineageJobStatus::Pending | LineageJobStatus::Failed
+    ) {
+        return Err(format!(
+            "the source repo can only be changed before a run starts (job is {:?})",
+            job.status
+        ));
+    }
+    let hint = payload
+        .repo
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+    // Forget the previous answer so resolution doesn't short-circuit on it.
+    target.repo_path = None;
+    target.repo_source = String::new();
+    store.save_feedback(&feedback).map_err(store_error)?;
+    if !crate::external::start_resolution(store.clone(), job.id.clone(), feedback, hint, None) {
+        return Err("the source repo is already being resolved for this job".into());
+    }
+    store
+        .load_lineage_job(&job.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", job.id))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDesktopRevisionPayload {
+    pub feedback_id: String,
+    #[serde(default)]
+    pub agent: Option<crate::types::AgentKind>,
+}
+
+/// "Revise on Canvas" for desktop-overlay feedback: reopen the overlay with
+/// the original frozen frame behind the restored annotations.
+#[tauri::command]
+pub fn open_desktop_revision(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    payload: OpenDesktopRevisionPayload,
+) -> Result<(), String> {
+    let store = state.store();
+    let feedback = store
+        .load_feedback(&payload.feedback_id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("feedback {} not found", payload.feedback_id))?;
+    let frame = desktop_revision_frame(&store, &feedback)?;
+    crate::desktop::open_revision(
+        &app,
+        &feedback.id,
+        payload.agent.unwrap_or_default(),
+        &frame,
+        feedback.target_app.clone(),
+    )
+}
+
+/// The clean frozen frame for a desktop feedback. Records captured before
+/// `frame.png` existed fall back to the submitted composite.
+pub fn desktop_revision_frame(
+    store: &crate::store::Store,
+    feedback: &FeedbackRecord,
+) -> Result<Vec<u8>, String> {
+    let name = feedback
+        .background_filename
+        .as_deref()
+        .or(feedback.screenshot_filename.as_deref())
+        .ok_or_else(|| format!("feedback {} has no captured screen to revise", feedback.id))?;
+    store
+        .read_attachment(&feedback.id, name)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("captured screen {name} is missing for {}", feedback.id))
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportLineagePayload {
@@ -1489,6 +1702,8 @@ mod tests {
             pause_after_plan: false,
             local_delegate: None,
             parent_feedback_id: None,
+            target_app: None,
+            background_base64: None,
         }
     }
 
@@ -1516,6 +1731,8 @@ mod tests {
             lineage_job_id: None,
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         };
         store.save_feedback(&fb).unwrap();
         let job = engine
@@ -1535,6 +1752,185 @@ mod tests {
         };
         crate::plan::save_plan(&runner::job_workspace_dir(root, &job.id), &plan).unwrap();
         (store, job.id)
+    }
+
+    /// A Pending lineage job whose feedback targets an external app.
+    fn external_job(
+        root: &std::path::Path,
+        repo_path: Option<String>,
+    ) -> (crate::store::Store, LineageJobRecord) {
+        let store = crate::store::Store::new(root.to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = mk_payload_record("fb-ext");
+        fb.target_app = Some(crate::types::TargetApp {
+            name: "Zed".into(),
+            window_title: "notes — Zed".into(),
+            bundle_id: Some("dev.zed.Zed".into()),
+            repo_path,
+            ..Default::default()
+        });
+        store.save_feedback(&fb).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
+        (store, job)
+    }
+
+    fn mk_payload_record(id: &str) -> FeedbackRecord {
+        FeedbackRecord {
+            id: id.into(),
+            feedback_type: FeedbackType::FeatureRequest,
+            status: crate::types::FeedbackStatus::New,
+            page_route: "desktop://Zed".into(),
+            feedback_text: "add a word count to the status bar".into(),
+            annotations: vec![],
+            pasted_images: vec![],
+            screenshot_filename: None,
+            screens: vec![],
+            voice_filename: None,
+            voice_transcript: None,
+            window_width: 1,
+            window_height: 1,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            lineage_job_id: None,
+            local_delegate: None,
+            revision: Default::default(),
+            target_app: None,
+            background_filename: None,
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "external app\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    #[test]
+    fn resolve_target_repo_uses_user_path_and_remembers_it() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("zed-src");
+        init_repo(&repo);
+        let (store, job) = external_job(&tmp.path().join("ws"), None);
+        resolve_target_repo_impl(
+            &store,
+            ResolveTargetRepoPayload {
+                id: job.id.clone(),
+                repo: Some(repo.display().to_string()),
+            },
+        )
+        .unwrap();
+        let mut target = None;
+        for _ in 0..100 {
+            let fb = store.load_feedback(&job.feedback_id).unwrap().unwrap();
+            let t = fb.target_app.unwrap();
+            if t.repo_status == "resolved" {
+                target = Some(t);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let target = target.expect("resolution finished");
+        assert_eq!(target.repo_path.as_deref(), Some(repo.to_str().unwrap()));
+        assert_eq!(target.repo_source, "user");
+        let map = crate::external::load_app_map(store.layout().root());
+        assert_eq!(map["dev.zed.Zed"].repo_path, repo.display().to_string());
+    }
+
+    #[test]
+    fn resolve_target_repo_refuses_evolvo_jobs_and_running_jobs() {
+        let tmp = tempdir().unwrap();
+        let (store, id) = paused_job(tmp.path());
+        let err = resolve_target_repo_impl(&store, ResolveTargetRepoPayload { id, repo: None })
+            .unwrap_err();
+        assert!(err.contains("not an external app"), "{err}");
+
+        let tmp2 = tempdir().unwrap();
+        let (store, job) = external_job(tmp2.path(), None);
+        LineageEngine::new(&store)
+            .force_status(&job.id, LineageJobStatus::Implementing)
+            .unwrap();
+        let err = resolve_target_repo_impl(
+            &store,
+            ResolveTargetRepoPayload {
+                id: job.id,
+                repo: Some("/tmp".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("before a run starts"), "{err}");
+    }
+
+    #[test]
+    fn prepare_run_forks_the_external_repo_with_the_external_prompt() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("zed-src");
+        init_repo(&repo);
+        let (store, job) = external_job(&tmp.path().join("ws"), Some(repo.display().to_string()));
+        let fb = store.load_feedback(&job.feedback_id).unwrap().unwrap();
+        let prepared = runner::prepare_run(&store, &job, &fb, AgentKind::ClaudeCode).unwrap();
+        assert!(prepared.external);
+        assert_eq!(prepared.source_repo, repo);
+        assert_eq!(prepared.base_branch.as_deref(), Some("main"));
+        assert!(prepared.worktree.join("README.md").exists());
+        assert!(!prepared.worktree.join("AGENTS.md").exists());
+        assert!(prepared.prompt.contains("Zed"));
+        assert!(prepared.prompt.contains("add a word count"));
+        assert!(!prepared.prompt.contains("Evolvo shell"));
+    }
+
+    #[test]
+    fn prepare_run_refuses_external_job_without_repo() {
+        let tmp = tempdir().unwrap();
+        let (store, job) = external_job(tmp.path(), None);
+        let fb = store.load_feedback(&job.feedback_id).unwrap().unwrap();
+        let err = match runner::prepare_run(&store, &job, &fb, AgentKind::ClaudeCode) {
+            Ok(_) => panic!("must not prepare without a repo"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no source repo resolved"), "{err}");
+    }
+
+    #[test]
+    fn desktop_revision_frame_prefers_clean_frame() {
+        let tmp = tempdir().unwrap();
+        let store = crate::store::Store::new(tmp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let mut fb = mk_payload_record("fb-frame");
+        fb.screenshot_filename = Some(
+            store
+                .save_attachment("fb-frame", "canvas.png", b"composite")
+                .unwrap(),
+        );
+        assert_eq!(desktop_revision_frame(&store, &fb).unwrap(), b"composite");
+        fb.background_filename = Some(
+            store
+                .save_attachment("fb-frame", "frame.png", b"clean")
+                .unwrap(),
+        );
+        assert_eq!(desktop_revision_frame(&store, &fb).unwrap(), b"clean");
+        fb.screenshot_filename = None;
+        fb.background_filename = None;
+        assert!(desktop_revision_frame(&store, &fb).is_err());
     }
 
     fn answer(q: &str, a: &str) -> crate::types::PlanAnswerPayload {
@@ -1944,6 +2340,8 @@ mod tests {
                 lineage_job_id: None,
                 local_delegate: None,
                 revision: Default::default(),
+                target_app: None,
+                background_filename: None,
             };
             store.save_feedback(&rec).unwrap();
             let engine = LineageEngine::new(&store);
@@ -2000,6 +2398,8 @@ mod tests {
             lineage_job_id: None,
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(&store);
@@ -2040,6 +2440,8 @@ mod tests {
             lineage_job_id: None,
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(store);

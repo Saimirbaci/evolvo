@@ -1,0 +1,490 @@
+//! Desktop overlay — "evolve any app".
+//!
+//! A global shortcut (default ⌘⇧E / Ctrl+Shift+E, override with
+//! `EVOLVO_DESKTOP_SHORTCUT`) snapshots whatever application is in front,
+//! freezes the monitor it is on, and opens a borderless always-on-top
+//! window showing that frozen frame with the Canvas + Feedback panel on
+//! top. Submitting goes through the ordinary `submit_feedback` command with
+//! a `targetApp` attached, so the feedback → lineage pipeline (I-P1) is the
+//! same one in-app feedback uses.
+//!
+//! Capture happens *before* the overlay is shown, so — unlike the in-app
+//! hide → capture → composite dance — nothing of Evolvo can leak into the
+//! screenshot, and the user draws on exactly what they saw.
+//!
+//! The in-app white canvas (Shell's Feedback FAB) is untouched: this is a
+//! second, separate surface for *other* applications.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+use crate::types::{current_time_unix_ms, TargetApp};
+
+pub const OVERLAY_LABEL: &str = "desktop-overlay";
+pub const CAPTURE_READY_EVENT: &str = "evolvo://desktop-capture";
+pub const DEFAULT_SHORTCUT: &str = "CommandOrControl+Shift+E";
+
+/// Longest edge (px) of the stored frozen frame. Retina full-screen PNGs
+/// otherwise blow past the 8 MB per-attachment cap.
+const MAX_CAPTURE_EDGE: u32 = 2560;
+
+/// System processes that own on-screen windows but are never the app the
+/// user means (menu bar, Dock, notification centre, …).
+const IGNORED_APP_NAMES: &[&str] = &[
+    "Window Server",
+    "Dock",
+    "Control Center",
+    "ControlCenter",
+    "Notification Center",
+    "NotificationCenter",
+    "SystemUIServer",
+    "Spotlight",
+    "loginwindow",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSession {
+    /// PNG of the frozen monitor, base64 (no data: prefix).
+    pub screenshot_base64: String,
+    pub width: u32,
+    pub height: u32,
+    /// `None` when the frontmost app could not be determined (or was
+    /// Evolvo itself); the feedback is then saved without a target.
+    pub target_app: Option<TargetApp>,
+    pub captured_at_unix_ms: u64,
+    /// Set when the overlay was opened by "Revise on Canvas" for an earlier
+    /// desktop feedback: the panel hydrates that record's annotations and
+    /// the frame is the original frozen screen (`frame.png`).
+    #[serde(default)]
+    pub revision_of: Option<String>,
+    #[serde(default)]
+    pub revision_agent: Option<crate::types::AgentKind>,
+    /// Hide Evolvo on close so focus returns to the captured app. True for
+    /// shortcut captures; false for revisions, which start in Evolvo.
+    #[serde(default)]
+    pub return_to_target: bool,
+}
+
+/// Process-wide holder for the capture currently displayed by the overlay.
+#[derive(Default)]
+pub struct DesktopState {
+    session: Mutex<Option<DesktopSession>>,
+}
+
+impl DesktopState {
+    pub fn current(&self) -> Option<DesktopSession> {
+        self.session.lock().ok().and_then(|s| s.clone())
+    }
+
+    fn set(&self, value: Option<DesktopSession>) {
+        if let Ok(mut s) = self.session.lock() {
+            *s = value;
+        }
+    }
+}
+
+pub fn shortcut_from_env() -> String {
+    std::env::var("EVOLVO_DESKTOP_SHORTCUT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_SHORTCUT.to_string())
+}
+
+/// Shortcut handler entry point. Capture runs off the event-loop thread
+/// (monitor capture + PNG encode take a few hundred ms) and the overlay is
+/// shown once the frame is ready.
+pub fn trigger(app: &AppHandle) {
+    // A second press while the overlay is up closes it (toggle), matching
+    // the in-app FAB's open/close semantics.
+    if let Some(win) = app.get_webview_window(OVERLAY_LABEL) {
+        if win.is_visible().unwrap_or(false) {
+            close_overlay(app);
+            return;
+        }
+    }
+    let app = app.clone();
+    std::thread::spawn(move || match capture_session() {
+        Ok((session, monitor)) => {
+            if let Some(state) = app.try_state::<DesktopState>() {
+                state.set(Some(session.clone()));
+            }
+            if let Err(err) = show_overlay(&app, &monitor) {
+                eprintln!("evolvo: desktop overlay failed to open: {err}");
+                return;
+            }
+            let _ = app.emit_to(
+                OVERLAY_LABEL,
+                CAPTURE_READY_EVENT,
+                &session.captured_at_unix_ms,
+            );
+        }
+        Err(err) => eprintln!("evolvo: desktop capture failed: {err}"),
+    });
+}
+
+/// Hide the overlay and, when the capture targeted another app, hand focus
+/// back to it instead of leaving Evolvo's main window in front.
+pub fn close_overlay(app: &AppHandle) {
+    let had_external_target = app
+        .try_state::<DesktopState>()
+        .and_then(|s| s.current())
+        .map(|s| s.return_to_target && s.target_app.is_some())
+        .unwrap_or(false);
+    if let Some(win) = app.get_webview_window(OVERLAY_LABEL) {
+        let _ = win.hide();
+    }
+    if let Some(state) = app.try_state::<DesktopState>() {
+        state.set(None);
+    }
+    #[cfg(target_os = "macos")]
+    if had_external_target {
+        let _ = app.hide();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = had_external_target;
+}
+
+struct MonitorRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn capture_session() -> Result<(DesktopSession, MonitorRect), String> {
+    let own_pid = std::process::id();
+    let front = frontmost_window(own_pid);
+
+    let monitor = front
+        .as_ref()
+        .and_then(|w| w.current_monitor().ok())
+        .or_else(primary_monitor)
+        .ok_or_else(|| "no monitor available to capture".to_string())?;
+    let rect = MonitorRect {
+        x: monitor.x().map_err(|e| e.to_string())?,
+        y: monitor.y().map_err(|e| e.to_string())?,
+        width: monitor.width().map_err(|e| e.to_string())?,
+        height: monitor.height().map_err(|e| e.to_string())?,
+    };
+
+    let rgba = monitor.capture_image().map_err(|e| e.to_string())?;
+    let rgba = downscale(rgba, MAX_CAPTURE_EDGE);
+    let (width, height) = (rgba.width(), rgba.height());
+    let mut buf: Vec<u8> = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+
+    let target_app = front.as_ref().and_then(describe_window);
+    Ok((
+        DesktopSession {
+            screenshot_base64: STANDARD.encode(&buf),
+            width,
+            height,
+            target_app,
+            captured_at_unix_ms: current_time_unix_ms(),
+            revision_of: None,
+            revision_agent: None,
+            return_to_target: true,
+        },
+        rect,
+    ))
+}
+
+/// "Revise on Canvas" for a desktop feedback: reopen the overlay on the
+/// primary monitor with the original frozen frame, so the user redraws over
+/// the screen they captured rather than over Evolvo's white canvas.
+pub fn open_revision(
+    app: &AppHandle,
+    feedback_id: &str,
+    agent: crate::types::AgentKind,
+    frame_png: &[u8],
+    target_app: Option<TargetApp>,
+) -> Result<(), String> {
+    let monitor = primary_monitor().ok_or_else(|| "no monitor available".to_string())?;
+    let rect = MonitorRect {
+        x: monitor.x().map_err(|e| e.to_string())?,
+        y: monitor.y().map_err(|e| e.to_string())?,
+        width: monitor.width().map_err(|e| e.to_string())?,
+        height: monitor.height().map_err(|e| e.to_string())?,
+    };
+    let (width, height) = image::load_from_memory(frame_png)
+        .map(|img| (img.width(), img.height()))
+        .unwrap_or((rect.width, rect.height));
+    let session = DesktopSession {
+        screenshot_base64: STANDARD.encode(frame_png),
+        width,
+        height,
+        target_app,
+        captured_at_unix_ms: current_time_unix_ms(),
+        revision_of: Some(feedback_id.to_string()),
+        revision_agent: Some(agent),
+        return_to_target: false,
+    };
+    if let Some(state) = app.try_state::<DesktopState>() {
+        state.set(Some(session.clone()));
+    }
+    show_overlay(app, &rect)?;
+    let _ = app.emit_to(
+        OVERLAY_LABEL,
+        CAPTURE_READY_EVENT,
+        &session.captured_at_unix_ms,
+    );
+    Ok(())
+}
+
+fn downscale(img: image::RgbaImage, max_edge: u32) -> image::RgbaImage {
+    let (w, h) = (img.width(), img.height());
+    let longest = w.max(h);
+    if longest <= max_edge || longest == 0 {
+        return img;
+    }
+    let scale = max_edge as f64 / longest as f64;
+    let nw = ((w as f64 * scale).round() as u32).max(1);
+    let nh = ((h as f64 * scale).round() as u32).max(1);
+    image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle)
+}
+
+fn primary_monitor() -> Option<xcap::Monitor> {
+    let monitors = xcap::Monitor::all().ok()?;
+    let primary = monitors
+        .iter()
+        .position(|m| m.is_primary().unwrap_or(false))
+        .unwrap_or(0);
+    monitors.into_iter().nth(primary)
+}
+
+/// The focused, visible window of the frontmost application, excluding
+/// Evolvo itself and OS chrome. `xcap::Window::all()` is ordered front to
+/// back, so the first eligible focused window is the one the user sees.
+fn frontmost_window(own_pid: u32) -> Option<xcap::Window> {
+    let windows = xcap::Window::all().ok()?;
+    let eligible = |w: &xcap::Window| -> bool {
+        let pid_ok = w.pid().map(|p| p != own_pid).unwrap_or(false);
+        let visible = !w.is_minimized().unwrap_or(false)
+            && w.width().unwrap_or(0) > 1
+            && w.height().unwrap_or(0) > 1;
+        let name = w.app_name().unwrap_or_default();
+        pid_ok && visible && !IGNORED_APP_NAMES.contains(&name.as_str())
+    };
+    let mut fallback: Option<xcap::Window> = None;
+    for w in windows {
+        if !eligible(&w) {
+            continue;
+        }
+        if w.is_focused().unwrap_or(false) {
+            return Some(w);
+        }
+        if fallback.is_none() {
+            fallback = Some(w);
+        }
+    }
+    fallback
+}
+
+fn describe_window(w: &xcap::Window) -> Option<TargetApp> {
+    let name = w.app_name().ok().filter(|n| !n.trim().is_empty())?;
+    let pid = w.pid().ok();
+    let executable_path = pid.and_then(executable_for_pid);
+    let bundle_id = executable_path
+        .as_deref()
+        .and_then(|p| bundle_id_for_executable(Path::new(p)));
+    let repo_path = executable_path
+        .as_deref()
+        .and_then(|p| guess_repo_from_executable(Path::new(p), home_dir().as_deref()))
+        .map(|p| p.display().to_string());
+    let (repo_source, repo_status) = if repo_path.is_some() {
+        ("executable".to_string(), "resolved".to_string())
+    } else {
+        (String::new(), String::new())
+    };
+    Some(TargetApp {
+        name,
+        window_title: w.title().unwrap_or_default(),
+        pid,
+        bundle_id,
+        executable_path,
+        repo_path,
+        repo_source,
+        repo_status,
+        ..Default::default()
+    })
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_for_pid(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn executable_for_pid(pid: u32) -> Option<String> {
+    // `ps -o comm=` prints the full executable path on macOS.
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then_some(path)
+}
+
+/// For an executable inside `Foo.app/Contents/MacOS/foo`, read
+/// `CFBundleIdentifier` from the bundle's Info.plist.
+fn bundle_id_for_executable(exe: &Path) -> Option<String> {
+    let bundle = enclosing_app_bundle(exe)?;
+    let plist = bundle.join("Contents").join("Info.plist");
+    if !plist.is_file() {
+        return None;
+    }
+    let out = Command::new("plutil")
+        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+        .arg(&plist)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+fn enclosing_app_bundle(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .find(|p| p.extension().map(|e| e == "app").unwrap_or(false))
+        .map(Path::to_path_buf)
+}
+
+/// Walk up from a running executable to the nearest git checkout. This is
+/// what makes "an open-source app I built locally" resolve automatically:
+/// `~/code/foo/target/release/foo` → `~/code/foo`. Stops before `home` so a
+/// dotfiles repo at `$HOME` never masquerades as an app's source.
+pub fn guess_repo_from_executable(exe: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    for dir in exe.ancestors().skip(1) {
+        if home.map(|h| dir == h).unwrap_or(false) || dir.parent().is_none() {
+            return None;
+        }
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+fn show_overlay(app: &AppHandle, rect: &MonitorRect) -> Result<(), String> {
+    let win = match app.get_webview_window(OVERLAY_LABEL) {
+        Some(win) => win,
+        None => WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::default())
+            .title("Evolvo — Desktop feedback")
+            // The UI picks its root component from this flag (see
+            // `ui/src/main.rs`): the overlay mounts canvas + panel only.
+            .initialization_script("window.__EVOLVO_MODE__ = 'desktop';")
+            .decorations(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .visible_on_all_workspaces(true)
+            .visible(false)
+            .build()
+            .map_err(|e| e.to_string())?,
+    };
+    let pos = tauri::LogicalPosition::new(rect.x as f64, rect.y as f64);
+    let size = tauri::LogicalSize::new(rect.width as f64, rect.height as f64);
+    win.set_position(pos).map_err(|e| e.to_string())?;
+    win.set_size(size).map_err(|e| e.to_string())?;
+    win.show().map_err(|e| e.to_string())?;
+    let _ = win.set_always_on_top(true);
+    let _ = win.set_focus();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_guess_walks_up_from_build_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("code").join("foo");
+        let exe_dir = repo.join("target").join("release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let exe = exe_dir.join("foo");
+        std::fs::write(&exe, b"").unwrap();
+        assert_eq!(guess_repo_from_executable(&exe, None), Some(repo));
+    }
+
+    #[test]
+    fn repo_guess_stops_at_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let exe_dir = home.join("Applications").join("Foo.app").join("Contents");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe = exe_dir.join("foo");
+        assert_eq!(guess_repo_from_executable(&exe, Some(&home)), None);
+    }
+
+    #[test]
+    fn repo_guess_none_for_installed_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("Applications/Foo.app/Contents/MacOS/foo");
+        assert_eq!(guess_repo_from_executable(&exe, None), None);
+    }
+
+    #[test]
+    fn finds_enclosing_app_bundle() {
+        let exe = Path::new("/Applications/Foo.app/Contents/MacOS/foo");
+        assert_eq!(
+            enclosing_app_bundle(exe),
+            Some(PathBuf::from("/Applications/Foo.app"))
+        );
+        assert_eq!(enclosing_app_bundle(Path::new("/usr/bin/foo")), None);
+    }
+
+    #[test]
+    fn downscale_caps_longest_edge() {
+        let img = image::RgbaImage::new(5120, 2880);
+        let out = downscale(img, 2560);
+        assert_eq!((out.width(), out.height()), (2560, 1440));
+        let small = image::RgbaImage::new(800, 600);
+        assert_eq!(downscale(small, 2560).dimensions(), (800, 600));
+    }
+
+    #[test]
+    fn session_round_trips_camel_case() {
+        let s = DesktopSession {
+            screenshot_base64: "AA==".into(),
+            width: 10,
+            height: 5,
+            target_app: Some(TargetApp {
+                name: "Foo".into(),
+                ..Default::default()
+            }),
+            captured_at_unix_ms: 1,
+            revision_of: None,
+            revision_agent: None,
+            return_to_target: true,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("screenshotBase64"));
+        assert!(json.contains("targetApp"));
+        let back: DesktopSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+}

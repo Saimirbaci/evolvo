@@ -362,7 +362,33 @@ fn attempt_merge(
 
 /// Public entry point used by production code: real cargo-backed gates.
 pub fn promote_job(store: &Store, job_id: &str) -> PromotionOutcome {
-    promote_job_with_gates(store, job_id, &default_gates())
+    // Desktop-overlay jobs merge into another application's repo: gate on
+    // that project's own detected build commands, not Evolvo's cargo gates.
+    let external = store
+        .load_lineage_job(job_id)
+        .ok()
+        .flatten()
+        .and_then(|job| store.load_feedback(&job.feedback_id).ok().flatten())
+        .is_some_and(|fb| fb.target_app.is_some());
+    let gates = if external {
+        external_gates()
+    } else {
+        default_gates()
+    };
+    promote_job_with_gates(store, job_id, &gates)
+}
+
+/// Post-merge gate for an external repo: the same detected build checks
+/// the run was validated with (`external::validate_external_gates`).
+fn external_gates() -> Vec<Gate> {
+    vec![Box::new(|repo| {
+        let report = crate::external::validate_external_gates(repo);
+        if report.passed {
+            Ok(())
+        } else {
+            Err(report.failure_block())
+        }
+    })]
 }
 
 /// Testable core: takes an explicit gate list so tests can stub out the
@@ -619,6 +645,8 @@ mod tests {
             lineage_job_id: None,
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         }
     }
 

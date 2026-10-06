@@ -39,7 +39,7 @@ pub struct CheckResult {
 }
 
 impl StageReport {
-    fn new(stage: &str) -> Self {
+    pub(crate) fn new(stage: &str) -> Self {
         Self {
             stage: stage.to_string(),
             passed: false,
@@ -49,7 +49,7 @@ impl StageReport {
         }
     }
 
-    fn push<S: Into<String>>(&mut self, name: &str, passed: bool, detail: S) {
+    pub(crate) fn push<S: Into<String>>(&mut self, name: &str, passed: bool, detail: S) {
         self.checks.push(CheckResult {
             name: name.to_string(),
             passed,
@@ -57,7 +57,7 @@ impl StageReport {
         });
     }
 
-    fn finalize(mut self) -> Self {
+    pub(crate) fn finalize(mut self) -> Self {
         let fails: Vec<&CheckResult> = self.checks.iter().filter(|c| !c.passed).collect();
         self.passed = fails.is_empty();
         self.headline = if self.passed {
@@ -1889,9 +1889,9 @@ const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60
 /// combined stdout/stderr, so a failed check can say *what* broke instead
 /// of "exited non-zero" — that tail is exactly what the Reflexion retry
 /// prompt needs to fix the right thing.
-struct ToolRun {
-    success: bool,
-    tail: String,
+pub(crate) struct ToolRun {
+    pub(crate) success: bool,
+    pub(crate) tail: String,
 }
 
 fn run_cargo(worktree: &Path, args: &[&str]) -> Result<ToolRun, String> {
@@ -1904,7 +1904,18 @@ fn run_cargo(worktree: &Path, args: &[&str]) -> Result<ToolRun, String> {
 /// where cargo and trunk actually live). Output is captured via a temp
 /// file — piping would deadlock once the child writes more than the pipe
 /// buffer, which cargo error output easily does.
-fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<ToolRun, String> {
+pub(crate) fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<ToolRun, String> {
+    run_tool_with_timeout(dir, program, args, TOOL_TIMEOUT)
+}
+
+/// `run_tool` with an explicit timeout — external-app gates (see
+/// `external.rs`) build arbitrary, often much larger, projects.
+pub(crate) fn run_tool_with_timeout(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<ToolRun, String> {
     let capture = tempfile::NamedTempFile::new().map_err(|e| format!("tool capture file: {e}"))?;
     let out = capture
         .reopen()
@@ -1919,14 +1930,14 @@ fn run_tool(dir: &Path, program: &str, args: &[&str]) -> Result<ToolRun, String>
         .env("PATH", crate::runner::enriched_path())
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err));
-    match crate::proc::run_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+    match crate::proc::run_with_timeout(&mut cmd, timeout) {
         Ok(crate::proc::WaitOutcome::Exited(s)) => Ok(ToolRun {
             success: s.success(),
             tail: read_tail(capture.path(), 1500),
         }),
         Ok(crate::proc::WaitOutcome::TimedOut) => Err(format!(
             "{program} timed out after {}s (process group killed)",
-            TOOL_TIMEOUT.as_secs()
+            timeout.as_secs()
         )),
         Err(e) => Err(format!("spawn {program}: {e}")),
     }
@@ -1947,7 +1958,7 @@ fn read_tail(path: &Path, max_chars: usize) -> String {
 
 /// Push one tool-gate result onto the report, carrying the output tail
 /// into the detail on failure.
-fn push_tool_gate(r: &mut StageReport, name: &str, res: Result<ToolRun, String>) {
+pub(crate) fn push_tool_gate(r: &mut StageReport, name: &str, res: Result<ToolRun, String>) {
     match res {
         Ok(t) if t.success => r.push(name, true, "ok"),
         Ok(t) => r.push(

@@ -2018,3 +2018,80 @@ button {
 .plan-design-reason {
     color: var(--muted);
 }
+
+/* ---------------------------------------------------------------------
+   Desktop overlay ("evolve any app") — host window `desktop-overlay`,
+   root component `desktop_overlay.rs`. The frozen monitor frame fills the
+   window; the canvas overlay and feedback panel sit on top exactly as in
+   the in-app overlay, minus the app bar offset.
+   --------------------------------------------------------------------- */
+.desktop-root {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    background: var(--fg-strong);
+}
+
+.desktop-frame {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: fill;
+    user-select: none;
+    pointer-events: none;
+}
+
+.desktop-root .canvas-overlay {
+    top: 0;
+}
+
+.desktop-target,
+.lineage-target-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-sunken);
+    color: var(--fg);
+    font-size: var(--text-xs);
+    line-height: 1.4;
+}
+
+.desktop-target-label,
+.lineage-target-label {
+    margin-right: var(--space-1);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: var(--weight-semibold);
+}
+
+.desktop-target-title,
+.desktop-target-repo,
+.lineage-target-repo,
+.lineage-target-note {
+    color: var(--muted);
+    word-break: break-all;
+}
+
+.desktop-target-unresolved,
+.lineage-target-unresolved {
+    color: var(--danger);
+    font-weight: var(--weight-medium);
+}
+
+.lineage-target-actions {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+    margin-top: var(--space-1);
+}
+
+.lineage-target-input {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--text-xs);
+}

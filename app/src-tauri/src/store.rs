@@ -567,7 +567,7 @@ fn content_hash(bytes: &[u8]) -> String {
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
-fn sanitise_filename(name: &str) -> String {
+pub fn sanitise_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -615,6 +615,8 @@ mod tests {
             lineage_job_id: None,
             local_delegate: None,
             revision: Default::default(),
+            target_app: None,
+            background_filename: None,
         }
     }
 
