@@ -2321,9 +2321,12 @@ pub fn cleanup_old_workspaces(store: &Store, max_age_days: u64) -> WorkspaceClea
         let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        // Never walk into the orphan quarantine dir itself, and skip
-        // anything that isn't a plain job-id directory.
-        if dir_name == ORPHANED_WORKSPACES_DIR {
+        // Never walk into the orphan quarantine dir itself, and never touch
+        // anything that isn't a job workspace: users (and external-app
+        // resolution) may keep git checkouts here — e.g. a hand-cloned
+        // `lineage_workspaces/zed` used as an external app's source repo.
+        // Moving one would orphan every worktree forked from it.
+        if !is_job_workspace_dir(dir_name, &path) {
             continue;
         }
 
@@ -2356,6 +2359,14 @@ pub fn cleanup_old_workspaces(store: &Store, max_age_days: u64) -> WorkspaceClea
 }
 
 const ORPHANED_WORKSPACES_DIR: &str = ".orphaned";
+
+/// A directory the retention sweep may manage: named like a job id
+/// (`job-…`, see `lineage.rs`) and not itself a git checkout. Job
+/// workspaces hold a `worktree/` *subdirectory*; a `.git` at the top level
+/// means someone put a repository here.
+fn is_job_workspace_dir(dir_name: &str, path: &Path) -> bool {
+    dir_name.starts_with("job-") && !path.join(".git").exists()
+}
 
 /// Move a lineage-workspace directory with no matching job record into
 /// `lineage_workspaces/.orphaned/<dir_name>` (appending a unix-ms suffix
@@ -3488,6 +3499,31 @@ mod tests {
             "recordless dir must survive under .orphaned/"
         );
         assert!(quarantined.join("marker.txt").exists());
+    }
+
+    #[test]
+    fn cleanup_old_workspaces_never_touches_repos_or_non_job_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let root = lineage_workspaces_root(store.layout().root());
+
+        // A hand-cloned external source repo kept in the workspace.
+        let repo = root.join("zed");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // A non-job directory without .git, and a job-named git checkout.
+        let other = root.join("scratch");
+        fs::create_dir_all(&other).unwrap();
+        let job_named_repo = root.join("job-looks-like-a-job");
+        fs::create_dir_all(job_named_repo.join(".git")).unwrap();
+
+        let summary = cleanup_old_workspaces(&store, 30);
+        assert_eq!(summary.quarantined, 0);
+        assert_eq!(summary.removed, 0);
+        assert!(repo.join(".git").exists());
+        assert!(other.exists());
+        assert!(job_named_repo.join(".git").exists());
+        assert!(!root.join(ORPHANED_WORKSPACES_DIR).exists());
     }
 
     #[test]
