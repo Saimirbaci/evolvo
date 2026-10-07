@@ -125,6 +125,8 @@ impl LineageEventSink for TauriLineageEventSink {
         // app's live Lineage projection.
         if workspace_root == self.workspace_root {
             let _ = self.app.emit(JOB_UPSERTED_EVENT, event);
+            // Desktop notification on milestone status changes.
+            crate::notify::observe_job(&event.job);
         }
     }
 

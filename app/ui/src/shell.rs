@@ -34,8 +34,8 @@ use crate::feedback_panel::{FeedbackPanel, FeedbackRevisionRequest};
 use crate::interop;
 use crate::toolbar::Toolbar;
 use crate::types::{
-    AppHealth, DelegationSummary, DesignPlan, FeedbackRecord, LineageJobRecord, LineageJobStatus,
-    PreviewSummary,
+    AppHealth, DelegationSummary, DesignPlan, FeedbackRecord, JobActivity, LineageJobRecord,
+    LineageJobStatus, PreviewSummary,
 };
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
@@ -972,6 +972,20 @@ fn LineageDetail(
             }
         });
     });
+    // Live agent activity: refreshed when the watcher reports a log/worktree
+    // change for this job (artifact_reload) or the job record changes.
+    let activity: RwSignal<Option<JobActivity>> = RwSignal::new(None);
+    let activity_job_id = record.id.clone();
+    Effect::new(move |_| {
+        reload.track();
+        artifact_reload.track();
+        let id = activity_job_id.clone();
+        spawn_local(async move {
+            if let Ok(a) = interop::read_job_activity(&id).await {
+                activity.set(Some(a));
+            }
+        });
+    });
     let repo_input: RwSignal<String> = RwSignal::new(String::new());
     let repo_busy: RwSignal<bool> = RwSignal::new(false);
     let resolve_job_id = record.id.clone();
@@ -1169,6 +1183,8 @@ fn LineageDetail(
                     </div>
                 }
             })}
+
+            {move || activity.get().filter(show_activity).map(|a| view! { <ActivityPanel activity=a /> })}
 
             {move || feedback_record.get().and_then(|feedback| {
                 let revision = feedback.revision;
@@ -1838,6 +1854,107 @@ fn EvolveConfirmation(
                 </footer>
             </div>
         </div>
+    }
+}
+
+/// Worth showing once there is something to show: a run in progress,
+/// transcript lines, or changes on disk.
+fn show_activity(a: &JobActivity) -> bool {
+    a.running || !a.events.is_empty() || !a.changed_files.is_empty()
+}
+
+fn format_duration(ms: u64) -> String {
+    let mins = ms / 60_000;
+    if mins >= 60 {
+        format!("{}h {}m", mins / 60, mins % 60)
+    } else if mins >= 1 {
+        format!("{mins}m")
+    } else {
+        format!("{}s", ms / 1000)
+    }
+}
+
+/// Phase stepper + "now" line + recent agent actions + changed files.
+#[component]
+fn ActivityPanel(activity: JobActivity) -> impl IntoView {
+    let now = js_sys::Date::now() as u64;
+    let timing = match (
+        activity.duration_ms,
+        activity.started_at_unix_ms,
+        activity.running,
+    ) {
+        (Some(d), _, false) => Some(format!("Agent took {}", format_duration(d))),
+        (_, Some(start), true) => Some(format!(
+            "Running for {}",
+            format_duration(now.saturating_sub(start))
+        )),
+        _ => None,
+    };
+    let cost = activity.cost_usd.map(|c| format!("${c:.2}"));
+    let meta = [timing, cost]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let running = activity.running;
+    let now_line = activity.current.clone().filter(|_| running);
+    let events_count = activity.events.len();
+    let files_count = activity.changed_files.len();
+    // Newest first: the reader cares about what just happened.
+    let events: Vec<_> = activity.events.iter().rev().cloned().collect();
+    let files = activity.changed_files.clone();
+    view! {
+        <section class="activity-panel" aria-label="Agent activity">
+            <div class="activity-head">
+                <strong>{if running { "Agent activity · live" } else { "Agent activity" }}</strong>
+                <span class="activity-meta">{meta}</span>
+            </div>
+            <ol class="activity-steps">
+                {activity.phases.into_iter().map(|p| {
+                    let class = format!("activity-step activity-step-{}", p.state);
+                    view! { <li class=class>{p.label}</li> }
+                }).collect_view()}
+            </ol>
+            {now_line.map(|line| view! {
+                <div class="activity-now" role="status">
+                    <span class="activity-pulse" aria-hidden="true"></span>
+                    <span>{line}</span>
+                </div>
+            })}
+            {(events_count > 0).then(|| view! {
+                <details class="activity-section" open=running>
+                    <summary>{format!("Recent steps ({events_count})")}</summary>
+                    <ul class="activity-feed">
+                        {events.into_iter().map(|e| {
+                            let icon = match (e.kind.as_str(), e.tool.as_deref()) {
+                                ("message", _) => "💬",
+                                ("result", _) => "✓",
+                                (_, Some("Edit" | "MultiEdit" | "Write" | "NotebookEdit")) => "✎",
+                                (_, Some("Bash")) => "▸",
+                                (_, Some("Read" | "Grep" | "Glob")) => "◎",
+                                (_, Some("WebSearch" | "WebFetch")) => "🌐",
+                                _ => "·",
+                            };
+                            let class = format!("activity-item activity-item-{}", e.kind);
+                            view! {
+                                <li class=class>
+                                    <span class="activity-icon" aria-hidden="true">{icon}</span>
+                                    <span>{e.text}</span>
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                </details>
+            })}
+            {(files_count > 0).then(|| view! {
+                <details class="activity-section">
+                    <summary>{format!("Changed files ({files_count})")}</summary>
+                    <ul class="activity-files">
+                        {files.into_iter().map(|f| view! { <li><code>{f}</code></li> }).collect_view()}
+                    </ul>
+                </details>
+            })}
+        </section>
     }
 }
 

@@ -1478,6 +1478,20 @@ pub struct CaptureDesktopWindowPayload {
     pub id: u32,
 }
 
+/// Live "what is the agent doing" view for a job: phase, recent actions
+/// from the transcript, changed files. See `activity.rs`.
+#[tauri::command]
+pub async fn read_job_activity(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<crate::activity::JobActivity, String> {
+    let store = state.store();
+    // Reads the transcript tail and runs `git diff`; keep it off the IPC thread.
+    tauri::async_runtime::spawn_blocking(move || crate::activity::job_activity(&store, &payload.id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Hide the desktop overlay and return focus to the captured app.
 #[tauri::command]
 pub fn close_desktop_overlay(app: tauri::AppHandle) -> Result<(), String> {

@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod agent;
 pub mod bundle;
 pub mod commands;
@@ -9,6 +10,7 @@ pub mod external;
 pub mod fsutil;
 pub mod lineage;
 pub mod lineage_events;
+pub mod notify;
 pub mod plan;
 pub mod proc;
 pub mod promotion;

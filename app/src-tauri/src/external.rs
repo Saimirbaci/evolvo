@@ -400,6 +400,7 @@ fn clone_into_workspace(
     note(&format!(
         "cloning {url} (this can take a while for large projects)…"
     ));
+    crate::notify::desktop_notify("Evolvo — cloning source", &format!("Cloning {url}…"));
     cloner(url, &partial)?;
     std::fs::rename(&partial, &dest).map_err(|e| format!("finalise clone: {e}"))?;
     note(&format!("cloned into {}", dest.display()));
@@ -708,6 +709,10 @@ pub fn start_resolution(
             }
             Err(err) => {
                 note(&format!("not resolved — {err}"));
+                crate::notify::desktop_notify(
+                    &format!("Evolvo — couldn't find {}'s source", target.name),
+                    &err,
+                );
                 update_target(&store, &feedback.id, |t| {
                     t.repo_status = "failed".into();
                     t.repo_error = Some(err.clone());

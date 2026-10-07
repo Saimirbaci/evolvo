@@ -869,3 +869,49 @@ pub struct AnswerPlanQuestionsPayload {
     pub answers: Vec<PlanAnswerPayload>,
     pub replan: bool,
 }
+
+/// One readable step from the agent's transcript (`activity.rs` on host).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEvent {
+    /// `tool`, `message`, `result` or `output`.
+    pub kind: String,
+    #[serde(default)]
+    pub tool: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseStep {
+    pub key: String,
+    pub label: String,
+    /// `done`, `active`, `failed` or `pending`.
+    pub state: String,
+}
+
+/// Live "what is the agent doing" view of a lineage job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobActivity {
+    pub job_id: String,
+    pub phase: String,
+    #[serde(default)]
+    pub phases: Vec<PhaseStep>,
+    #[serde(default)]
+    pub current: Option<String>,
+    #[serde(default)]
+    pub events: Vec<ActivityEvent>,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub log_updated_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub running: bool,
+}

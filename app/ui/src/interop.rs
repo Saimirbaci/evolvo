@@ -7,7 +7,7 @@ use web_sys::window;
 
 use crate::types::{
     AgentAvailability, AgentKind, AnswerPlanQuestionsPayload, AppHealth, DelegationSummary,
-    DesignSummary, DesktopSession, EditableDesign, EditableFeedback, FeedbackRecord,
+    DesignSummary, DesktopSession, EditableDesign, EditableFeedback, FeedbackRecord, JobActivity,
     LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted, LocalDelegateAvailability,
     PlanAnswerPayload, PreviewSummary, SaveDesignPayload, SketchRequest, SketchResponse,
     StageState, SubmitFeedbackPayload, WindowCapture,
@@ -283,6 +283,11 @@ pub async fn capture_desktop_window(id: u32) -> Result<WindowCapture, String> {
         &CaptureDesktopWindowPayload { id },
     )
     .await
+}
+
+/// Live activity (phase, recent agent actions, changed files) for a job.
+pub async fn read_job_activity(id: &str) -> Result<JobActivity, String> {
+    invoke_command_with_args("read_job_activity", &IdArg { id }).await
 }
 
 /// Hide the desktop overlay window and hand focus back to the captured app.

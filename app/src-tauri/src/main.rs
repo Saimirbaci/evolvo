@@ -98,6 +98,7 @@ fn main() {
             commands::capture_window_png,
             commands::take_desktop_capture,
             commands::close_desktop_overlay,
+            commands::read_job_activity,
             commands::capture_desktop_window,
             commands::open_desktop_revision,
             commands::resolve_target_repo,
