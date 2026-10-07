@@ -414,13 +414,18 @@ pub fn FeedbackPanel(
                 let background_base64 = desktop_session
                     .as_ref()
                     .map(|session| session.screenshot_base64.clone());
-                let target_app = desktop_session.and_then(|session| session.target_app);
+                let target_app = desktop_session
+                    .as_ref()
+                    .and_then(|session| session.target_app.clone());
+                let frame_rect = desktop_session.as_ref().and_then(|_| desktop_frame_rect());
 
                 // Composite: page as backdrop, annotation PNG stretched on top.
                 let screenshot = match (page_b64.as_deref(), anno_url.as_deref()) {
-                    (Some(page), Some(anno)) => composite_page_and_annotations(page, anno)
-                        .await
-                        .or_else(|| Some(page.to_string())),
+                    (Some(page), Some(anno)) => {
+                        composite_page_and_annotations(page, anno, frame_rect)
+                            .await
+                            .or_else(|| Some(page.to_string()))
+                    }
                     (Some(page), None) => Some(page.to_string()),
                     (None, Some(anno)) => Some(
                         anno.split(',')
@@ -436,9 +441,11 @@ pub fn FeedbackPanel(
                 for draft in storyboard_drafts {
                     let screen_screenshot =
                         match (page_b64.as_deref(), draft.annotation_data_url.as_deref()) {
-                            (Some(page), Some(anno)) => composite_page_and_annotations(page, anno)
-                                .await
-                                .or_else(|| Some(page.to_string())),
+                            (Some(page), Some(anno)) => {
+                                composite_page_and_annotations(page, anno, frame_rect)
+                                    .await
+                                    .or_else(|| Some(page.to_string()))
+                            }
                             (Some(page), None) => Some(page.to_string()),
                             (None, Some(anno)) => anno
                                 .split(',')
@@ -1202,7 +1209,27 @@ async fn wait_two_frames() {
 /// element's actual bounding rect in the captured image — not stretched to
 /// the full page — so strokes stay aligned with the page content they're
 /// annotating (the app bar stays visible, strokes don't creep over it).
-async fn composite_page_and_annotations(page_b64: &str, anno_data_url: &str) -> Option<String> {
+/// Where the desktop overlay displays its frozen frame (`.desktop-frame`),
+/// in CSS px. Whole-screen mode fills the viewport; window mode shows one
+/// window centred and scaled, so strokes must be mapped onto that rect.
+fn desktop_frame_rect() -> Option<(f64, f64, f64, f64)> {
+    let el = window()?
+        .document()?
+        .query_selector(".desktop-frame")
+        .ok()
+        .flatten()?;
+    let r = el.get_bounding_client_rect();
+    (r.width() > 0.0 && r.height() > 0.0).then(|| (r.left(), r.top(), r.width(), r.height()))
+}
+
+/// `frame_rect` (CSS px) is where `page_b64` is displayed on screen — the
+/// desktop overlay passes it so the annotation layer lands on the right
+/// part of the image. `None` keeps the in-app mapping (page = window).
+async fn composite_page_and_annotations(
+    page_b64: &str,
+    anno_data_url: &str,
+    frame_rect: Option<(f64, f64, f64, f64)>,
+) -> Option<String> {
     let page_url = format!("data:image/png;base64,{page_b64}");
     let page_img = load_image(&page_url).await?;
     let anno_img = load_image(anno_data_url).await?;
@@ -1247,17 +1274,31 @@ async fn composite_page_and_annotations(page_b64: &str, anno_data_url: &str) -> 
             .flatten()
             .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
         let rect = surface.as_ref().map(|el| el.get_bounding_client_rect());
-        let scale_x = pw as f64 / inner_w;
-        let scale_y = pw as f64 / inner_w; // preserve aspect using width ratio
-        let chrome_offset = (ph as f64 - inner_h * scale_y).max(0.0);
-        match rect {
-            Some(r) => (
-                r.left() * scale_x,
-                chrome_offset + r.top() * scale_y,
-                r.width() * scale_x,
-                r.height() * scale_y,
-            ),
-            None => (0.0, 0.0, pw as f64, ph as f64),
+        if let (Some((fx, fy, fw, fh)), Some(r)) = (frame_rect, rect.as_ref()) {
+            // Desktop overlay: map the surface rect into the displayed frame
+            // rect, then scale CSS px → image px. Strokes outside the frame
+            // fall off the image edge (the canvas clips them).
+            let kx = pw as f64 / fw;
+            let ky = ph as f64 / fh;
+            (
+                (r.left() - fx) * kx,
+                (r.top() - fy) * ky,
+                r.width() * kx,
+                r.height() * ky,
+            )
+        } else {
+            let scale_x = pw as f64 / inner_w;
+            let scale_y = pw as f64 / inner_w; // preserve aspect using width ratio
+            let chrome_offset = (ph as f64 - inner_h * scale_y).max(0.0);
+            match rect {
+                Some(r) => (
+                    r.left() * scale_x,
+                    chrome_offset + r.top() * scale_y,
+                    r.width() * scale_x,
+                    r.height() * scale_y,
+                ),
+                None => (0.0, 0.0, pw as f64, ph as f64),
+            }
         }
     };
 

@@ -70,7 +70,42 @@ pub struct DesktopSession {
     /// shortcut captures; false for revisions, which start in Evolvo.
     #[serde(default)]
     pub return_to_target: bool,
+    /// Visible windows on the captured monitor, front to back, for the
+    /// overlay's window picker (W). Rects are in CSS px / points relative
+    /// to the monitor — the overlay window is sized to the monitor, so they
+    /// map 1:1 onto the overlay viewport.
+    #[serde(default)]
+    pub windows: Vec<PickableWindow>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PickableWindow {
+    pub id: u32,
+    pub app_name: String,
+    pub title: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// The window of the app that was frontmost at shortcut time — the
+    /// picker pre-highlights it so Enter means "the active window".
+    pub focused: bool,
+}
+
+/// A single window captured on its own (window mode).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowCapture {
+    pub screenshot_base64: String,
+    pub width: u32,
+    pub height: u32,
+    pub target_app: Option<TargetApp>,
+}
+
+/// Windows smaller than this (after clipping to the monitor) are not
+/// offered by the picker — tooltips, badges, menu-bar extras.
+const MIN_PICKABLE_EDGE: u32 = 40;
 
 /// Process-wide holder for the capture currently displayed by the overlay.
 #[derive(Default)]
@@ -161,7 +196,8 @@ struct MonitorRect {
 
 fn capture_session() -> Result<(DesktopSession, MonitorRect), String> {
     let own_pid = std::process::id();
-    let front = frontmost_window(own_pid);
+    let candidates = eligible_windows(own_pid);
+    let front = frontmost_of(&candidates);
 
     let monitor = front
         .as_ref()
@@ -184,6 +220,8 @@ fn capture_session() -> Result<(DesktopSession, MonitorRect), String> {
         .map_err(|e| e.to_string())?;
 
     let target_app = front.as_ref().and_then(describe_window);
+    let front_pid = front.as_ref().and_then(|w| w.pid().ok());
+    let windows = pickable_windows(&candidates, &rect, front_pid);
     Ok((
         DesktopSession {
             screenshot_base64: STANDARD.encode(&buf),
@@ -194,9 +232,90 @@ fn capture_session() -> Result<(DesktopSession, MonitorRect), String> {
             revision_of: None,
             revision_agent: None,
             return_to_target: true,
+            windows,
         },
         rect,
     ))
+}
+
+/// Window mode: capture one window on its own (other windows covering it,
+/// including this overlay, are excluded by the OS), and describe its app.
+pub fn capture_window(id: u32) -> Result<WindowCapture, String> {
+    let window = xcap::Window::all()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|w| w.id().ok() == Some(id))
+        .ok_or_else(|| "that window is no longer open".to_string())?;
+    let rgba = window.capture_image().map_err(|e| e.to_string())?;
+    let rgba = downscale(rgba, MAX_CAPTURE_EDGE);
+    let (width, height) = (rgba.width(), rgba.height());
+    let mut buf: Vec<u8> = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(WindowCapture {
+        screenshot_base64: STANDARD.encode(&buf),
+        width,
+        height,
+        target_app: describe_window(&window),
+    })
+}
+
+/// Clip a window rect (global points) to the monitor and return it relative
+/// to the monitor origin, or `None` when too little of it is on this monitor.
+fn rect_on_monitor(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    monitor: &MonitorRect,
+) -> Option<(i32, i32, u32, u32)> {
+    let left = x.max(monitor.x);
+    let top = y.max(monitor.y);
+    let right = (x + width as i32).min(monitor.x + monitor.width as i32);
+    let bottom = (y + height as i32).min(monitor.y + monitor.height as i32);
+    if right - left < MIN_PICKABLE_EDGE as i32 || bottom - top < MIN_PICKABLE_EDGE as i32 {
+        return None;
+    }
+    Some((
+        left - monitor.x,
+        top - monitor.y,
+        (right - left) as u32,
+        (bottom - top) as u32,
+    ))
+}
+
+fn pickable_windows(
+    candidates: &[xcap::Window],
+    monitor: &MonitorRect,
+    front_pid: Option<u32>,
+) -> Vec<PickableWindow> {
+    let mut focused_assigned = false;
+    candidates
+        .iter()
+        .filter_map(|w| {
+            let (x, y, width, height) = rect_on_monitor(
+                w.x().ok()?,
+                w.y().ok()?,
+                w.width().ok()?,
+                w.height().ok()?,
+                monitor,
+            )?;
+            // Only the frontmost window of the active app counts as focused.
+            let focused = !focused_assigned && w.pid().ok().is_some() && w.pid().ok() == front_pid;
+            focused_assigned |= focused;
+            Some(PickableWindow {
+                id: w.id().ok()?,
+                app_name: w.app_name().unwrap_or_default(),
+                title: w.title().unwrap_or_default(),
+                x,
+                y,
+                width,
+                height,
+                focused,
+            })
+        })
+        .collect()
 }
 
 /// "Revise on Canvas" for a desktop feedback: reopen the overlay on the
@@ -228,6 +347,7 @@ pub fn open_revision(
         revision_of: Some(feedback_id.to_string()),
         revision_agent: Some(agent),
         return_to_target: false,
+        windows: Vec::new(),
     };
     if let Some(state) = app.try_state::<DesktopState>() {
         state.set(Some(session.clone()));
@@ -265,29 +385,33 @@ fn primary_monitor() -> Option<xcap::Monitor> {
 /// The focused, visible window of the frontmost application, excluding
 /// Evolvo itself and OS chrome. `xcap::Window::all()` is ordered front to
 /// back, so the first eligible focused window is the one the user sees.
-fn frontmost_window(own_pid: u32) -> Option<xcap::Window> {
-    let windows = xcap::Window::all().ok()?;
-    let eligible = |w: &xcap::Window| -> bool {
-        let pid_ok = w.pid().map(|p| p != own_pid).unwrap_or(false);
-        let visible = !w.is_minimized().unwrap_or(false)
-            && w.width().unwrap_or(0) > 1
-            && w.height().unwrap_or(0) > 1;
-        let name = w.app_name().unwrap_or_default();
-        pid_ok && visible && !IGNORED_APP_NAMES.contains(&name.as_str())
+/// On-screen windows of other apps, front to back (the order
+/// `xcap::Window::all()` returns), excluding Evolvo itself and OS chrome.
+fn eligible_windows(own_pid: u32) -> Vec<xcap::Window> {
+    let Ok(windows) = xcap::Window::all() else {
+        return Vec::new();
     };
-    let mut fallback: Option<xcap::Window> = None;
-    for w in windows {
-        if !eligible(&w) {
-            continue;
-        }
-        if w.is_focused().unwrap_or(false) {
-            return Some(w);
-        }
-        if fallback.is_none() {
-            fallback = Some(w);
-        }
-    }
-    fallback
+    windows
+        .into_iter()
+        .filter(|w| {
+            let pid_ok = w.pid().map(|p| p != own_pid).unwrap_or(false);
+            let visible = !w.is_minimized().unwrap_or(false)
+                && w.width().unwrap_or(0) > 1
+                && w.height().unwrap_or(0) > 1;
+            let name = w.app_name().unwrap_or_default();
+            pid_ok && visible && !IGNORED_APP_NAMES.contains(&name.as_str())
+        })
+        .collect()
+}
+
+/// The focused window of the frontmost application, else the topmost
+/// eligible window.
+fn frontmost_of(candidates: &[xcap::Window]) -> Option<xcap::Window> {
+    candidates
+        .iter()
+        .find(|w| w.is_focused().unwrap_or(false))
+        .or_else(|| candidates.first())
+        .cloned()
 }
 
 fn describe_window(w: &xcap::Window) -> Option<TargetApp> {
@@ -458,6 +582,29 @@ mod tests {
     }
 
     #[test]
+    fn rect_on_monitor_clips_and_relativises() {
+        let mon = MonitorRect {
+            x: 1512,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        // Fully inside a secondary monitor → relative to its origin.
+        assert_eq!(
+            rect_on_monitor(1612, 100, 800, 600, &mon),
+            Some((100, 100, 800, 600))
+        );
+        // Straddling the left edge → clipped to the visible part.
+        assert_eq!(
+            rect_on_monitor(1400, 50, 400, 300, &mon),
+            Some((0, 50, 288, 300))
+        );
+        // On another monitor, or a sliver → not pickable.
+        assert_eq!(rect_on_monitor(0, 0, 800, 600, &mon), None);
+        assert_eq!(rect_on_monitor(1500, 0, 30, 600, &mon), None);
+    }
+
+    #[test]
     fn downscale_caps_longest_edge() {
         let img = image::RgbaImage::new(5120, 2880);
         let out = downscale(img, 2560);
@@ -480,6 +627,7 @@ mod tests {
             revision_of: None,
             revision_agent: None,
             return_to_target: true,
+            windows: Vec::new(),
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("screenshotBase64"));

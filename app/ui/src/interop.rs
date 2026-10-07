@@ -10,7 +10,7 @@ use crate::types::{
     DesignSummary, DesktopSession, EditableDesign, EditableFeedback, FeedbackRecord,
     LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted, LocalDelegateAvailability,
     PlanAnswerPayload, PreviewSummary, SaveDesignPayload, SketchRequest, SketchResponse,
-    StageState, SubmitFeedbackPayload,
+    StageState, SubmitFeedbackPayload, WindowCapture,
 };
 
 pub const LINEAGE_JOB_UPSERTED_EVENT: &str = "lineage://job-upserted";
@@ -268,6 +268,21 @@ pub async fn capture_window_png() -> Result<String, String> {
 /// Frozen desktop frame + target app for the overlay, if one is pending.
 pub async fn take_desktop_capture() -> Result<Option<DesktopSession>, String> {
     invoke_command("take_desktop_capture").await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureDesktopWindowPayload {
+    id: u32,
+}
+
+/// Window mode: capture one window (by OS window id) on its own.
+pub async fn capture_desktop_window(id: u32) -> Result<WindowCapture, String> {
+    invoke_command_with_args(
+        "capture_desktop_window",
+        &CaptureDesktopWindowPayload { id },
+    )
+    .await
 }
 
 /// Hide the desktop overlay window and hand focus back to the captured app.

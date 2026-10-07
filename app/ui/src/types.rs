@@ -228,6 +228,36 @@ pub struct DesktopSession {
     pub revision_of: Option<String>,
     #[serde(default)]
     pub revision_agent: Option<AgentKind>,
+    /// Visible windows on the captured monitor, front to back, in overlay
+    /// CSS px — the window picker's hit-test targets.
+    #[serde(default)]
+    pub windows: Vec<PickableWindow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PickableWindow {
+    pub id: u32,
+    pub app_name: String,
+    #[serde(default)]
+    pub title: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub focused: bool,
+}
+
+/// One window captured on its own (window mode).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowCapture {
+    pub screenshot_base64: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1461,6 +1461,23 @@ pub fn take_desktop_capture(
     Ok(state.current())
 }
 
+/// Window mode (W in the overlay): capture one window by its OS id.
+#[tauri::command]
+pub async fn capture_desktop_window(
+    payload: CaptureDesktopWindowPayload,
+) -> Result<crate::desktop::WindowCapture, String> {
+    // Capture + PNG encode take a few hundred ms; keep them off the IPC thread.
+    tauri::async_runtime::spawn_blocking(move || crate::desktop::capture_window(payload.id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureDesktopWindowPayload {
+    pub id: u32,
+}
+
 /// Hide the desktop overlay and return focus to the captured app.
 #[tauri::command]
 pub fn close_desktop_overlay(app: tauri::AppHandle) -> Result<(), String> {
