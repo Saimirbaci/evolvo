@@ -35,7 +35,7 @@ Before starting, verify:
    IS fatal: `STAGE_RESULT: fail: attachment unreadable <path>`.
 3. The agent's expected project guide ({agent_context_files}) is present
    at the worktree root. If not, the runner failed to symlink it — bail
-   with `STAGE_RESULT: fail: missing <CLAUDE.md|AGENTS.md|GEMINI.md>`.
+   with `STAGE_RESULT: fail: missing <CLAUDE.md|AGENTS.md>`.
 4. The required toolchain commands (`cargo`, `git`, and `trunk` when the
    stack still uses Trunk) are on PATH. If not, fail fast.
 

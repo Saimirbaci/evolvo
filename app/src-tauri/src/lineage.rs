@@ -381,6 +381,36 @@ impl<'a> LineageEngine<'a> {
         Ok(job)
     }
 
+    /// Retired agents (Gemini, Forge) can't run any more: switch the job to
+    /// the agent that will actually run it and say so in the notes, so the
+    /// record stays truthful about who did the new run.
+    pub fn ensure_runnable_agent(
+        &self,
+        job: LineageJobRecord,
+    ) -> Result<LineageJobRecord, StoreError> {
+        if !job.agent.is_retired() {
+            return Ok(job);
+        }
+        let replacement = job.agent.runnable();
+        let note = format!(
+            "{} is no longer supported — this run uses {}",
+            job.agent.label(),
+            replacement.label()
+        );
+        {
+            let lock = job_write_lock(&job.id);
+            let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut fresh = self
+                .store
+                .load_lineage_job(&job.id)?
+                .ok_or_else(|| format!("lineage job not found: {}", job.id))?;
+            fresh.agent = replacement;
+            fresh.updated_at_unix_ms = current_time_unix_ms();
+            self.store.save_lineage_job(&fresh)?;
+        }
+        self.append_note(&job.id, &note)
+    }
+
     /// Stamp a successful promotion merge onto the job record:
     /// `promotedAtUnixMs` + `promotedCommit`. Does NOT change `status` —
     /// callers pair this with `force_status(.., Promoted)` (see
@@ -444,6 +474,7 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         }
     }
 

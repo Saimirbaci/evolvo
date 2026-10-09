@@ -233,13 +233,12 @@ A lineage job persists its selected agent as `agent` on the `LineageJobRecord` (
 
 - **Claude Code** (`AgentKind::ClaudeCode`) — binary `claude`, transcript `claude.log` (stream-json / JSONL).
 - **Codex CLI** (`AgentKind::CodexCli`) — binary `codex`, transcript `codex.log` (`codex exec --json` JSONL with its own event schema).
-- **Gemini CLI** (`AgentKind::GeminiCli`) — binary `gemini`, transcript `gemini.log` (free-form text, no stable JSONL).
-- **Forge** (`AgentKind::Forge`) — binary `forge` (forgecode.dev / tailcallhq), transcript `forge.log`. One-shot mode: `forge -p <prompt>`. Provider/model selection lives in `forge.yaml` at the worktree root or via `forge provider login` once per host. The wire-type variant carries `#[serde(alias = "open_code")]`, so lineage jobs persisted by older builds (which previously slotted OpenCode here) deserialise into the Forge variant — those records render as Forge in the UI even though they were originally executed by `opencode`.
+- **Grok CLI** (`AgentKind::GrokCli`) — binary `grok` (xAI Grok Build, installed under `~/.grok/bin`, which is on the spawn PATH), transcript `grok.log`. Headless: `grok -p <prompt> --always-approve --cwd <worktree> --output-format streaming-messages-json` — NDJSON in the same envelope as Claude's stream-json (`system`/`assistant`/`result` with `total_cost_usd`), so `activity.rs` parses it like a Claude transcript. Needs `grok login` once per host. Grok only loads `AGENTS.md`/`CLAUDE.md` in folders listed in `~/.grok/trusted_folders.toml`; Evolvo doesn't edit that file — its prompts tell the agent to read the project guide explicitly.
+- **Retired: Gemini CLI and Forge** (`AgentKind::GeminiCli`, `AgentKind::Forge`, incl. the `open_code` alias). Not selectable and never spawned; the variants stay so old job records deserialise (labelled "(retired)"). `backend_for` maps them to Claude, and `LineageEngine::ensure_runnable_agent` switches such a job to Claude Code (with a note) when it is started, retried or resumed.
 
-Project-guide discovery differs per CLI; the runner materialises symlinks at the worktree root so all four agents pick up `CLAUDE.md`:
+Project-guide discovery differs per CLI; the runner materialises symlinks at the worktree root so every agent picks up `CLAUDE.md`:
 - Claude Code reads `CLAUDE.md` and `.claude/agents/*` natively.
-- Codex / Forge see `AGENTS.md` (symlink to `CLAUDE.md`).
-- Gemini sees `GEMINI.md` (symlink to `CLAUDE.md`).
+- Codex and Grok see `AGENTS.md` (symlink to `CLAUDE.md`).
 
 The multi-stage NewApp pipeline works for every backend because it drives off `plan.json`, not the agent log (see `app/src-tauri/src/stages.rs`). Retry/Resume reuse the job's persisted `agent`, so a failed Codex run retries as Codex, not Claude.
 
@@ -273,6 +272,15 @@ Feedback with a `targetApp` (desktop overlay) runs against **that app's reposito
 - **`read_job_activity`** (`activity.rs`) turns a job's transcript tail (last 768 KB of the most recently written of `claude.log` / `logs/*.log`; Claude stream-json and Codex JSONL parsed, other agents as plain output) into a readable feed ("Reading crates/x.rs", "Running cargo check", the agent's own one-line updates), a phase (`repo → exploring → implementing → verifying → checks → review`, derived from job status/notes, edit and build-command events, and whether the worktree has changes), changed files (`git diff --name-only <merge-base with base_branch>` + untracked), and cost/duration from the final `result` line. Read-only, no model calls. The Lineage detail's **Agent activity** panel re-reads it on `lineage://artifacts-changed` for the selected job (debounced watcher), so it's live without polling.
 - **Desktop notifications** (`notify.rs`): `lineage_events`' Tauri sink calls `notify::observe_job` on every published job save; a per-job last-status map fires only on transitions (agent started, plan ready for review, ready for review, merge bounced, failed, merged), never on first sighting. `external.rs` also notifies on cloning and on repo-resolution failure. macOS uses `osascript`, Linux `notify-send`; `EVOLVO_NOTIFICATIONS=0` disables.
 - **Retention sweep** (`runner::cleanup_old_workspaces`) only manages `lineage_workspaces/job-*` directories that are not themselves git checkouts — a hand-cloned external source repo kept there (e.g. `lineage_workspaces/zed`) is never quarantined.
+
+## Running the new version + the Evolvo menu bar
+
+- **Run spec** (`apprun.rs`): external-app agents write `<job dir>/run_spec.json` — `{"build": [[argv]…], "run": [argv], "cwd": "<rel>", "notes": ""}` (argv arrays, no shell; `cwd` must stay inside the worktree; validated by `RunSpec::validate`). Missing/invalid → `detect_run_spec` guesses (`cargo build`/`cargo run`, `<pm> install` [+ `<pm> run build`] / `<pm> run dev|start`, `go build ./...`/`go run .`). `prepare_run` deletes a stale spec before each run.
+- **Build gate = real build:** after the agent exits, external jobs run `external::validate_external_build` (the spec's build steps, stopping at the first failure; falls back to `validate_external_gates`' detected checks when there's no runnable spec). A job that reaches BuildReady is therefore already built.
+- **Launch:** `apprun::launch` runs the build steps (skipped right after the gate) then the run command in its own process group, logging to `iteration-run.log`, replacing any instance the job already had. The job's **Run** button routes external jobs here (`runner::launch_iteration_run` delegates); **Stop** = `stop_lineage_run` (SIGTERM to the group). `FeedbackRecord.auto_launch` ("Run the new version as soon as it's ready" in the desktop panel, **off by default**) launches automatically at BuildReady; otherwise the user is notified and runs it from the menu bar or Lineage.
+- **Follow-up feedback on a launched build:** `apprun::job_for_pid` walks the captured window's process ancestry to a tracked run; `link_launched_build` then sets `targetApp.repoPath` to that job's worktree (`repoSource: "evolvo-build"`, `basedOnJob`), so the next job forks from the previous job's branch instead of re-resolving upstream. Tracking is in-memory: runs launched before an Evolvo restart aren't recognised.
+- **Menu bar** (`tray.rs`, Tauri `tray-icon` feature): Running (Stop / Show log), Ready to run (Run), In progress (phase), Capture screen, Open Evolvo, Quit; the title shows the number of builds ready to run. `build_model` is pure (tested); a refresh loop rebuilds the menu on the main thread when `tray::request_refresh` is called (every published job save, and run start/exit). macOS notifications from `osascript` can't carry buttons, so "run it now?" is answered from this menu.
+- Activity phases gain **New version running** (external jobs, `JobActivity.app_running`).
 
 ## Promotion — merging a lineage branch back into the source repo
 
@@ -316,9 +324,7 @@ If `claude.log` is empty or missing tool_use events for the staged attachments, 
 ### Other agents
 `codex.log` is also JSONL but with a different schema — each line has a `type` (`agent_message`, `tool_call`, `tool_result`, `task_complete`, etc.). Grep for `"type":"tool_call"` to see which tools fired and pipe through `jq` the same way.
 
-`gemini.log` has no standard JSONL — fall back to `grep -n 'tool:'` and `grep -n 'error'` for a quick triage.
-
-`forge.log` shape depends on the provider Forge is configured with; start by tailing the file and adapting the Claude/Codex recipes as needed.
+`grok.log` (`--output-format streaming-messages-json`) uses Claude's envelope, so the Claude `jq` recipes above work on it as-is.
 
 ## Lineage iteration port convention
 

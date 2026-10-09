@@ -55,6 +55,8 @@ fn main() {
                 .build(),
         )
         .setup(move |app| {
+            // "Evolvo" menu-bar icon: run/stop builds, capture, open, quit.
+            evolvo_desktop::tray::install(app.handle());
             // Desktop overlay ("evolve any app"): a failure to grab the
             // shortcut (taken by another app, bad accelerator in
             // EVOLVO_DESKTOP_SHORTCUT) must not stop Evolvo opening.
@@ -99,6 +101,7 @@ fn main() {
             commands::take_desktop_capture,
             commands::close_desktop_overlay,
             commands::read_job_activity,
+            commands::stop_lineage_run,
             commands::capture_desktop_window,
             commands::open_desktop_revision,
             commands::resolve_target_repo,

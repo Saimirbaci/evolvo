@@ -1,5 +1,5 @@
-//! Process-global cap on how many agent CLI sessions (Claude/Codex/Gemini/
-//! Forge, one-shot or multi-stage) may run at once.
+//! Process-global cap on how many agent CLI sessions (Claude/Codex/
+//! Grok, one-shot or multi-stage) may run at once.
 //!
 //! Nothing else in the runner limits concurrency: every `submit_feedback`
 //! with `autoEvolve` set, or every reviewer clicking Advance, spawns its own

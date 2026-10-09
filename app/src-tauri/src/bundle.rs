@@ -343,6 +343,7 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         };
         store.save_feedback(&fb).unwrap();
         store

@@ -109,11 +109,13 @@ fn DesktopTargetBanner(ctx: DesktopCaptureContext) -> impl IntoView {
                     } else {
                         format!(" — {}", app.window_title)
                     };
-                    let repo = app
-                        .repo_path
-                        .clone()
-                        .map(|p| format!("Source: {p}"))
-                        .unwrap_or_else(|| "Source repo: unresolved".to_string());
+                    let repo = match (&app.based_on_job, &app.repo_path) {
+                        (Some(job), _) => format!("Continues the build from {job}"),
+                        (None, Some(p)) => format!("Source: {p}"),
+                        (None, None) => {
+                            "Source: Evolvo finds and clones it after you send".to_string()
+                        }
+                    };
                     view! {
                         <div class="desktop-target-app">
                             <span class="desktop-target-label">"Target"</span>
@@ -181,6 +183,10 @@ pub fn FeedbackPanel(
     // their choice is sticky for the rest of this panel session.
     let auto_evolve = RwSignal::new(false);
     let auto_evolve_user_set = RwSignal::new(false);
+    // Desktop overlay only: start the new version of the app as soon as it
+    // is built. Off by default — the user is notified and runs it from the
+    // Evolvo menu bar (or the Lineage page) when they're ready.
+    let auto_launch = RwSignal::new(false);
     // Plan-review gate: only meaningful for NewApp submissions (the
     // multi-stage pipeline). Off by default — checking it makes the
     // pipeline park in `Planned` after the backend plan validates so the
@@ -223,7 +229,7 @@ pub fn FeedbackPanel(
                             drafts
                         };
                         feedback_type.set(parent.feedback_type);
-                        agent.set(request.agent);
+                        agent.set(request.agent.runnable());
                         text.set(parent.feedback_text.clone());
                         route.set(parent.page_route.clone());
                         voice.clear();
@@ -292,9 +298,8 @@ pub fn FeedbackPanel(
     });
 
     // Delegation only makes sense for supervisor-style agents that can
-    // call into a Bash tool. Claude and Codex both qualify; Gemini and
-    // Forge ignore the env var harmlessly but the chip would be
-    // misleading, so we hide it for them.
+    // call into a Bash tool and have been wired for it: Claude and Codex.
+    // Grok ignores the env var, so the chip would be misleading there.
     let agent_supports_delegate =
         move || matches!(agent.get(), AgentKind::ClaudeCode | AgentKind::CodexCli);
     let delegate_ready = move || {
@@ -322,7 +327,7 @@ pub fn FeedbackPanel(
         Some(_) => "Start Ollama (127.0.0.1:11434) to enable local delegation.".into(),
     };
     // If the user toggled delegation on but then switched to an
-    // unsupported agent (e.g. Gemini), drop the toggle so the submit
+    // unsupported agent (e.g. Grok), drop the toggle so the submit
     // payload doesn't carry an inert `local_delegate`. Same for the case
     // where availability flips from Some(ready) to Some(not ready).
     Effect::new(move |_| {
@@ -373,6 +378,7 @@ pub fn FeedbackPanel(
             let feedback_type_v = feedback_type.get_untracked();
             let agent_v = agent.get_untracked();
             let auto_evolve_v = auto_evolve.get_untracked();
+            let auto_launch_v = auto_launch.get_untracked();
             let pause_after_plan_v = pause_after_plan.get_untracked();
             let parent_feedback_id_v = revision_parent.get_untracked().map(|parent| parent.id);
             // Snapshot delegate config at submit time. Only rides
@@ -391,6 +397,7 @@ pub fn FeedbackPanel(
             let voice_b64 = voice.base64.get_untracked();
             let voice_mime = voice.mime_type.get_untracked();
             let desktop_session = desktop.and_then(|d| d.session.get_untracked());
+            let desktop_session_present = desktop_session.is_some();
 
             let ctrl_reset = ctrl.clone();
             let voice_reset = voice.clone();
@@ -497,6 +504,7 @@ pub fn FeedbackPanel(
                     local_delegate: delegate_v,
                     target_app,
                     background_base64,
+                    auto_launch: desktop_session_present && auto_launch_v,
                 };
 
                 match interop::submit_feedback(&payload).await {
@@ -836,7 +844,7 @@ pub fn FeedbackPanel(
                 {move || {
                     // Only render the local-worker row when (a) the
                     // selected agent supports delegation and (b) we have
-                    // a probe result. Hidden by default for Gemini/Forge
+                    // a probe result. Hidden for Grok
                     // and for hosts where pi+Ollama isn't reachable —
                     // the user shouldn't see a dead chip.
                     let visible = agent_supports_delegate() && delegate_avail.get().is_some();
@@ -1083,6 +1091,22 @@ pub fn FeedbackPanel(
                     />
                     <span>"Start agent immediately"</span>
                 </label>
+                {desktop.is_some().then(|| view! {
+                    <label
+                        class="auto-evolve-toggle"
+                        title="If on, Evolvo builds and starts the new version of this app as soon as the agent is done. If off, you get a notification and start it from the Evolvo menu bar or the Lineage page."
+                    >
+                        <input
+                            type="checkbox"
+                            prop:checked=move || auto_launch.get()
+                            on:change=move |ev| {
+                                let target = event_target::<HtmlInputElement>(&ev);
+                                auto_launch.set(target.checked());
+                            }
+                        />
+                        <span>"Run the new version as soon as it's ready"</span>
+                    </label>
+                })}
                 <label
                     class="auto-evolve-toggle"
                     title="NewApp builds only: pause after the backend plan is validated so you can review plan.json (and its open questions) on the Lineage tab before any code is written. Approve the job to continue."

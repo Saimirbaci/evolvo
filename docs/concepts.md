@@ -213,7 +213,7 @@ new product line from it.
 
 ## 4. The agent backends
 
-Evolvo supports four agent CLIs. They are interchangeable at the pipeline
+Evolvo supports three agent CLIs. They are interchangeable at the pipeline
 level — every backend receives the same structured prompt and produces output
 into the same worktree. The differences are in auth model, output format,
 and practical behaviour.
@@ -258,42 +258,24 @@ teams already using the OpenAI ecosystem.
 **Context file at worktree root:** `AGENTS.md` (symlinked to `CLAUDE.md` by
 the runner).
 
-### Gemini CLI (`gemini`)
+### Grok CLI (`grok`)
 
-Google's agent CLI. Spawned as `gemini --yolo --skip-trust -p <prompt>`.
-`--skip-trust` suppresses the workspace-trust interactive prompt that Gemini
-shows the first time it enters a directory; without it, every lineage run
-blocks waiting for TTY input. Output is plain text — no stable JSONL stream,
-so `gemini.log` is a freeform transcript.
+xAI's Grok Build CLI (installed under `~/.grok/bin`). Spawned as `grok -p
+<prompt> --always-approve --cwd <worktree> --output-format
+streaming-messages-json`. Output is NDJSON in the same envelope as Claude's
+stream-json, so `grok.log` can be inspected with the same `jq` recipes as
+`claude.log`.
 
-**Auth:** Google OAuth (browser flow). Run `gemini` once interactively to
-complete login.
-
-**Best for:** Iteration when you have Google One AI Premium; tasks where you
-want Gemini 2.5 Pro's long-context reasoning.
-
-**Context files at worktree root:** `GEMINI.md` and `AGENTS.md` (both
-symlinked to `CLAUDE.md` by the runner).
-
-### Forge (`forge`)
-
-ForgeCode ([forgecode.dev](https://forgecode.dev)), a provider-agnostic
-agent CLI. Spawned as `forge -p <prompt>`. Provider and model selection live
-in `forge.yaml` at the worktree root or via `forge provider login`; Evolvo
-does not prescribe which provider Forge uses.
-
-**Auth:** Depends on the provider configured in `forge.yaml`.
-
-**Best for:** Teams who want to swap the underlying model without changing
-anything else; situations where none of the three managed CLIs fit.
+**Auth:** Run `grok login` once per host.
 
 **Context file at worktree root:** `AGENTS.md` (symlinked to `CLAUDE.md`).
+Grok only auto-loads it in folders it trusts, so Evolvo's prompts tell the
+agent to read the project guide explicitly.
 
-> **Note on legacy records:** Older Evolvo builds recorded the `open_code`
-> variant for OpenCode CLI runs. Those records deserialise as `Forge` in
-> current builds due to a `#[serde(alias)]` on the variant. They render as
-> "Forge" in the Lineage tab even though they were originally run by
-> `opencode`.
+> **Retired backends:** Gemini CLI and Forge are no longer supported. Job
+> records that used them (including older `open_code` records) still load and
+> are labelled "(retired)" in the Lineage tab; retrying or resuming such a
+> job runs it with Claude Code.
 
 ---
 

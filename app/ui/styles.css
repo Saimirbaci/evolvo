@@ -2309,3 +2309,12 @@ button {
     padding: 2px 0;
     word-break: break-all;
 }
+
+.activity-app-running {
+    border: 1px solid var(--success);
+}
+
+.activity-stop {
+    margin-left: auto;
+    flex: none;
+}

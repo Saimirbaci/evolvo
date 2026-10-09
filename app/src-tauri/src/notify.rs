@@ -99,7 +99,9 @@ pub fn transition_message(
             // Promotion bounced back (precondition, conflict or gate).
             format!("Merge didn't go through — {}", last_note(job))
         }
-        LineageJobStatus::BuildReady => "Ready for review".to_string(),
+        LineageJobStatus::BuildReady => {
+            "Ready for review — run it from the Evolvo menu bar".to_string()
+        }
         LineageJobStatus::Failed => format!("Failed — {}", last_note(job)),
         LineageJobStatus::Promoted => "Merged into the source repo".to_string(),
         _ => return None,
@@ -168,7 +170,7 @@ mod tests {
         assert!(title.contains("Add a Jira button"));
         assert!(body.contains("started"));
         let (_, body) = transition_message(Some(s), &job(LineageJobStatus::BuildReady)).unwrap();
-        assert_eq!(body, "Ready for review");
+        assert!(body.starts_with("Ready for review"));
         let mut failed = job(LineageJobStatus::Failed);
         failed.notes = vec!["build gates rejected the worktree".into()];
         let (_, body) = transition_message(Some(s), &failed).unwrap();

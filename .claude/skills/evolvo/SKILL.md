@@ -9,7 +9,7 @@ This skill is the map of the Evolvo project — both the product (what it is, ho
 
 ## What Evolvo is
 
-Evolvo is a local-first **self-evolving desktop app**. The user runs the app, draws / pastes / records feedback on a per-page Canvas overlay, and submits it. Each submission becomes a **lineage job** that a coding-agent backend (Claude Code, Codex, Gemini, or Forge) picks up to produce the next iteration of the app itself. The user reviews, approves, and promotes iterations into a NewApp they can run, fork, save, and rename. Feedback → iteration → promoted app, all on disk, no server, no cloud.
+Evolvo is a local-first **self-evolving desktop app**. The user runs the app, draws / pastes / records feedback on a per-page Canvas overlay, and submits it. Each submission becomes a **lineage job** that a coding-agent backend (Claude Code, Codex, or Grok) picks up to produce the next iteration of the app itself. The user reviews, approves, and promotes iterations into a NewApp they can run, fork, save, and rename. Feedback → iteration → promoted app, all on disk, no server, no cloud.
 
 ## Stack at a glance
 
@@ -64,18 +64,19 @@ When seeding fixtures or proposing layout changes, verify all four hold.
 
 ## Multi-agent backends
 
-Lineage jobs run on one of four CLIs. The runner symlinks `CLAUDE.md` into per-agent guide names so they all pick up the same project context:
+Lineage jobs run on one of three CLIs. The runner symlinks `CLAUDE.md` into per-agent guide names so they all pick up the same project context:
 
 | Backend     | Binary   | Transcript       | Format                         | Guide file       |
 |-------------|----------|------------------|--------------------------------|------------------|
 | Claude Code | `claude` | `claude.log`     | stream-json JSONL              | `CLAUDE.md`      |
 | Codex CLI   | `codex`  | `codex.log`      | `codex exec --json` JSONL      | `AGENTS.md`      |
-| Gemini CLI  | `gemini` | `gemini.log`     | free-form text                 | `GEMINI.md`      |
-| Forge       | `forge`  | `forge.log`      | provider-dependent             | `AGENTS.md`      |
+| Grok CLI    | `grok`   | `grok.log`       | stream-json-style NDJSON       | `AGENTS.md`      |
+
+Gemini CLI and Forge are retired: old job records that used them still load (labelled "(retired)"), and retry/resume runs them on Claude Code.
 
 The multi-stage NewApp pipeline drives off `plan.json` (`app/src-tauri/src/stages.rs`), not the agent log, so it works for every backend. The Feedback panel's Agent chip greys out backends whose binary is not on PATH.
 
-For debugging a Claude run, see the `jq` recipes in `CLAUDE.md` — `claude.log` is JSONL keyed by `type` (`assistant`, `user`, `result`).
+For debugging a Claude run, see the `jq` recipes in `CLAUDE.md` — `claude.log` is JSONL keyed by `type` (`assistant`, `user`, `result`). `grok.log` uses the same envelope, so the same recipes work.
 
 ---
 

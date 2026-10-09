@@ -1184,7 +1184,9 @@ fn LineageDetail(
                 }
             })}
 
-            {move || activity.get().filter(show_activity).map(|a| view! { <ActivityPanel activity=a /> })}
+            {move || activity.get().filter(show_activity).map(|a| view! {
+                <ActivityPanel activity=a action_error=action_error reload=reload />
+            })}
 
             {move || feedback_record.get().and_then(|feedback| {
                 let revision = feedback.revision;
@@ -1876,7 +1878,22 @@ fn format_duration(ms: u64) -> String {
 
 /// Phase stepper + "now" line + recent agent actions + changed files.
 #[component]
-fn ActivityPanel(activity: JobActivity) -> impl IntoView {
+fn ActivityPanel(
+    activity: JobActivity,
+    action_error: RwSignal<Option<String>>,
+    reload: RwSignal<u32>,
+) -> impl IntoView {
+    let stop_job_id = activity.job_id.clone();
+    let stop = move |_| {
+        let id = stop_job_id.clone();
+        spawn_local(async move {
+            if let Err(e) = interop::stop_lineage_run(&id).await {
+                action_error.set(Some(e));
+            }
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+    let app_running = activity.app_running;
     let now = js_sys::Date::now() as u64;
     let timing = match (
         activity.duration_ms,
@@ -1919,6 +1936,19 @@ fn ActivityPanel(activity: JobActivity) -> impl IntoView {
                 <div class="activity-now" role="status">
                     <span class="activity-pulse" aria-hidden="true"></span>
                     <span>{line}</span>
+                </div>
+            })}
+            {app_running.then(|| view! {
+                <div class="activity-now activity-app-running" role="status">
+                    <span class="activity-pulse" aria-hidden="true"></span>
+                    <span>"The new version is running — try your change."</span>
+                    <button
+                        class="btn btn-ghost activity-stop"
+                        title="Stop the version Evolvo launched for this job"
+                        on:click=stop
+                    >
+                        "Stop"
+                    </button>
                 </div>
             })}
             {(events_count > 0).then(|| view! {

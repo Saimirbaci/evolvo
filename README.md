@@ -2,7 +2,7 @@
 
 **Evolvo turns feedback into iterations of your app, and keeps the lineage.**
 Sketch on the page you're looking at — draw, type, paste, speak. An agent
-of your choice (Claude Code, Codex, Gemini, or Forge — local, BYOK) turns
+of your choice (Claude Code, Codex, or Grok — local, BYOK) turns
 each piece of feedback into a new iteration. Every iteration is a node on
 a tree you can review, run, fork, and rename into an app of its own. Local
 by default — nothing leaves your machine, nothing ships without your click.
@@ -48,7 +48,7 @@ into a `.evolvo-bundle`, and hand it to someone else to continue.
 **We are not Cursor / Replit / Lovable.**
 Those are vibe-coding tools. Evolvo is the layer *around* them — we record
 the lineage that vibe coding throws away. We integrate with the underlying
-agent CLIs (Claude Code, Codex, Gemini, Forge) as interchangeable backends;
+agent CLIs (Claude Code, Codex, Grok) as interchangeable backends;
 we are not competing on editor polish or hosted model quality.
 
 **We are not a Jira / Linear import.**
@@ -107,18 +107,19 @@ touching Evolvo itself.
 
 ## Supported agent backends
 
-Evolvo ships with four backends. Install any combination; the UI greys out
+Evolvo ships with three backends. Install any combination; the UI greys out
 backends whose CLI is not on your `PATH`.
 
 | Agent | CLI binary | Install |
 |---|---|---|
 | Claude Code | `claude` | [docs.anthropic.com/claude-code](https://docs.anthropic.com/en/docs/claude-code) |
 | Codex CLI | `codex` | [github.com/openai/codex](https://github.com/openai/codex) |
-| Gemini CLI | `gemini` | [github.com/google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) |
-| Forge | `forge` | [forgecode.dev](https://forgecode.dev) |
+| Grok CLI | `grok` | xAI Grok Build CLI (then `grok login`) |
 
-All four read `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` at the worktree root,
-so a single project guide reaches every backend.
+All three read `CLAUDE.md` / `AGENTS.md` at the worktree root, so a single
+project guide reaches every backend. Gemini CLI and Forge are retired: old
+jobs that used them still load (shown as "(retired)") and retry/resume
+with Claude Code.
 
 ## Workspace layout
 

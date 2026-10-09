@@ -129,7 +129,7 @@ pub fn log_path(workspace_root: &Path, job_id: &str) -> PathBuf {
 }
 
 /// Per-backend log path. The filename comes from the backend itself
-/// (`claude.log`, `codex.log`, `gemini.log`, `forge.log`) so a single
+/// (`claude.log`, `codex.log`, `grok.log`) so a single
 /// lineage workspace can host retries across different agents without
 /// clobbering the transcript.
 pub fn agent_log_path(workspace_root: &Path, job_id: &str, agent: AgentKind) -> PathBuf {
@@ -138,7 +138,7 @@ pub fn agent_log_path(workspace_root: &Path, job_id: &str, agent: AgentKind) -> 
 }
 
 /// Materialise the worktree-root project guide files an agent expects
-/// (`AGENTS.md` for Codex/Forge, `GEMINI.md` for Gemini, etc.) by
+/// (`AGENTS.md` for Codex and Grok) by
 /// symlinking them to the repo's existing `CLAUDE.md`. Best-effort: if a
 /// file with the same name already exists we leave it alone, and if the
 /// symlink syscall isn't available we fall back to `fs::copy`.
@@ -779,7 +779,7 @@ pub fn build_implementation_prompt(
 
 /// Agent-aware prompt builder. Substitutes `{agent_label}` and
 /// `{agent_context_files}` so the same template nudges Codex / Gemini /
-/// Forge to read `AGENTS.md` / `GEMINI.md` while keeping Claude on
+/// Grok to read `AGENTS.md` while keeping Claude on
 /// `CLAUDE.md`. When `feedback.local_delegate` is set, appends the
 /// delegation rules block (`prompts/pi.md`) so the supervisor knows it
 /// can call `$EVOLVO_DELEGATE_BIN` for boilerplate sub-implementations.
@@ -924,6 +924,9 @@ pub struct PreparedRun {
     /// overlay feedback). Selects `external::validate_external_gates`
     /// instead of Evolvo's cargo gates after the agent exits.
     pub external: bool,
+    /// External jobs: start the new version as soon as it's built
+    /// (`FeedbackRecord::auto_launch`). Otherwise the user starts it.
+    pub auto_launch: bool,
 }
 
 /// Resolved spawn-time wiring for local-model delegation: the absolute
@@ -1072,7 +1075,7 @@ pub fn prepare_run(
     let attachments = stage_attachments(store, feedback, &inputs_dir)?;
 
     // Drop agent-appropriate context aliases (e.g. `AGENTS.md` → CLAUDE.md
-    // for Codex/Forge, `GEMINI.md` for Gemini) so each CLI picks up the
+    // for Codex and Grok) so each CLI picks up the
     // same project guide under the name it expects. Best-effort; failures
     // are swallowed because the worktree is already usable without them.
     let backend = backend_for(agent);
@@ -1080,16 +1083,19 @@ pub fn prepare_run(
     // External repos are not Evolvo-shaped: no CLAUDE.md aliases (they would
     // show up as stray files in the foreign repo) and no port rewrite.
     let (aliases, prompt) = match external_target {
-        Some(target) => (
-            Vec::new(),
+        Some(target) => (Vec::new(), {
+            // A spec left by an earlier attempt must not outlive it.
+            let run_spec = job_dir.join(crate::apprun::RUN_SPEC_FILE);
+            let _ = fs::remove_file(&run_spec);
             crate::external::build_external_prompt(
                 feedback,
                 target,
                 &job.id,
                 &branch,
                 &attachments,
-            ),
-        ),
+                &run_spec,
+            )
+        }),
         None => {
             let aliases = materialise_context_files(&worktree, backend.as_ref());
             // Each iteration gets its own dev-server port so users can run
@@ -1147,6 +1153,7 @@ pub fn prepare_run(
         prompt,
         local_delegate,
         external: external_target.is_some(),
+        auto_launch: external_target.is_some() && feedback.auto_launch,
     })
 }
 
@@ -1299,7 +1306,12 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                     ),
                 );
                 let gates = if prepared.external {
-                    crate::external::validate_external_gates(&prepared.worktree)
+                    let job_dir = prepared
+                        .metadata_file
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    crate::external::validate_external_build(&prepared.worktree, &job_dir)
                 } else {
                     crate::validators::validate_build_gates(&prepared.worktree)
                 };
@@ -1307,6 +1319,10 @@ pub fn launch_agent_session(store: Store, job_id: String, prepared: PreparedRun,
                     let _ = engine
                         .append_note(&job_id, &format!("build gates passed — {}", gates.headline));
                     let _ = engine.force_status(&job_id, LineageJobStatus::BuildReady);
+                    if prepared.auto_launch {
+                        // The gate just ran the build steps; go straight to run.
+                        crate::apprun::launch(store.clone(), job_id.clone(), true);
+                    }
                 } else {
                     let _ = engine.append_note(
                         &job_id,
@@ -1395,6 +1411,7 @@ pub fn enriched_path() -> String {
         parts.push(format!("{home}/.cargo/bin"));
         parts.push(format!("{home}/.local/bin"));
         parts.push(format!("{home}/.bun/bin"));
+        parts.push(format!("{home}/.grok/bin"));
         parts.push(format!("{home}/.volta/bin"));
         parts.push(format!("{home}/.nvm/versions/node/current/bin"));
     }
@@ -1437,6 +1454,18 @@ pub fn resolve_run_command(worktree: &Path) -> ResolvedRunCommand {
 /// pointed at the per-job `run_workspace/` dir so it can't clobber the host
 /// Evolvo's feedback / lineage data.
 pub fn launch_iteration_run(store: Store, job_id: String) {
+    // External-app jobs run the other project's own build/run commands
+    // (`apprun.rs`), not Evolvo's `cargo tauri dev`.
+    let external = store
+        .load_lineage_job(&job_id)
+        .ok()
+        .flatten()
+        .and_then(|job| store.load_feedback(&job.feedback_id).ok().flatten())
+        .is_some_and(|fb| fb.target_app.is_some());
+    if external {
+        crate::apprun::launch(store, job_id, false);
+        return;
+    }
     std::thread::spawn(move || {
         let engine = LineageEngine::new(&store);
 
@@ -2528,6 +2557,10 @@ pub fn resume_pipeline(store: Store, job_id: String) -> Result<(), String> {
         .load_lineage_job(&job_id)
         .map_err(|e| format!("load job: {e}"))?
         .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+    // Jobs recorded with a retired agent (Gemini, Forge) resume with Claude.
+    let job = LineageEngine::new(&store)
+        .ensure_runnable_agent(job)
+        .map_err(|e| format!("switch retired agent: {e}"))?;
 
     let feedback = store
         .load_feedback(&job.feedback_id)
@@ -2694,6 +2727,7 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         }
     }
 
@@ -3043,10 +3077,8 @@ mod tests {
             .ends_with("lineage_workspaces/job-1/claude.log"));
         assert!(agent_log_path(&root, "job-1", AgentKind::CodexCli)
             .ends_with("lineage_workspaces/job-1/codex.log"));
-        assert!(agent_log_path(&root, "job-1", AgentKind::GeminiCli)
-            .ends_with("lineage_workspaces/job-1/gemini.log"));
-        assert!(agent_log_path(&root, "job-1", AgentKind::Forge)
-            .ends_with("lineage_workspaces/job-1/forge.log"));
+        assert!(agent_log_path(&root, "job-1", AgentKind::GrokCli)
+            .ends_with("lineage_workspaces/job-1/grok.log"));
     }
 
     #[test]

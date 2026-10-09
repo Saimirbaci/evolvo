@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod agent;
+pub mod apprun;
 pub mod bundle;
 pub mod commands;
 pub mod concurrency;
@@ -19,6 +20,7 @@ pub mod sketch;
 pub mod stages;
 pub mod state;
 pub mod store;
+pub mod tray;
 pub mod types;
 pub mod validate_cli;
 pub mod validators;

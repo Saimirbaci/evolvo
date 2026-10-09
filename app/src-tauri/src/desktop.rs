@@ -147,7 +147,14 @@ pub fn trigger(app: &AppHandle) {
     }
     let app = app.clone();
     std::thread::spawn(move || match capture_session() {
-        Ok((session, monitor)) => {
+        Ok((mut session, monitor)) => {
+            // Feedback on a version Evolvo launched continues that job.
+            if let (Some(target), Some(state)) = (
+                session.target_app.as_mut(),
+                app.try_state::<crate::state::AppState>(),
+            ) {
+                crate::apprun::link_launched_build(&state.store(), target);
+            }
             if let Some(state) = app.try_state::<DesktopState>() {
                 state.set(Some(session.clone()));
             }

@@ -814,6 +814,31 @@ pub fn validate_external_gates(dir: &Path) -> StageReport {
     r.finalize()
 }
 
+/// The job's build gate after the agent exits: the run spec's build steps
+/// (agent-declared, else detected) so a job that is Ready for review is
+/// already built and starts instantly; falls back to the detected checks
+/// when there is no runnable spec.
+pub fn validate_external_build(worktree: &Path, job_dir: &Path) -> StageReport {
+    let Some(spec) = crate::apprun::resolve_run_spec(job_dir, worktree) else {
+        return validate_external_gates(worktree);
+    };
+    if spec.build.is_empty() {
+        return validate_external_gates(worktree);
+    }
+    let mut r = StageReport::new("external_build_gates");
+    let cwd = spec.working_dir(worktree);
+    for step in &spec.build {
+        let args: Vec<&str> = step[1..].iter().map(String::as_str).collect();
+        let res = crate::validators::run_tool_with_timeout(&cwd, &step[0], &args, gate_timeout());
+        let label = format!("{} ({} run spec)", step.join(" "), spec.source);
+        crate::validators::push_tool_gate(&mut r, &label, res);
+        if r.checks.last().is_some_and(|c| !c.passed) {
+            break; // later steps depend on earlier ones (install → build)
+        }
+    }
+    r.finalize()
+}
+
 // ---------------------------------------------------------------------
 // Prompt
 // ---------------------------------------------------------------------
@@ -827,6 +852,7 @@ pub fn build_external_prompt(
     job_id: &str,
     branch: &str,
     attachments: &[crate::runner::StagedAttachment],
+    run_spec_path: &Path,
 ) -> String {
     let voice = feedback
         .voice_transcript
@@ -863,7 +889,20 @@ pub fn build_external_prompt(
             )
         })
         .unwrap_or_default();
+    let continuation = target
+        .based_on_job
+        .as_deref()
+        .map(|job| {
+            format!(
+                "\n\nThe user captured a build Evolvo produced for an earlier job (`{job}`). \
+                 This worktree starts from that job's branch, so its changes are already here — \
+                 build on them rather than starting over."
+            )
+        })
+        .unwrap_or_default();
     crate::runner::load_prompt("external_app.md", EMBEDDED_EXTERNAL_PROMPT)
+        .replace("{run_spec_path}", &run_spec_path.display().to_string())
+        .replace("{continuation}", &continuation)
         .replace("{app_name}", &target.name)
         .replace("{app_facts}", &app_facts)
         .replace("{job_id}", job_id)
@@ -1159,9 +1198,19 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         };
         let t = target("Zed", Some("dev.zed.Zed"));
-        let p = build_external_prompt(&fb, &t, "job-1", "lineage/job-1", &[]);
+        let p = build_external_prompt(
+            &fb,
+            &t,
+            "job-1",
+            "lineage/job-1",
+            &[],
+            Path::new("/ws/job-1/run_spec.json"),
+        );
+        assert!(p.contains("/ws/job-1/run_spec.json"));
+        assert!(!p.contains("{run_spec_path}"));
         assert!(p.contains("Zed"));
         assert!(p.contains("lineage/job-1"));
         assert!(p.contains("<user-content>"));

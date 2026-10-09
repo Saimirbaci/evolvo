@@ -8,7 +8,7 @@ welcome.
 You need: **Rust**, **a C linker**, **Tauri CLI 2**, **Trunk**, the
 **wasm32-unknown-unknown** target, and **at least one agent backend**. Each
 section below is independently completable — you do not have to install all
-four agent backends.
+three agent backends.
 
 ---
 
@@ -131,7 +131,7 @@ trunk --version   # should print trunk 0.21.x
 
 ## 5. Agent backends
 
-Evolvo ships with four agent backends. Install any combination; the
+Evolvo ships with three agent backends. Install any combination; the
 Feedback panel greys out chips whose binary is not on your `PATH`. You
 can add more later — relaunch Evolvo after installing a new CLI and the
 availability check re-runs automatically.
@@ -143,7 +143,7 @@ system `PATH`):
 ~/.cargo/bin
 ~/.local/bin
 ~/.bun/bin
-~/.forge/bin
+~/.grok/bin
 ~/.volta/bin
 ~/.nvm/versions/node/current/bin
 ~/.npm-global/bin
@@ -210,54 +210,27 @@ envelope Claude's `--dangerously-skip-permissions` provides.
 **Context file:** `AGENTS.md` at the worktree root (symlinked from
 `CLAUDE.md` by the Evolvo runner).
 
-### 5c. Gemini CLI (binary: `gemini`)
+### 5c. Grok CLI (binary: `grok`)
+
+Install the xAI Grok Build CLI per xAI's instructions; it installs under
+`~/.grok/bin`, which Evolvo adds to the spawn PATH.
+
+**Auth:** Log in once per host:
 
 ```bash
-npm install -g @google/gemini-cli
-# or with bun:
-bun add -g @google/gemini-cli
+grok login
 ```
 
-**Auth:** On first run, Gemini CLI opens a browser to complete Google
-OAuth. Run it once manually:
-
-```bash
-gemini
-# Complete the browser login, then Ctrl-C
-```
-
-Evolvo spawns Gemini with `gemini --yolo --skip-trust -p <prompt>`.
-`--skip-trust` suppresses the interactive workspace-trust prompt that
-Gemini shows the first time it enters a directory; without it, every
-lineage run blocks waiting for TTY input.
-
-**Context files:** `GEMINI.md` and `AGENTS.md` (both symlinked from
-`CLAUDE.md` by the runner).
-
-### 5d. Forge (binary: `forge`)
-
-Forge ([forgecode.dev](https://forgecode.dev)) is a provider-agnostic
-agent CLI. Install it per the upstream README:
-
-```bash
-# Homebrew (macOS / Linux)
-brew install forge-cli
-# or via the install script:
-curl -sSL https://forgecode.dev/install.sh | sh
-```
-
-**Auth / provider selection:** Forge uses `forge.yaml` at the worktree
-root for provider/model selection. Run `forge provider login` once to
-set up credentials for your preferred provider:
-
-```bash
-forge provider login
-```
-
-Evolvo spawns Forge with `forge -p <prompt>`.
+Evolvo spawns Grok with `grok -p <prompt> --always-approve --cwd <worktree>
+--output-format streaming-messages-json`. The output is NDJSON in the same
+envelope as Claude's stream-json, written to `grok.log`.
 
 **Context file:** `AGENTS.md` at the worktree root (symlinked from
-`CLAUDE.md` by the runner).
+`CLAUDE.md` by the runner). Grok only auto-loads it in folders it trusts,
+so Evolvo's prompts tell the agent to read the guide explicitly.
+
+> Gemini CLI and Forge are retired. Old jobs that used them still load
+> (shown as "(retired)"); retrying or resuming them runs Claude Code.
 
 ---
 
@@ -323,7 +296,7 @@ The agent's binary is not on the enriched PATH (see the probe list in
 section 5). Verify:
 
 ```bash
-which claude   # or codex, gemini, forge
+which claude   # or codex, grok
 ```
 
 If the binary exists but Evolvo doesn't see it, its install location is

@@ -39,14 +39,14 @@ The name is not the problem — the category is.
 
 > **Evolvo turns feedback into iterations of your app, and keeps the lineage.**
 > Sketch on the page you're looking at — draw, type, paste, speak. An agent
-> of your choice (Claude Code, Codex, Gemini, or Forge — local, BYOK) turns
+> of your choice (Claude Code, Codex, or Grok — local, BYOK) turns
 > each piece of feedback into a new iteration. Every iteration is a node on
 > a tree you can review, run, fork, and rename into an app of its own. Local
 > by default — nothing leaves your machine, nothing ships without your click.
 > The lineage is the product: vibe coding with a memory.
 
 This paragraph does five things at once: opens with a verb (no coined-noun
-bounce), names the four agent backends to satisfy the BYO-model reader,
+bounce), names the three agent backends to satisfy the BYO-model reader,
 reassures on the safety story before anyone asks, names the wedge (the
 lineage), and lands the tagline as the closer. Every other artifact ladders
 to this paragraph.
@@ -68,7 +68,7 @@ remember how they got here."*
 1. **We are not Cursor / Replit / Lovable.** Those are vibe-coding tools.
    Evolvo is the layer *around* them — we record the lineage that vibe coding
    throws away. We integrate with the underlying agent CLIs (Claude Code,
-   Codex, Gemini, Forge) as backends; we are not competing with them on
+   Codex, Grok) as backends; we are not competing with them on
    editor polish or model quality.
 
 2. **We are not a Jira / Linear import.** Feedback in Evolvo is not a ticket

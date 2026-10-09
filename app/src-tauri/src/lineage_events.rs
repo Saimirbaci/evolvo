@@ -127,6 +127,7 @@ impl LineageEventSink for TauriLineageEventSink {
             let _ = self.app.emit(JOB_UPSERTED_EVENT, event);
             // Desktop notification on milestone status changes.
             crate::notify::observe_job(&event.job);
+            crate::tray::request_refresh();
         }
     }
 

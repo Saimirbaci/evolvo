@@ -285,6 +285,11 @@ pub async fn capture_desktop_window(id: u32) -> Result<WindowCapture, String> {
     .await
 }
 
+/// Stop the new version Evolvo launched for a job. `true` if one was running.
+pub async fn stop_lineage_run(id: &str) -> Result<bool, String> {
+    invoke_command_with_args("stop_lineage_run", &IdArg { id }).await
+}
+
 /// Live activity (phase, recent agent actions, changed files) for a job.
 pub async fn read_job_activity(id: &str) -> Result<JobActivity, String> {
     invoke_command_with_args("read_job_activity", &IdArg { id }).await

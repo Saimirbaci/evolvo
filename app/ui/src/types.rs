@@ -8,36 +8,43 @@ pub enum AgentKind {
     #[default]
     ClaudeCode,
     CodexCli,
+    GrokCli,
+    /// Retired — only on jobs recorded by older builds.
     GeminiCli,
+    /// Retired — only on jobs recorded by older builds.
     #[serde(alias = "open_code")]
     Forge,
 }
 
 impl AgentKind {
-    pub fn all() -> [AgentKind; 4] {
-        [
-            Self::ClaudeCode,
-            Self::CodexCli,
-            Self::GeminiCli,
-            Self::Forge,
-        ]
+    /// Selectable agents (retired ones are left out).
+    pub fn all() -> [AgentKind; 3] {
+        [Self::ClaudeCode, Self::CodexCli, Self::GrokCli]
+    }
+
+    /// Retired agents run as Claude Code (mirrors the host).
+    pub fn runnable(self) -> AgentKind {
+        match self {
+            Self::GeminiCli | Self::Forge => Self::ClaudeCode,
+            other => other,
+        }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::ClaudeCode => "Claude Code",
             Self::CodexCli => "Codex",
-            Self::GeminiCli => "Gemini",
-            Self::Forge => "Forge",
+            Self::GrokCli => "Grok",
+            Self::GeminiCli => "Gemini (retired)",
+            Self::Forge => "Forge (retired)",
         }
     }
 
     pub fn binary(self) -> &'static str {
         match self {
-            Self::ClaudeCode => "claude",
+            Self::ClaudeCode | Self::GeminiCli | Self::Forge => "claude",
             Self::CodexCli => "codex",
-            Self::GeminiCli => "gemini",
-            Self::Forge => "forge",
+            Self::GrokCli => "grok",
         }
     }
 }
@@ -184,6 +191,8 @@ pub struct FeedbackRecord {
     pub target_app: Option<TargetApp>,
     #[serde(default)]
     pub background_filename: Option<String>,
+    #[serde(default)]
+    pub auto_launch: bool,
 }
 
 /// External application a desktop-overlay capture was drawn on. Mirrors
@@ -211,6 +220,9 @@ pub struct TargetApp {
     pub repo_status: String,
     #[serde(default)]
     pub repo_error: Option<String>,
+    /// Captured over a version Evolvo launched for this earlier job.
+    #[serde(default)]
+    pub based_on_job: Option<String>,
 }
 
 /// Frozen desktop frame the overlay window displays (`desktop.rs` on host).
@@ -615,6 +627,9 @@ pub struct SubmitFeedbackPayload {
     /// revision can redraw over the original screen.
     #[serde(default)]
     pub background_base64: Option<String>,
+    /// Desktop overlay: start the new version as soon as it's built.
+    #[serde(default)]
+    pub auto_launch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -914,4 +929,7 @@ pub struct JobActivity {
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub running: bool,
+    /// The new version Evolvo launched for this job is running.
+    #[serde(default)]
+    pub app_running: bool,
 }

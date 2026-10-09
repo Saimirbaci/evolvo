@@ -22,8 +22,7 @@ Follow [`docs/INSTALL.md`](INSTALL.md) in full before continuing. The tutorial
 assumes:
 
 - `cargo tauri dev` works from `app/src-tauri/`.
-- At least one agent CLI (`claude`, `codex`, `gemini`, or `forge`) is on your
-  PATH.
+- At least one agent CLI (`claude`, `codex`, or `grok`) is on your PATH.
 - You are on macOS (Linux works too; Windows is untested).
 
 ---

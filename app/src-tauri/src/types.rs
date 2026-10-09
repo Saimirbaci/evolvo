@@ -19,24 +19,36 @@ pub enum AgentKind {
     #[default]
     ClaudeCode,
     CodexCli,
+    /// xAI Grok Build CLI — `grok -p <prompt>` headless, transcript in the
+    /// Anthropic Messages NDJSON format.
+    GrokCli,
+    /// Retired (no longer selectable or runnable). Kept so lineage jobs
+    /// recorded by older builds still deserialise and show who ran them.
     GeminiCli,
-    /// ForgeCode (forgecode.dev) — `forge -p <prompt>` runs a single
-    /// non-interactive turn. The `open_code` alias keeps lineage jobs
-    /// persisted by older builds (which ran the OpenCode CLI under the
-    /// same slot) deserialisable; those records render as Forge in the
-    /// UI even though they were originally executed by `opencode`.
+    /// Retired ForgeCode slot; see `GeminiCli`. The `open_code` alias keeps
+    /// even older records (OpenCode ran under this slot) loadable.
     #[serde(alias = "open_code")]
     Forge,
 }
 
 impl AgentKind {
-    pub fn all() -> [AgentKind; 4] {
-        [
-            Self::ClaudeCode,
-            Self::CodexCli,
-            Self::GeminiCli,
-            Self::Forge,
-        ]
+    /// Agents that can be selected and run.
+    pub fn all() -> [AgentKind; 3] {
+        [Self::ClaudeCode, Self::CodexCli, Self::GrokCli]
+    }
+
+    /// Recorded on old jobs only; Retry/Resume run them with Claude Code.
+    pub fn is_retired(self) -> bool {
+        matches!(self, Self::GeminiCli | Self::Forge)
+    }
+
+    /// The agent that actually runs a job recorded with `self`.
+    pub fn runnable(self) -> AgentKind {
+        if self.is_retired() {
+            Self::ClaudeCode
+        } else {
+            self
+        }
     }
 
     /// Short human label used in the UI and in job notes.
@@ -44,8 +56,9 @@ impl AgentKind {
         match self {
             Self::ClaudeCode => "Claude Code",
             Self::CodexCli => "Codex",
-            Self::GeminiCli => "Gemini",
-            Self::Forge => "Forge",
+            Self::GrokCli => "Grok",
+            Self::GeminiCli => "Gemini (retired)",
+            Self::Forge => "Forge (retired)",
         }
     }
 
@@ -55,6 +68,7 @@ impl AgentKind {
         match self {
             Self::ClaudeCode => "claude",
             Self::CodexCli => "codex",
+            Self::GrokCli => "grok",
             Self::GeminiCli => "gemini",
             Self::Forge => "forge",
         }
@@ -208,6 +222,10 @@ pub struct FeedbackRecord {
     /// redraws over the original screen, not over their old strokes.
     #[serde(default)]
     pub background_filename: Option<String>,
+    /// Desktop overlay "Run the new version as soon as it's ready". Off:
+    /// the user is notified and starts it from the menu bar / Lineage.
+    #[serde(default)]
+    pub auto_launch: bool,
 }
 
 /// The external application a desktop-overlay capture was taken over.
@@ -247,6 +265,10 @@ pub struct TargetApp {
     /// Why the last resolution attempt failed, for the Lineage card.
     #[serde(default)]
     pub repo_error: Option<String>,
+    /// Set when the capture was taken over a version Evolvo launched for an
+    /// earlier job: the new request continues from that job's worktree.
+    #[serde(default)]
+    pub based_on_job: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -781,6 +803,9 @@ pub struct SubmitFeedbackPayload {
     /// Desktop captures: the clean frozen frame (no annotations), base64.
     #[serde(default)]
     pub background_base64: Option<String>,
+    /// See `FeedbackRecord::auto_launch`.
+    #[serde(default)]
+    pub auto_launch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1050,6 +1075,7 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"feedbackType\":\"bug\""));
@@ -1106,6 +1132,18 @@ mod tests {
         // new variant rather than failing the deserialise.
         let legacy: AgentKind = serde_json::from_str("\"open_code\"").unwrap();
         assert_eq!(legacy, AgentKind::Forge);
+        let grok: AgentKind = serde_json::from_str("\"grok_cli\"").unwrap();
+        assert_eq!(grok, AgentKind::GrokCli);
+    }
+
+    #[test]
+    fn retired_agents_load_but_run_as_claude() {
+        for retired in [AgentKind::GeminiCli, AgentKind::Forge] {
+            assert!(retired.is_retired());
+            assert_eq!(retired.runnable(), AgentKind::ClaudeCode);
+            assert!(!AgentKind::all().contains(&retired));
+        }
+        assert_eq!(AgentKind::GrokCli.runnable(), AgentKind::GrokCli);
     }
 
     #[test]

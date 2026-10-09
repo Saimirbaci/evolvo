@@ -70,6 +70,9 @@ pub struct JobActivity {
     #[serde(default)]
     pub duration_ms: Option<u64>,
     pub running: bool,
+    /// External-app jobs: the new version Evolvo launched is running.
+    #[serde(default)]
+    pub app_running: bool,
 }
 
 const PHASES: &[(&str, &str)] = &[
@@ -79,6 +82,7 @@ const PHASES: &[(&str, &str)] = &[
     ("verifying", "Verifying"),
     ("checks", "Build checks"),
     ("review", "Ready for review"),
+    ("running", "New version running"),
 ];
 
 // ---------------------------------------------------------------------
@@ -373,7 +377,9 @@ pub fn derive_phase(
 fn phase_steps(phase: &str, failed: bool, external: bool) -> Vec<PhaseStep> {
     let order: Vec<&(&str, &str)> = PHASES
         .iter()
-        .filter(|(k, _)| external || *k != "repo")
+        // Finding the source and running the new version exist only for
+        // external apps (Evolvo iterations have their own Run flow).
+        .filter(|(k, _)| external || !matches!(*k, "repo" | "running"))
         .collect();
     // Phases outside the stepper map onto the nearest step.
     let anchor = match phase {
@@ -532,7 +538,12 @@ pub fn job_activity(store: &Store, job_id: &str) -> Result<JobActivity, String> 
         .map(|w| changed_files(Path::new(w), job.base_branch.as_deref()))
         .unwrap_or_default();
 
-    let phase = derive_phase(&job, feedback.as_ref(), &events, !changed.is_empty());
+    let app_running = crate::apprun::is_running(&job.id);
+    let phase = if app_running {
+        "running".to_string()
+    } else {
+        derive_phase(&job, feedback.as_ref(), &events, !changed.is_empty())
+    };
     let external = feedback.as_ref().is_some_and(|f| f.target_app.is_some());
     let failed = job.status == LineageJobStatus::Failed;
     let running = matches!(
@@ -545,7 +556,9 @@ pub fn job_activity(store: &Store, job_id: &str) -> Result<JobActivity, String> 
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .and_then(|v| v.get("started_at_unix_ms").and_then(Value::as_u64));
 
-    let current = if phase == "checks" {
+    let current = if app_running {
+        Some("The new version is running — try your change".to_string())
+    } else if phase == "checks" {
         Some("Evolvo is running the build checks".to_string())
     } else if phase == "repo" {
         job.notes
@@ -574,6 +587,7 @@ pub fn job_activity(store: &Store, job_id: &str) -> Result<JobActivity, String> 
         cost_usd: result.map(|(c, _)| c),
         duration_ms: result.map(|(_, d)| d),
         running,
+        app_running,
     })
 }
 
@@ -693,7 +707,7 @@ mod tests {
         assert_eq!(derive_phase(&pending, Some(&fb), &[], false), "repo");
         let steps = phase_steps("repo", false, true);
         assert_eq!(steps[0].state, "active");
-        assert_eq!(steps.len(), 6);
+        assert_eq!(steps.len(), 7);
         assert_eq!(phase_steps("exploring", false, false).len(), 5);
     }
 
@@ -703,8 +717,11 @@ mod tests {
         let states: Vec<&str> = s.iter().map(|p| p.state.as_str()).collect();
         assert_eq!(
             states,
-            vec!["done", "done", "done", "active", "pending", "pending"]
+            vec!["done", "done", "done", "active", "pending", "pending", "pending"]
         );
+        let run = phase_steps("running", false, true);
+        assert_eq!(run.last().unwrap().state, "active");
+        assert!(run[..6].iter().all(|p| p.state == "done"));
         let f = phase_steps("checks", true, false);
         assert_eq!(
             f.iter().find(|p| p.key == "checks").unwrap().state,

@@ -262,6 +262,7 @@ pub fn submit_feedback(
             .unwrap_or_default(),
         target_app: payload.target_app.clone(),
         background_filename,
+        auto_launch: payload.auto_launch,
     };
 
     store.save_feedback(&record).map_err(store_error)?;
@@ -902,6 +903,11 @@ fn start_implementation_run(
         .map_err(store_error)?
         .ok_or_else(|| format!("feedback {} not found for job {}", job.feedback_id, job.id))?;
 
+    // Jobs recorded with a retired agent (Gemini, Forge) run with Claude.
+    let job = &engine
+        .ensure_runnable_agent(job.clone())
+        .map_err(store_error)?;
+
     // External app (desktop overlay): the agent can only start once the
     // app's source repo is known. Resolve (and clone) it first; the run
     // starts automatically when resolution succeeds.
@@ -1464,18 +1470,41 @@ pub fn take_desktop_capture(
 /// Window mode (W in the overlay): capture one window by its OS id.
 #[tauri::command]
 pub async fn capture_desktop_window(
+    state: State<'_, AppState>,
     payload: CaptureDesktopWindowPayload,
 ) -> Result<crate::desktop::WindowCapture, String> {
+    let store = state.store();
     // Capture + PNG encode take a few hundred ms; keep them off the IPC thread.
-    tauri::async_runtime::spawn_blocking(move || crate::desktop::capture_window(payload.id))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut capture = crate::desktop::capture_window(payload.id)?;
+        // A window of a version Evolvo launched continues that job.
+        if let Some(target) = capture.target_app.as_mut() {
+            crate::apprun::link_launched_build(&store, target);
+        }
+        Ok(capture)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureDesktopWindowPayload {
     pub id: u32,
+}
+
+/// Stop the new version Evolvo launched for an external-app job.
+#[tauri::command]
+pub fn stop_lineage_run(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<bool, String> {
+    let stopped = crate::apprun::stop(&payload.id);
+    if stopped {
+        let _ = LineageEngine::new(&state.store())
+            .append_note(&payload.id, "stopped the launched version");
+    }
+    Ok(stopped)
 }
 
 /// Live "what is the agent doing" view for a job: phase, recent actions
@@ -1735,6 +1764,7 @@ mod tests {
             parent_feedback_id: None,
             target_app: None,
             background_base64: None,
+            auto_launch: false,
         }
     }
 
@@ -1764,6 +1794,7 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         };
         store.save_feedback(&fb).unwrap();
         let job = engine
@@ -1830,6 +1861,7 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         }
     }
 
@@ -2373,6 +2405,7 @@ mod tests {
                 revision: Default::default(),
                 target_app: None,
                 background_filename: None,
+                auto_launch: false,
             };
             store.save_feedback(&rec).unwrap();
             let engine = LineageEngine::new(&store);
@@ -2431,6 +2464,7 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(&store);
@@ -2473,6 +2507,7 @@ mod tests {
             revision: Default::default(),
             target_app: None,
             background_filename: None,
+            auto_launch: false,
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(store);
