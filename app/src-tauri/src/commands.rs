@@ -10,10 +10,9 @@ use crate::store::StoreError;
 #[cfg(test)]
 use crate::types::AgentKind;
 use crate::types::{
-    current_time_unix_ms, AgentAvailability, AppHealth, DelegationSummary, EditableFeedback,
-    EditableFeedbackScreen, EntityIdPayload, FeedbackRecord, FeedbackRevision,
-    FeedbackScreenRecord, FeedbackStatus, LineageJobRecord, LineageJobStatus,
-    LocalDelegateAvailability, PreviewSummary, SubmitFeedbackPayload,
+    current_time_unix_ms, AgentAvailability, AppHealth, EditableFeedback, EditableFeedbackScreen,
+    EntityIdPayload, FeedbackRecord, FeedbackRevision, FeedbackScreenRecord, FeedbackStatus,
+    LineageJobRecord, LineageJobStatus, PreviewSummary, SubmitFeedbackPayload,
 };
 
 const APP_NAME: &str = "Evolvo";
@@ -133,10 +132,6 @@ pub fn submit_feedback(
     let store = state.store();
     store.init_workspace().map_err(store_error)?;
 
-    if let Some(cfg) = payload.local_delegate.as_ref() {
-        cfg.validate()?;
-    }
-
     let mut parent_feedback = match payload
         .parent_feedback_id
         .as_deref()
@@ -255,7 +250,6 @@ pub fn submit_feedback(
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         lineage_job_id: None,
-        local_delegate: payload.local_delegate.clone(),
         revision: parent_feedback
             .as_ref()
             .map(next_feedback_revision)
@@ -423,32 +417,6 @@ fn persist_storyboard_screens(
 #[tauri::command]
 pub fn list_available_agents() -> Result<Vec<AgentAvailability>, String> {
     Ok(agent::availability())
-}
-
-/// Whether the local-model delegation worker (`pi` + Ollama) is wireable
-/// on this host. The UI uses this to gate the "Local worker" chip in the
-/// feedback panel; a `pi_installed: false` or `ollama_reachable: false`
-/// result greys the chip with a tooltip telling the user which piece to
-/// install. Cached per-process — same restart-to-rescan convention as
-/// `list_available_agents`.
-#[tauri::command]
-pub fn list_local_delegate_availability() -> Result<LocalDelegateAvailability, String> {
-    Ok(agent::local_delegate_availability())
-}
-
-/// Aggregate the per-job pi-events.jsonl stream into a `DelegationSummary`
-/// the UI can render in the Lineage detail panel. Returns `Ok(None)` when
-/// the events file is absent (the steady state for jobs that didn't opt
-/// into delegation), so the UI hides the "Local worker" section
-/// completely instead of rendering a row of zeros.
-#[tauri::command]
-pub fn read_delegation_summary(
-    state: State<'_, AppState>,
-    payload: EntityIdPayload,
-) -> Result<Option<DelegationSummary>, String> {
-    let root = state.store().layout().root().to_path_buf();
-    let job_dir = runner::job_workspace_dir(&root, &payload.id);
-    crate::delegation::read_summary(&job_dir).map_err(|e| format!("read pi-events: {e}"))
 }
 
 #[tauri::command]
@@ -1771,7 +1739,6 @@ mod tests {
             agent: None,
             auto_evolve: false,
             pause_after_plan: false,
-            local_delegate: None,
             parent_feedback_id: None,
             target_app: None,
             background_base64: None,
@@ -1801,7 +1768,6 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             lineage_job_id: None,
-            local_delegate: None,
             revision: Default::default(),
             target_app: None,
             background_filename: None,
@@ -1868,7 +1834,6 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             lineage_job_id: None,
-            local_delegate: None,
             revision: Default::default(),
             target_app: None,
             background_filename: None,
@@ -2412,7 +2377,6 @@ mod tests {
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
                 lineage_job_id: None,
-                local_delegate: None,
                 revision: Default::default(),
                 target_app: None,
                 background_filename: None,
@@ -2471,7 +2435,6 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             lineage_job_id: None,
-            local_delegate: None,
             revision: Default::default(),
             target_app: None,
             background_filename: None,
@@ -2514,7 +2477,6 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             lineage_job_id: None,
-            local_delegate: None,
             revision: Default::default(),
             target_app: None,
             background_filename: None,

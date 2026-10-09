@@ -4,7 +4,6 @@ pub mod apprun;
 pub mod bundle;
 pub mod commands;
 pub mod concurrency;
-pub mod delegation;
 pub mod deletion;
 pub mod designs;
 pub mod desktop;
@@ -31,9 +30,8 @@ pub use lineage::{LineageEngine, Transition};
 pub use state::AppState;
 pub use store::{default_workspace_root, Store, StoreError, WorkspaceLayout};
 pub use types::{
-    current_time_unix_ms, AgentAvailability, AgentKind, AppHealth, DelegationStageStat,
-    DelegationSummary, EditableFeedback, EditableFeedbackScreen, EntityIdPayload, FeedbackRecord,
-    FeedbackRevision, FeedbackStatus, FeedbackType, LineageJobRecord, LineageJobStatus,
-    LocalDelegateAvailability, LocalDelegateConfig, PreviewSummary, StageKind, StageState,
+    current_time_unix_ms, AgentAvailability, AgentKind, AppHealth, EditableFeedback,
+    EditableFeedbackScreen, EntityIdPayload, FeedbackRecord, FeedbackRevision, FeedbackStatus,
+    FeedbackType, LineageJobRecord, LineageJobStatus, PreviewSummary, StageKind, StageState,
     StageStatus, SubmitFeedbackPayload, TargetApp,
 };

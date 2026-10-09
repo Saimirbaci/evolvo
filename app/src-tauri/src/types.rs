@@ -197,15 +197,6 @@ pub struct FeedbackRecord {
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub lineage_job_id: Option<String>,
-    /// When set, the user opted into delegating tightly-scoped subtasks
-    /// to a local model (today: pi + Ollama / Gemma4). The supervisor
-    /// agent (Claude / Codex) still owns planning and review; only
-    /// boilerplate-shaped sub-implementations get handed to the local
-    /// worker. `None` means delegation is off — the historical behaviour.
-    /// Forward-compat default: older feedback records without this field
-    /// deserialise as `None`, so disk migrations are unnecessary.
-    #[serde(default)]
-    pub local_delegate: Option<LocalDelegateConfig>,
     /// Immutable revision ancestry. Historical records deserialize as
     /// revision 1; revising from the Lineage view creates a new feedback
     /// record and links both directions without rewriting this record's
@@ -339,135 +330,6 @@ pub struct EditableFeedbackScreen {
     pub pasted_image_data_urls: Vec<String>,
     pub window_width: u32,
     pub window_height: u32,
-}
-
-/// Configuration for the local-model delegation worker the supervisor
-/// agent can call into during a lineage run. Today only pi + Ollama is
-/// supported, but the struct is shaped so a second backend (e.g. raw
-/// `ollama run`) could slot in without breaking the wire format.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct LocalDelegateConfig {
-    /// Provider slug as it appears in `~/.pi/agent/models.json`. Today
-    /// always `"ollama"`; reserved so a future `"llama-cpp"` or
-    /// `"vllm"` provider doesn't need a schema change.
-    pub provider: String,
-    /// Model id matching the `id` field in `models.json` (e.g.
-    /// `"gemma4"`). The wrapper script passes this verbatim to
-    /// `pi --model <provider>/<model>`.
-    pub model: String,
-}
-
-impl Default for LocalDelegateConfig {
-    fn default() -> Self {
-        Self {
-            provider: "ollama".into(),
-            model: "gemma4".into(),
-        }
-    }
-}
-
-impl LocalDelegateConfig {
-    /// Max length for `provider` / `model`. These strings are spliced
-    /// verbatim into a child process environment
-    /// (`EVOLVO_DELEGATE_PROVIDER` / `EVOLVO_DELEGATE_MODEL` in
-    /// `runner.rs`) and into a `pi --model <provider>/<model>` CLI
-    /// invocation, so they must be restricted to an inert charset well
-    /// before they reach a shell — 128 chars is generous for any real
-    /// provider/model slug.
-    const MAX_FIELD_LEN: usize = 128;
-
-    /// Reject anything outside `[A-Za-z0-9._/-]` or over the length cap.
-    /// Called at the deserialization boundary (`submit_feedback`) so a
-    /// malformed value never reaches `resolve_delegate`'s env-var
-    /// splice. Returns a clear, field-specific error message.
-    pub fn validate(&self) -> Result<(), String> {
-        Self::validate_field("provider", &self.provider)?;
-        Self::validate_field("model", &self.model)?;
-        Ok(())
-    }
-
-    fn validate_field(name: &str, value: &str) -> Result<(), String> {
-        if value.is_empty() {
-            return Err(format!("local_delegate.{name} cannot be empty"));
-        }
-        if value.chars().count() > Self::MAX_FIELD_LEN {
-            return Err(format!(
-                "local_delegate.{name} is too long (max {} chars)",
-                Self::MAX_FIELD_LEN
-            ));
-        }
-        if !value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
-        {
-            return Err(format!(
-                "local_delegate.{name} contains invalid characters (only [A-Za-z0-9._/-] allowed)"
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Whether local-model delegation is wireable on this host. Returned by
-/// the `list_local_delegate_availability` Tauri command so the UI can
-/// disable the "Local worker" chip when either piece is missing and show
-/// the user which one to install. Forward-compat: new fields can be
-/// added with `#[serde(default)]` without breaking older UI builds.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct LocalDelegateAvailability {
-    /// `pi` binary on the enriched PATH.
-    pub pi_installed: bool,
-    /// Ollama HTTP API answering on `127.0.0.1:11434`.
-    pub ollama_reachable: bool,
-    /// Default provider slug for the chip label.
-    pub provider: String,
-    /// Default model id surfaced as the chip label (e.g. `pi · gemma4`).
-    pub default_model: String,
-}
-
-impl LocalDelegateAvailability {
-    /// True only when both the supervisor-side launcher (`pi`) and the
-    /// inference backend (`ollama`) are wired up. The UI uses this to
-    /// gate the chip; the runner uses it to decide whether to inject
-    /// delegation rules into the supervisor prompt.
-    pub fn ready(&self) -> bool {
-        self.pi_installed && self.ollama_reachable
-    }
-}
-
-/// Aggregated delegation telemetry for one lineage job. Synthesised by
-/// `read_delegation_summary` from `<job_dir>/pi-events.jsonl`. Forward-
-/// compatible: every collection field is `#[serde(default)]`, and the
-/// JSONL schema the wrapper writes uses an enum tag (`kind: "result" |
-/// "capped"`) so we can add new event types without breaking older
-/// host parsers.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DelegationSummary {
-    /// Total result events recorded (success + failure).
-    pub total: u32,
-    /// Count of result events that returned non-zero.
-    pub failed: u32,
-    /// Count of `capped` events — invocations the wrapper refused
-    /// because the per-stage cap was already reached.
-    pub capped: u32,
-    /// Sum of `runtime_ms` across all result events.
-    pub runtime_ms: u64,
-    /// Per-stage breakdown for the by-stage line in the UI.
-    #[serde(default)]
-    pub by_stage: Vec<DelegationStageStat>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DelegationStageStat {
-    pub stage: String,
-    pub total: u32,
-    pub failed: u32,
-    pub capped: u32,
-    pub runtime_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -769,13 +631,6 @@ pub struct SubmitFeedbackPayload {
     /// `AgentKind::default()` (Claude Code) so older UI builds keep working.
     #[serde(default)]
     pub agent: Option<AgentKind>,
-    /// Opt-in local-model delegation. `None` (the default) preserves
-    /// pre-existing behaviour. When set, the runner appends delegation
-    /// rules to the supervisor prompt and exposes the `evolvo-delegate`
-    /// wrapper as an env var so the supervisor can call into pi+Ollama
-    /// for boilerplate sub-implementations.
-    #[serde(default)]
-    pub local_delegate: Option<LocalDelegateConfig>,
     /// When true, `submit_feedback` immediately fires
     /// `start_implementation_run` after enqueuing the lineage job — the
     /// reviewer doesn't have to switch to the Lineage tab and click Evolve.
@@ -996,54 +851,6 @@ mod tests {
     }
 
     #[test]
-    fn local_delegate_config_accepts_valid_strings() {
-        let cfg = LocalDelegateConfig {
-            provider: "ollama".into(),
-            model: "gemma4".into(),
-        };
-        assert!(cfg.validate().is_ok());
-
-        let cfg = LocalDelegateConfig {
-            provider: "a.b_c-d/e9".into(),
-            model: "Model-1.2_3".into(),
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn local_delegate_config_rejects_invalid_strings() {
-        let cases = [
-            LocalDelegateConfig {
-                provider: "".into(),
-                model: "gemma4".into(),
-            },
-            LocalDelegateConfig {
-                provider: "ollama".into(),
-                model: "".into(),
-            },
-            LocalDelegateConfig {
-                provider: "ollama; rm -rf /".into(),
-                model: "gemma4".into(),
-            },
-            LocalDelegateConfig {
-                provider: "$(whoami)".into(),
-                model: "gemma4".into(),
-            },
-            LocalDelegateConfig {
-                provider: "ollama".into(),
-                model: "a b".into(),
-            },
-            LocalDelegateConfig {
-                provider: "a".repeat(129),
-                model: "gemma4".into(),
-            },
-        ];
-        for cfg in cases {
-            assert!(cfg.validate().is_err(), "expected rejection for {cfg:?}");
-        }
-    }
-
-    #[test]
     fn lineage_can_approve() {
         assert!(LineageJobStatus::Pending.can_approve());
         assert!(LineageJobStatus::Planned.can_approve());
@@ -1071,7 +878,6 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             lineage_job_id: None,
-            local_delegate: None,
             revision: Default::default(),
             target_app: None,
             background_filename: None,
@@ -1134,6 +940,27 @@ mod tests {
         assert_eq!(legacy, AgentKind::Forge);
         let grok: AgentKind = serde_json::from_str("\"grok_cli\"").unwrap();
         assert_eq!(grok, AgentKind::GrokCli);
+    }
+
+    #[test]
+    fn feedback_written_with_the_removed_local_worker_still_loads() {
+        // Records from builds that had the pi + Ollama "Local worker"
+        // carry a `localDelegate` object; it is simply ignored now.
+        let json = r#"{"id":"fb-1","feedbackType":"bug","status":"new","pageRoute":"/",
+            "feedbackText":"x","screenshotFilename":null,"voiceFilename":null,
+            "voiceTranscript":null,"windowWidth":1,"windowHeight":1,
+            "createdAtUnixMs":1,"updatedAtUnixMs":1,"lineageJobId":null,
+            "localDelegate":{"provider":"ollama","model":"gemma4"}}"#;
+        let fb: FeedbackRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(fb.id, "fb-1");
+        let payload: SubmitFeedbackPayload = serde_json::from_str(
+            r#"{"feedbackType":"bug","feedbackText":"x","screenshotBase64":null,
+                "voiceBase64":null,"voiceMimeType":null,"voiceTranscript":null,
+                "windowWidth":1,"windowHeight":1,
+                "localDelegate":{"provider":"ollama","model":"gemma4"}}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.feedback_text, "x");
     }
 
     #[test]

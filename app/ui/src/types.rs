@@ -184,8 +184,6 @@ pub struct FeedbackRecord {
     pub updated_at_unix_ms: u64,
     pub lineage_job_id: Option<String>,
     #[serde(default)]
-    pub local_delegate: Option<LocalDelegateConfig>,
-    #[serde(default)]
     pub revision: FeedbackRevision,
     #[serde(default)]
     pub target_app: Option<TargetApp>,
@@ -339,68 +337,6 @@ pub struct EditableFeedbackScreen {
     pub window_height: u32,
 }
 
-/// Mirror of `evolvo_desktop::types::LocalDelegateConfig`. Carries the
-/// user's opt-in choice to enable local-model delegation on a feedback
-/// submission. Round-trips as camelCase JSON.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct LocalDelegateConfig {
-    pub provider: String,
-    pub model: String,
-}
-
-impl Default for LocalDelegateConfig {
-    fn default() -> Self {
-        Self {
-            provider: "ollama".into(),
-            model: "gemma4".into(),
-        }
-    }
-}
-
-/// Mirror of `evolvo_desktop::types::LocalDelegateAvailability`. Returned
-/// by `list_local_delegate_availability` so the feedback panel can grey
-/// out the "Local worker" chip when pi or Ollama are missing.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct LocalDelegateAvailability {
-    pub pi_installed: bool,
-    pub ollama_reachable: bool,
-    pub provider: String,
-    pub default_model: String,
-}
-
-impl LocalDelegateAvailability {
-    pub fn ready(&self) -> bool {
-        self.pi_installed && self.ollama_reachable
-    }
-}
-
-/// Mirror of `evolvo_desktop::types::DelegationSummary`. Returned by
-/// `read_delegation_summary`. Forward-compat: every collection field
-/// is `#[serde(default)]` so a host with new event kinds round-trips
-/// cleanly into older UI builds.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DelegationSummary {
-    pub total: u32,
-    pub failed: u32,
-    pub capped: u32,
-    pub runtime_ms: u64,
-    #[serde(default)]
-    pub by_stage: Vec<DelegationStageStat>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DelegationStageStat {
-    pub stage: String,
-    pub total: u32,
-    pub failed: u32,
-    pub capped: u32,
-    pub runtime_ms: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LineageJobRecord {
@@ -453,7 +389,6 @@ pub struct LineageJobRecord {
 #[serde(rename_all = "snake_case")]
 pub enum LineageArtifactKind {
     Plan,
-    Delegation,
     Log,
     Workspace,
 }
@@ -617,9 +552,6 @@ pub struct SubmitFeedbackPayload {
     pub pause_after_plan: bool,
     #[serde(default)]
     pub parent_feedback_id: Option<String>,
-    /// Opt-in local-model worker. `None` keeps historical behaviour.
-    #[serde(default)]
-    pub local_delegate: Option<LocalDelegateConfig>,
     /// Set by the desktop overlay: the external app the capture shows.
     #[serde(default)]
     pub target_app: Option<TargetApp>,

@@ -34,8 +34,8 @@ use crate::feedback_panel::{FeedbackPanel, FeedbackRevisionRequest};
 use crate::interop;
 use crate::toolbar::Toolbar;
 use crate::types::{
-    AppHealth, DelegationSummary, DesignPlan, FeedbackRecord, JobActivity, LineageJobRecord,
-    LineageJobStatus, PreviewSummary,
+    AppHealth, DesignPlan, FeedbackRecord, JobActivity, LineageJobRecord, LineageJobStatus,
+    PreviewSummary,
 };
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
@@ -1151,22 +1151,6 @@ fn LineageDetail(
         });
     });
 
-    // Per-job delegation telemetry (pi-events.jsonl). `None` either
-    // means "not yet loaded" or "this job didn't run delegations".
-    // Refreshed from an artifact event rather than the lineage-list clock.
-    let delegation: RwSignal<Option<DelegationSummary>> = RwSignal::new(None);
-    let delegation_id = record.id.clone();
-    Effect::new(move |_| {
-        let _ = artifact_reload.get();
-        let id = delegation_id.clone();
-        spawn_local(async move {
-            match interop::read_delegation_summary(&id).await {
-                Ok(s) => delegation.set(s),
-                Err(_) => delegation.set(None),
-            }
-        });
-    });
-
     view! {
         <div class="lineage-detail-inner">
             <header class="lineage-detail-head">
@@ -1500,47 +1484,6 @@ fn LineageDetail(
                                 }
                             }).collect_view()}
                         </ul>
-                    </section>
-                }.into_any()
-            }}
-
-            {move || {
-                // Hide the section completely when the job didn't run
-                // any delegations. Showing zeros would just be noise.
-                let Some(s) = delegation.get() else {
-                    return view! { <span></span> }.into_any();
-                };
-                if s.total == 0 && s.capped == 0 {
-                    return view! { <span></span> }.into_any();
-                }
-                let runtime_s = (s.runtime_ms as f64) / 1000.0;
-                let head = format!(
-                    "Local worker · {} runs · {} failed · {} capped · {:.1}s",
-                    s.total, s.failed, s.capped, runtime_s
-                );
-                let by_stage = s.by_stage.clone();
-                view! {
-                    <section class="lineage-delegation">
-                        <h4>{head}</h4>
-                        {if by_stage.is_empty() {
-                            view! { <span></span> }.into_any()
-                        } else {
-                            view! {
-                                <ul class="stage-list">
-                                    {by_stage.into_iter().map(|st| {
-                                        let line = format!(
-                                            "{} · {} runs · {} failed · {} capped · {:.1}s",
-                                            st.stage,
-                                            st.total,
-                                            st.failed,
-                                            st.capped,
-                                            (st.runtime_ms as f64) / 1000.0,
-                                        );
-                                        view! { <li class="stage-row"><span class="stage-headline">{line}</span></li> }
-                                    }).collect_view()}
-                                </ul>
-                            }.into_any()
-                        }}
                     </section>
                 }.into_any()
             }}

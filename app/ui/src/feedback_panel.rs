@@ -14,7 +14,7 @@ use crate::desktop_overlay::DesktopCaptureContext;
 use crate::interop;
 use crate::types::{
     AgentAvailability, AgentKind, EditableFeedbackScreen, FeedbackRecord, FeedbackScreenPayload,
-    FeedbackType, LocalDelegateAvailability, LocalDelegateConfig, SubmitFeedbackPayload,
+    FeedbackType, SubmitFeedbackPayload,
 };
 use crate::voice::{VoiceRecorder, VoiceState};
 
@@ -156,15 +156,6 @@ pub fn FeedbackPanel(
     // backend probe failed (in which case we optimistically enable every
     // chip so the feature isn't silently disabled by a probe bug).
     let availability: RwSignal<Option<Vec<AgentAvailability>>> = RwSignal::new(None);
-    // Local-delegate availability: pi binary + Ollama health. None until
-    // the host responds. Greys out the "Local worker" chip when either
-    // piece is missing so the user knows what to install.
-    let delegate_avail: RwSignal<Option<LocalDelegateAvailability>> = RwSignal::new(None);
-    // User's opt-in toggle for delegation. Only meaningful when both the
-    // selected agent supports it (Claude / Codex today) AND
-    // `delegate_avail` reports ready. Defaults off so the historical
-    // "supervisor does everything" path is unchanged.
-    let delegate_on = RwSignal::new(false);
     let text = RwSignal::new(String::new());
     let active_screen = RwSignal::new(0usize);
     let next_screen_number = RwSignal::new(2usize);
@@ -242,7 +233,6 @@ pub fn FeedbackPanel(
                         // The user can explicitly re-enable the toggle.
                         auto_evolve_user_set.set(true);
                         pause_after_plan.set(false);
-                        delegate_on.set(false);
                         next_screen_number.set(drafts.len().saturating_add(1));
                         active_screen.set(0);
                         screens.set(drafts.clone());
@@ -282,58 +272,6 @@ pub fn FeedbackPanel(
                 Err(_) => availability.set(Some(Vec::new())),
             }
         });
-    });
-
-    // Probe local-delegate availability (pi binary + Ollama health). One
-    // shot per panel lifecycle, same as the agent probe; backend caches.
-    Effect::new(move |already: Option<()>| {
-        if already.is_some() {
-            return;
-        }
-        spawn_local(async move {
-            if let Ok(a) = interop::list_local_delegate_availability().await {
-                delegate_avail.set(Some(a));
-            }
-        });
-    });
-
-    // Delegation only makes sense for supervisor-style agents that can
-    // call into a Bash tool and have been wired for it: Claude and Codex.
-    // Grok ignores the env var, so the chip would be misleading there.
-    let agent_supports_delegate =
-        move || matches!(agent.get(), AgentKind::ClaudeCode | AgentKind::CodexCli);
-    let delegate_ready = move || {
-        delegate_avail
-            .get()
-            .as_ref()
-            .map(|a| a.ready())
-            .unwrap_or(false)
-    };
-    let delegate_label = move || {
-        delegate_avail
-            .get()
-            .map(|a| format!("pi · {}", a.default_model))
-            .unwrap_or_else(|| "pi · gemma4".into())
-    };
-    let delegate_tooltip = move || match delegate_avail.get() {
-        None => "Probing local worker availability…".to_string(),
-        Some(a) if a.ready() => format!(
-            "Delegate boilerplate to {}/{} to save supervisor tokens. Free, runs offline.",
-            a.provider, a.default_model
-        ),
-        Some(a) if !a.pi_installed => {
-            "Install `pi` (pi-agent) on PATH to enable local delegation.".into()
-        }
-        Some(_) => "Start Ollama (127.0.0.1:11434) to enable local delegation.".into(),
-    };
-    // If the user toggled delegation on but then switched to an
-    // unsupported agent (e.g. Grok), drop the toggle so the submit
-    // payload doesn't carry an inert `local_delegate`. Same for the case
-    // where availability flips from Some(ready) to Some(not ready).
-    Effect::new(move |_| {
-        if delegate_on.get_untracked() && !(agent_supports_delegate() && delegate_ready()) {
-            delegate_on.set(false);
-        }
     });
 
     let submit = {
@@ -381,17 +319,6 @@ pub fn FeedbackPanel(
             let auto_launch_v = auto_launch.get_untracked();
             let pause_after_plan_v = pause_after_plan.get_untracked();
             let parent_feedback_id_v = revision_parent.get_untracked().map(|parent| parent.id);
-            // Snapshot delegate config at submit time. Only rides
-            // through when the user explicitly toggled it on AND the
-            // chip was actually live (probe ready, agent supports it).
-            let delegate_v: Option<LocalDelegateConfig> = if delegate_on.get_untracked() {
-                delegate_avail.get_untracked().map(|a| LocalDelegateConfig {
-                    provider: a.provider,
-                    model: a.default_model,
-                })
-            } else {
-                None
-            };
             let route_v = route.get_untracked();
             let text_v = text.get_untracked();
             let voice_b64 = voice.base64.get_untracked();
@@ -501,7 +428,6 @@ pub fn FeedbackPanel(
                     auto_evolve: auto_evolve_v,
                     pause_after_plan: pause_after_plan_v,
                     parent_feedback_id: parent_feedback_id_v.clone(),
-                    local_delegate: delegate_v,
                     target_app,
                     background_base64,
                     auto_launch: desktop_session_present && auto_launch_v,
@@ -840,42 +766,6 @@ pub fn FeedbackPanel(
                         }
                     }).collect_view()}
                 </div>
-
-                {move || {
-                    // Only render the local-worker row when (a) the
-                    // selected agent supports delegation and (b) we have
-                    // a probe result. Hidden for Grok
-                    // and for hosts where pi+Ollama isn't reachable —
-                    // the user shouldn't see a dead chip.
-                    let visible = agent_supports_delegate() && delegate_avail.get().is_some();
-                    if !visible {
-                        return view! { <span></span> }.into_any();
-                    }
-                    let active = move || delegate_on.get();
-                    let enabled = move || delegate_ready();
-                    let label = delegate_label();
-                    let tip = delegate_tooltip();
-                    view! {
-                        <div class="panel-section-label">"Local worker"</div>
-                        <div class="type-chips agent-chips">
-                            <button
-                                class="type-chip agent-chip"
-                                class:active=active
-                                class:disabled=move || !enabled()
-                                prop:disabled=move || !enabled()
-                                title=tip
-                                aria-pressed=move || if active() { "true" } else { "false" }
-                                on:click=move |_| {
-                                    if enabled() {
-                                        delegate_on.set(!delegate_on.get_untracked());
-                                    }
-                                }
-                            >
-                                {label}
-                            </button>
-                        </div>
-                    }.into_any()
-                }}
 
                 <div class="panel-section-label">"Type"</div>
                 <div class="type-chips">

@@ -339,7 +339,6 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             lineage_job_id: Some("job-1".into()),
-            local_delegate: None,
             revision: Default::default(),
             target_app: None,
             background_filename: None,

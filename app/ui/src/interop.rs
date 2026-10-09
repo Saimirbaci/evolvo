@@ -6,11 +6,11 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 
 use crate::types::{
-    AgentAvailability, AgentKind, AnswerPlanQuestionsPayload, AppHealth, DelegationSummary,
-    DeleteSummary, DesignSummary, DesktopSession, EditableDesign, EditableFeedback, FeedbackRecord,
-    JobActivity, LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted,
-    LocalDelegateAvailability, PlanAnswerPayload, PreviewSummary, SaveDesignPayload, SketchRequest,
-    SketchResponse, StageState, SubmitFeedbackPayload, WindowCapture,
+    AgentAvailability, AgentKind, AnswerPlanQuestionsPayload, AppHealth, DeleteSummary,
+    DesignSummary, DesktopSession, EditableDesign, EditableFeedback, FeedbackRecord, JobActivity,
+    LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted, PlanAnswerPayload,
+    PreviewSummary, SaveDesignPayload, SketchRequest, SketchResponse, StageState,
+    SubmitFeedbackPayload, WindowCapture,
 };
 
 pub const LINEAGE_JOB_UPSERTED_EVENT: &str = "lineage://job-upserted";
@@ -399,21 +399,6 @@ pub async fn resume_lineage_job(id: &str) -> Result<LineageJobRecord, String> {
 /// installed. Cached server-side so repeated polls are cheap.
 pub async fn list_available_agents() -> Result<Vec<AgentAvailability>, String> {
     invoke_command("list_available_agents").await
-}
-
-/// Whether local-model delegation (pi + Ollama) is wireable on this
-/// host. The feedback panel uses this to gate the "Local worker" chip.
-pub async fn list_local_delegate_availability() -> Result<LocalDelegateAvailability, String> {
-    invoke_command("list_local_delegate_availability").await
-}
-
-/// Aggregated delegation telemetry for one lineage job, parsed from
-/// `<job_dir>/pi-events.jsonl`. `Ok(None)` means the job didn't run any
-/// delegations — the UI should hide the section instead of rendering
-/// zeros. The Lineage detail panel calls this on mount and on every
-/// reload tick.
-pub async fn read_delegation_summary(id: &str) -> Result<Option<DelegationSummary>, String> {
-    invoke_command_with_args("read_delegation_summary", &IdArg { id }).await
 }
 
 /// Read-only dry-run preview of what an `Evolve` click on `id` will

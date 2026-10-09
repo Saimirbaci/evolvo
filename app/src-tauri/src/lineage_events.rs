@@ -16,7 +16,6 @@ use notify::{Event, EventKind, RecursiveMode, Watcher};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-use crate::runner;
 use crate::store::Store;
 use crate::types::{current_time_unix_ms, LineageJobRecord};
 
@@ -33,7 +32,6 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(750);
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     Plan,
-    Delegation,
     Log,
     Workspace,
 }
@@ -267,8 +265,6 @@ fn classify_change(root: &Path, path: &Path) -> Option<PendingChange> {
     let filename = remaining.last().copied().unwrap_or_default();
     let kind = if filename == crate::plan::PLAN_FILENAME {
         ArtifactKind::Plan
-    } else if filename == runner::PI_EVENTS_FILENAME {
-        ArtifactKind::Delegation
     } else if filename.ends_with(".log") {
         ArtifactKind::Log
     } else {
@@ -309,17 +305,12 @@ mod tests {
     fn classifies_agent_artifacts_and_ignores_build_noise() {
         let root = Path::new("/workspace");
         let plan = root.join("lineage_workspaces/job-7/plan.json");
-        let delegation = root.join("lineage_workspaces/job-7/pi-events.jsonl");
         let source = root.join("lineage_workspaces/job-7/worktree/src/app.rs");
         let build = root.join("lineage_workspaces/job-7/worktree/target/debug/app");
 
         assert!(matches!(
             classify_change(root, &plan),
             Some(PendingChange::Artifact(id, ArtifactKind::Plan)) if id == "job-7"
-        ));
-        assert!(matches!(
-            classify_change(root, &delegation),
-            Some(PendingChange::Artifact(id, ArtifactKind::Delegation)) if id == "job-7"
         ));
         assert!(matches!(
             classify_change(root, &source),

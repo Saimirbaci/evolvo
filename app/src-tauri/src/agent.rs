@@ -15,14 +15,11 @@
 //! 3. Extend [`backend_for`] to map the new variant.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
-use crate::types::{AgentAvailability, AgentKind, LocalDelegateAvailability};
+use crate::types::{AgentAvailability, AgentKind};
 
 /// Per-CLI spawn contract. Concrete impls live in this module; they are all
 /// zero-sized so handing out `Box<dyn AgentBackend>` is cheap.
@@ -239,60 +236,6 @@ fn binary_on_path(binary: &str) -> bool {
     false
 }
 
-/// Probe whether the local-delegation worker (`pi` CLI + a reachable
-/// Ollama server at `127.0.0.1:11434`) is available. The result is cached
-/// per process; users who install `pi` or start Ollama after launching
-/// Evolvo need to relaunch — same convention as the per-agent probe.
-///
-/// Both pieces must be true for delegation to make sense: `pi` is the
-/// invocation surface the supervisor talks to, Ollama is what `pi` calls
-/// for inference. We do not parse `~/.pi/agent/models.json` here — if pi
-/// is installed and Ollama is reachable, we trust the user's pi config to
-/// have a usable model. The UI shows a clear error if delegation later
-/// fails at run time.
-pub fn local_delegate_availability() -> LocalDelegateAvailability {
-    static CACHE: OnceLock<LocalDelegateAvailability> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let pi_installed = binary_on_path("pi");
-            let ollama_reachable = ollama_health_check();
-            LocalDelegateAvailability {
-                pi_installed,
-                ollama_reachable,
-                provider: "ollama".into(),
-                default_model: "gemma4".into(),
-            }
-        })
-        .clone()
-}
-
-/// Best-effort HEAD-style probe of the Ollama API root. We open a TCP
-/// connection to `127.0.0.1:11434` with a 250ms connect timeout and write
-/// a minimal HTTP/1.1 GET against `/`. Any 2xx/3xx/4xx response counts as
-/// "Ollama is up" — even a 404 means the server answered. We avoid taking
-/// a `reqwest` dependency just for one health check.
-fn ollama_health_check() -> bool {
-    let addr: SocketAddr = match "127.0.0.1:11434".parse() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-    let req = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    if stream.write_all(req).is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 12];
-    match stream.read(&mut buf) {
-        Ok(n) if n >= 12 => buf.starts_with(b"HTTP/"),
-        _ => false,
-    }
-}
-
 /// Snapshot availability for every known agent. Used by the
 /// `list_available_agents` Tauri command so the UI can grey out chips
 /// whose binaries are missing.
@@ -393,21 +336,6 @@ mod tests {
         for kind in AgentKind::all() {
             assert!(list.iter().any(|a| a.kind == kind));
         }
-    }
-
-    #[test]
-    fn ollama_health_check_does_not_panic_when_offline() {
-        // The probe must always return a bool quickly — even if no Ollama
-        // server is running on the dev machine. We don't assert the value
-        // because CI machines could legitimately have one running.
-        let _ = ollama_health_check();
-    }
-
-    #[test]
-    fn local_delegate_availability_returns_known_provider() {
-        let a = local_delegate_availability();
-        assert_eq!(a.provider, "ollama");
-        assert_eq!(a.default_model, "gemma4");
     }
 
     #[test]
