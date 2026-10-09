@@ -5,6 +5,7 @@ pub mod bundle;
 pub mod commands;
 pub mod concurrency;
 pub mod delegation;
+pub mod deletion;
 pub mod designs;
 pub mod desktop;
 pub mod external;

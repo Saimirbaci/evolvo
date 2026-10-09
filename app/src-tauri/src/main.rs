@@ -102,6 +102,7 @@ fn main() {
             commands::close_desktop_overlay,
             commands::read_job_activity,
             commands::stop_lineage_run,
+            commands::delete_lineage_job,
             commands::capture_desktop_window,
             commands::open_desktop_revision,
             commands::resolve_target_repo,

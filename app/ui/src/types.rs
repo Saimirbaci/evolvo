@@ -933,3 +933,12 @@ pub struct JobActivity {
     #[serde(default)]
     pub app_running: bool,
 }
+
+/// What `delete_lineage_job` removed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSummary {
+    pub job_id: String,
+    #[serde(default)]
+    pub removed: Vec<String>,
+}

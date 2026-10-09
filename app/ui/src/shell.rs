@@ -366,6 +366,9 @@ fn LineagePage(
     let reconcile = RwSignal::new(0_u32);
     let artifact_reload = RwSignal::new(0_u32);
     let selected: RwSignal<Option<String>> = RwSignal::new(None);
+    // Per-card delete: which job is showing its inline confirmation.
+    let confirm_delete: RwSignal<Option<String>> = RwSignal::new(None);
+    let deleting = RwSignal::new(false);
     // Sort order for the sidebar list. `true` = newest first (default), which
     // matches the user's mental model — recent work sits at the top.
     let newest_first: RwSignal<bool> = RwSignal::new(true);
@@ -590,8 +593,48 @@ fn LineagePage(
                                         let id = r.id.clone();
                                         let id_for_click = id.clone();
                                         let is_active = move || selected.get().as_deref() == Some(&id);
+                                        // Delete is unavailable while an agent or merge
+                                        // is running on the job (the host refuses too).
+                                        let busy = matches!(
+                                            r.status,
+                                            LineageJobStatus::Implementing
+                                                | LineageJobStatus::Triaging
+                                                | LineageJobStatus::Merging
+                                        );
+                                        let ask_id = r.id.clone();
+                                        let confirm_id = r.id.clone();
+                                        let do_id = r.id.clone();
+                                        let confirming = move || confirm_delete.get().as_deref() == Some(confirm_id.as_str());
+                                        let confirming_btn = confirming.clone();
+                                        let delete_now = move |_| {
+                                            let id = do_id.clone();
+                                            deleting.set(true);
+                                            action_error.set(None);
+                                            spawn_local(async move {
+                                                match interop::delete_lineage_job(&id).await {
+                                                    Ok(summary) => {
+                                                        items.update(|items| {
+                                                            if let Some(Ok(list)) = items {
+                                                                list.retain(|j| j.id != id);
+                                                            }
+                                                        });
+                                                        if selected.get_untracked().as_deref() == Some(id.as_str()) {
+                                                            selected.set(None);
+                                                        }
+                                                        action_success.set(Some(format!(
+                                                            "Deleted {} — removed {}.",
+                                                            summary.job_id,
+                                                            summary.removed.join(", ")
+                                                        )));
+                                                    }
+                                                    Err(e) => action_error.set(Some(e)),
+                                                }
+                                                confirm_delete.set(None);
+                                                deleting.set(false);
+                                            });
+                                        };
                                         view! {
-                                            <li>
+                                            <li class="lineage-list-row">
                                                 <button
                                                     class="lineage-list-item"
                                                     class:active=is_active
@@ -607,6 +650,45 @@ fn LineagePage(
                                         </div>
                                         <span class="list-card-status">{r.status.label()}</span>
                                                 </button>
+                                                <button
+                                                    class="lineage-delete-btn"
+                                                    class:active=confirming_btn
+                                                    prop:disabled=busy
+                                                    title=if busy {
+                                                        "Can't delete while the agent or a merge is running"
+                                                    } else {
+                                                        "Delete this job and everything under it"
+                                                    }
+                                                    aria-label="Delete lineage job"
+                                                    on:click=move |_| confirm_delete.set(Some(ask_id.clone()))
+                                                >
+                                                    <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">
+                                                        <path d="M9 3h6l1 2h4v2H4V5h4l1-2zm-3 6h12l-1 12H7L6 9zm4 2v8h2v-8h-2zm4 0v8h2v-8h-2z"/>
+                                                    </svg>
+                                                </button>
+                                                {move || confirming().then(|| {
+                                                    let delete_now = delete_now.clone();
+                                                    view! {
+                                                        <div class="lineage-delete-confirm" role="alertdialog" aria-label="Confirm delete">
+                                                            <span>"Delete this job, its worktree and branch, logs, and the feedback that created it? This can't be undone."</span>
+                                                            <div class="lineage-delete-actions">
+                                                                <button
+                                                                    class="btn btn-danger"
+                                                                    prop:disabled=move || deleting.get()
+                                                                    on:click=delete_now
+                                                                >
+                                                                    {move || if deleting.get() { "Deleting…" } else { "Delete" }}
+                                                                </button>
+                                                                <button
+                                                                    class="btn btn-ghost"
+                                                                    on:click=move |_| confirm_delete.set(None)
+                                                                >
+                                                                    "Cancel"
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    }
+                                                })}
                                             </li>
                                         }
                                     }).collect_view()}

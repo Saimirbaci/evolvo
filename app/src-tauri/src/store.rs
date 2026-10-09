@@ -200,6 +200,17 @@ impl Store {
         Ok(true)
     }
 
+    /// Remove a lineage job record. Callers own cleanup of its workspace —
+    /// see `deletion::delete_lineage_job`.
+    pub fn delete_lineage_job(&self, id: &str) -> Result<bool, StoreError> {
+        let path = self.lineage_job_path(id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&path)?;
+        Ok(true)
+    }
+
     pub fn save_lineage_job(&self, rec: &LineageJobRecord) -> Result<(), StoreError> {
         self.init_workspace()?;
         let json = serde_json::to_string_pretty(rec)?;

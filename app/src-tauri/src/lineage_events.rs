@@ -109,7 +109,7 @@ fn publish_artifacts_changed(job_id: String, kinds: BTreeSet<ArtifactKind>) {
     with_sink(|sink| sink.artifacts_changed(&event));
 }
 
-fn publish_snapshot_invalidated() {
+pub(crate) fn publish_snapshot_invalidated() {
     with_sink(LineageEventSink::snapshot_invalidated);
 }
 

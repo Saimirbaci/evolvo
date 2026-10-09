@@ -1493,6 +1493,17 @@ pub struct CaptureDesktopWindowPayload {
     pub id: u32,
 }
 
+/// Delete a lineage job and everything under it (running version,
+/// worktree + branch, job workspace, its feedback + attachments, record).
+/// See `deletion.rs` for what is kept and when it refuses.
+#[tauri::command]
+pub fn delete_lineage_job(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<crate::deletion::DeleteSummary, String> {
+    crate::deletion::delete_lineage_job(&state.store(), &payload.id)
+}
+
 /// Stop the new version Evolvo launched for an external-app job.
 #[tauri::command]
 pub fn stop_lineage_run(

@@ -7,10 +7,10 @@ use web_sys::window;
 
 use crate::types::{
     AgentAvailability, AgentKind, AnswerPlanQuestionsPayload, AppHealth, DelegationSummary,
-    DesignSummary, DesktopSession, EditableDesign, EditableFeedback, FeedbackRecord, JobActivity,
-    LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted, LocalDelegateAvailability,
-    PlanAnswerPayload, PreviewSummary, SaveDesignPayload, SketchRequest, SketchResponse,
-    StageState, SubmitFeedbackPayload, WindowCapture,
+    DeleteSummary, DesignSummary, DesktopSession, EditableDesign, EditableFeedback, FeedbackRecord,
+    JobActivity, LineageArtifactsChanged, LineageJobRecord, LineageJobUpserted,
+    LocalDelegateAvailability, PlanAnswerPayload, PreviewSummary, SaveDesignPayload, SketchRequest,
+    SketchResponse, StageState, SubmitFeedbackPayload, WindowCapture,
 };
 
 pub const LINEAGE_JOB_UPSERTED_EVENT: &str = "lineage://job-upserted";
@@ -283,6 +283,12 @@ pub async fn capture_desktop_window(id: u32) -> Result<WindowCapture, String> {
         &CaptureDesktopWindowPayload { id },
     )
     .await
+}
+
+/// Delete a lineage job and everything under it (worktree, branch, job
+/// workspace, its feedback + attachments, the record).
+pub async fn delete_lineage_job(id: &str) -> Result<DeleteSummary, String> {
+    invoke_command_with_args("delete_lineage_job", &IdArg { id }).await
 }
 
 /// Stop the new version Evolvo launched for a job. `true` if one was running.
