@@ -1,6 +1,6 @@
 # Evolvo — Repository Guide for Claude
 
-Evolvo is a **Tauri 2** desktop app with a **Leptos 0.8 (CSR / WASM)** frontend. It is a "white canvas" app: users draw / paste / record feedback on a blank canvas, submit it, and a **local lineage pipeline** turns each feedback row into a lineage job that a reviewer can approve/reject. Everything is stored as JSON files on the local filesystem — there is no database, no server, no cloud.
+Evolvo is a **Tauri 2** desktop app with a **Leptos 0.8 (CSR / WASM)** frontend. It is a "white canvas" app: users draw / paste / record feedback on a blank canvas, submit it, and a **local lineage pipeline** turns each feedback row into a lineage job that a reviewer can approve/reject. Evolvo's **own** data (feedback, lineage jobs, designs, attachments) is stored as JSON files on the local filesystem — no database, no server, no cloud. This keeps lineages portable and forkable (I-P4). **This is not a constraint on NewApps:** an app built through the lineage pipeline picks whatever persistence its specification calls for (JSON files, SQLite, Postgres, …).
 
 ## Stack snapshot
 
