@@ -1,0 +1,7 @@
+# timeline_feed scaffold — Cargo dependencies to merge.
+# Default backend uses only crates already in the workspace.
+# When `webhook_ingest` seam is bound, that integration's deps.toml
+# supplies the embedded HTTP server (axum/hyper or whatever it picks).
+
+[workspace.dependencies]
+# (none required)

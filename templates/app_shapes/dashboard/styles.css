@@ -1,0 +1,132 @@
+/* dashboard — append to app/ui/styles/app.css. ~80 lines.
+   Uses var(--...) tokens from app/ui/styles/tokens.css — no raw hex/rgb. */
+
+.dashboard-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 56px);
+  background: var(--bg);
+  color: var(--fg);
+  overflow: hidden;
+}
+
+.dashboard-toolbar {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.dashboard-input {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+}
+
+.dashboard-url {
+  flex: 1;
+}
+
+.dashboard-error {
+  padding: var(--space-2) var(--space-4);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 20%, transparent);
+  font-size: var(--text-sm);
+}
+
+.dashboard-grid {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-4);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-3);
+}
+
+.dashboard-tile {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
+  display: flex;
+  flex-direction: column;
+  min-height: 140px;
+}
+
+.dashboard-tile-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.dashboard-tile-head h3 {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.dashboard-tile-actions {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.dashboard-tile-btn {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: var(--text-base);
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+.dashboard-tile-btn:hover {
+  background: color-mix(in srgb, black 5%, transparent);
+}
+
+.dashboard-tile-btn-danger:hover {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+
+.dashboard-tile-body {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3);
+}
+
+.dashboard-tile-number {
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-tile-text {
+  font-size: var(--text-base);
+  text-align: center;
+  word-break: break-word;
+}
+
+.dashboard-tile-foot {
+  display: flex;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.dashboard-tile-meta {
+  font-size: var(--text-xs);
+  color: var(--muted);
+}

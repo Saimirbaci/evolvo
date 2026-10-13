@@ -7,24 +7,96 @@ use crate::lineage::{LineageEngine, Transition};
 use crate::runner;
 use crate::state::AppState;
 use crate::store::StoreError;
-use crate::types::{
-    current_time_unix_ms, AgentAvailability, AppHealth, EntityIdPayload, FeedbackRecord,
-    FeedbackStatus, LineageJobRecord, LineageJobStatus, PreviewSummary, SubmitFeedbackPayload,
-};
 #[cfg(test)]
 use crate::types::AgentKind;
+use crate::types::{
+    current_time_unix_ms, AgentAvailability, AppHealth, EditableFeedback, EditableFeedbackScreen,
+    EntityIdPayload, FeedbackRecord, FeedbackRevision, FeedbackScreenRecord, FeedbackStatus,
+    LineageJobRecord, LineageJobStatus, PreviewSummary, SubmitFeedbackPayload,
+};
 
 const APP_NAME: &str = "Evolvo";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Per-attachment decoded-byte ceiling. Kept in sync with
+/// `store::MAX_ATTACHMENT_BYTES` (the store enforces its own copy as
+/// defense in depth); this constant lets `submit_feedback` reject an
+/// oversized attachment before spending the cost of base64-decoding it.
+const MAX_ATTACHMENT_BYTES: usize = crate::store::MAX_ATTACHMENT_BYTES;
+/// Aggregate decoded-byte ceiling across every attachment in a single
+/// `SubmitFeedbackPayload` (screenshot + pasted images + voice). Bounds the
+/// total IPC payload / disk write a single submission can cost regardless
+/// of how the bytes are split across attachments.
+const MAX_TOTAL_ATTACHMENT_BYTES: usize = 32 * 1024 * 1024;
 
 fn store_error(err: StoreError) -> String {
     err.to_string()
 }
 
+/// Estimate the decoded byte length of a base64 string without decoding it,
+/// so oversized payloads can be rejected before paying the decode cost.
+/// Standard base64 (no line breaks) encodes every 4 input chars as 3 output
+/// bytes, minus 1 or 2 for `=` padding.
+fn estimated_decoded_len(b64: &str) -> usize {
+    let len = b64.len();
+    let padding = b64.chars().rev().take_while(|&c| c == '=').count();
+    (len / 4) * 3 - padding.min(len / 4 * 3)
+}
+
+/// Reject a base64 attachment before decoding if its estimated decoded size
+/// exceeds `MAX_ATTACHMENT_BYTES`. Cheap, and avoids allocating a
+/// multi-megabyte `Vec<u8>` for a payload we're going to reject anyway.
+fn check_encoded_size(name: &str, b64: &str) -> Result<(), String> {
+    let estimated = estimated_decoded_len(b64);
+    if estimated > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "attachment {name} is approximately {estimated} bytes, which exceeds the {MAX_ATTACHMENT_BYTES}-byte per-attachment limit"
+        ));
+    }
+    Ok(())
+}
+
 fn decode_base64(name: &str, value: &str) -> Result<Vec<u8>, String> {
-    STANDARD
+    check_encoded_size(name, value)?;
+    let bytes = STANDARD
         .decode(value)
-        .map_err(|e| format!("invalid base64 for {name}: {e}"))
+        .map_err(|e| format!("invalid base64 for {name}: {e}"))?;
+    // Double-check post-decode: the pre-decode estimate is a close but not
+    // exact bound (base64 implementations can differ at the margins), and
+    // this is the number that actually lands on disk.
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "attachment {name} is {} bytes, which exceeds the {MAX_ATTACHMENT_BYTES}-byte per-attachment limit",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Track and enforce the aggregate decoded-byte budget across every
+/// attachment in one `submit_feedback` call. Call `add` after each
+/// successful `decode_base64` so a submission with many attachments, each
+/// individually under the per-attachment cap, still can't blow past a
+/// sane total.
+struct AttachmentBudget {
+    used: usize,
+}
+
+impl AttachmentBudget {
+    fn new() -> Self {
+        Self { used: 0 }
+    }
+
+    fn add(&mut self, name: &str, len: usize) -> Result<(), String> {
+        self.used = self.used.saturating_add(len);
+        if self.used > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachment {name} pushed total attachment size to {} bytes, which exceeds the {MAX_TOTAL_ATTACHMENT_BYTES}-byte aggregate limit",
+                self.used
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn guess_voice_ext(mime: Option<&str>) -> &'static str {
@@ -46,6 +118,9 @@ pub fn app_health(state: State<'_, AppState>) -> Result<AppHealth, String> {
         app_version: APP_VERSION.into(),
         workspace_path: state.workspace_root_display(),
         launched_at_unix_ms: state.launched_at_unix_ms,
+        active_agent_sessions: crate::concurrency::active_count(),
+        max_concurrent_agent_sessions: crate::concurrency::cap(),
+        corrupted_entity_count: store.count_quarantined_entities(),
     })
 }
 
@@ -57,12 +132,36 @@ pub fn submit_feedback(
     let store = state.store();
     store.init_workspace().map_err(store_error)?;
 
+    let mut parent_feedback = match payload
+        .parent_feedback_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(parent_id) => Some(
+            store
+                .load_feedback(parent_id)
+                .map_err(store_error)?
+                .ok_or_else(|| format!("feedback revision parent not found: {parent_id}"))?,
+        ),
+        None => None,
+    };
+
     let now = current_time_unix_ms();
     let id = format!("fb-{now}");
 
+    let mut budget = AttachmentBudget::new();
+
+    let screens = persist_storyboard_screens(&store, &id, &payload, &mut budget)?;
+    let has_storyboard = !screens.is_empty();
+
     let screenshot_filename = match payload.screenshot_base64.as_deref() {
+        _ if has_storyboard => screens
+            .first()
+            .and_then(|screen| screen.screenshot_filename.clone()),
         Some(b64) if !b64.is_empty() => {
             let bytes = decode_base64("screenshot", b64)?;
+            budget.add("screenshot", bytes.len())?;
             Some(
                 store
                     .save_attachment(&id, "canvas.png", &bytes)
@@ -72,22 +171,33 @@ pub fn submit_feedback(
         _ => None,
     };
 
-    let mut pasted_images = Vec::with_capacity(payload.pasted_images_base64.len());
-    for (idx, b64) in payload.pasted_images_base64.iter().enumerate() {
-        if b64.is_empty() {
-            continue;
+    let pasted_images = if has_storyboard {
+        screens
+            .first()
+            .map(|screen| screen.pasted_images.clone())
+            .unwrap_or_default()
+    } else {
+        let mut images = Vec::with_capacity(payload.pasted_images_base64.len());
+        for (idx, b64) in payload.pasted_images_base64.iter().enumerate() {
+            if b64.is_empty() {
+                continue;
+            }
+            let name = format!("pasted-image-{idx}");
+            let bytes = decode_base64(&name, b64)?;
+            budget.add(&name, bytes.len())?;
+            let filename = format!("paste-{idx}.png");
+            let saved = store
+                .save_attachment(&id, &filename, &bytes)
+                .map_err(store_error)?;
+            images.push(saved);
         }
-        let bytes = decode_base64(&format!("pasted-image-{idx}"), b64)?;
-        let filename = format!("paste-{idx}.png");
-        let saved = store
-            .save_attachment(&id, &filename, &bytes)
-            .map_err(store_error)?;
-        pasted_images.push(saved);
-    }
+        images
+    };
 
     let voice_filename = match payload.voice_base64.as_deref() {
         Some(b64) if !b64.is_empty() => {
             let bytes = decode_base64("voice", b64)?;
+            budget.add("voice", bytes.len())?;
             let ext = guess_voice_ext(payload.voice_mime_type.as_deref());
             Some(
                 store
@@ -98,19 +208,41 @@ pub fn submit_feedback(
         _ => None,
     };
 
+    let background_filename = match payload.background_base64.as_deref() {
+        Some(b64) if !b64.is_empty() => {
+            let bytes = decode_base64("background frame", b64)?;
+            budget.add("background frame", bytes.len())?;
+            Some(
+                store
+                    .save_attachment(&id, "frame.png", &bytes)
+                    .map_err(store_error)?,
+            )
+        }
+        _ => None,
+    };
+
+    let first_screen = screens.first();
     let mut record = FeedbackRecord {
         id: id.clone(),
         feedback_type: payload.feedback_type,
         status: FeedbackStatus::New,
-        page_route: if payload.page_route.is_empty() {
+        page_route: if let Some(route) = first_screen
+            .map(|screen| screen.intended_route.as_str())
+            .filter(|route| !route.is_empty())
+        {
+            route.to_string()
+        } else if payload.page_route.is_empty() {
             "/".into()
         } else {
             payload.page_route
         },
         feedback_text: payload.feedback_text,
-        annotations: payload.annotations,
+        annotations: first_screen
+            .map(|screen| screen.annotations.clone())
+            .unwrap_or(payload.annotations),
         pasted_images,
         screenshot_filename,
+        screens,
         voice_filename,
         voice_transcript: payload.voice_transcript.filter(|s| !s.trim().is_empty()),
         window_width: payload.window_width,
@@ -118,6 +250,13 @@ pub fn submit_feedback(
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         lineage_job_id: None,
+        revision: parent_feedback
+            .as_ref()
+            .map(next_feedback_revision)
+            .unwrap_or_default(),
+        target_app: payload.target_app.clone(),
+        background_filename,
+        auto_launch: payload.auto_launch,
     };
 
     store.save_feedback(&record).map_err(store_error)?;
@@ -131,16 +270,144 @@ pub fn submit_feedback(
         .enqueue_job_for_feedback(&mut record, agent)
         .map_err(store_error)?;
 
+    // Plan-review gate must be armed BEFORE any run fires — the pipeline
+    // reads the flag right after the BackendPlan stage validates.
+    let job = if payload.pause_after_plan {
+        engine.request_plan_review(&job.id).map_err(store_error)?
+    } else {
+        job
+    };
+
+    // Link the old record to its successor only after the new feedback and
+    // lineage job are durable. A metadata-write failure must not make the UI
+    // report that an otherwise valid revision was lost.
+    if let Some(parent) = parent_feedback.as_mut() {
+        parent.revision.superseded_by_feedback_id = Some(record.id.clone());
+        parent.updated_at_unix_ms = now;
+        if let Err(err) = store.save_feedback(parent) {
+            eprintln!(
+                "evolvo: revision {} saved but failed to link parent {}: {err}",
+                record.id, parent.id
+            );
+        }
+    }
+
     // Auto-evolve: skip the manual "Evolve" click and fire the agent run
     // immediately. We swallow run-prep errors so the feedback record is
     // still reported as saved — the failure is recorded on the lineage
     // job by `start_implementation_run` itself (note + status=Failed),
     // which the user can then see on the Lineage tab.
     if payload.auto_evolve {
+        // External apps resolve their repo first; `start_implementation_run`
+        // kicks that off and starts the agent when it finishes.
         let _ = start_implementation_run(&store, &engine, &job);
+    } else if let Some(target) = record.target_app.as_ref() {
+        // Not auto-starting, but find/clone the repo now so it's ready when
+        // the reviewer clicks Evolve.
+        if target.repo_path.is_none() {
+            crate::external::start_resolution(
+                store.clone(),
+                job.id.clone(),
+                record.clone(),
+                None,
+                None,
+            );
+        }
     }
 
     Ok(record)
+}
+
+/// Continuation handed to `external::start_resolution`: once the repo is
+/// known, start the job's agent run if it is still waiting to start.
+fn run_after_resolution(job_id: String) -> crate::external::OnResolved {
+    Box::new(move |store: &crate::store::Store| {
+        let engine = LineageEngine::new(store);
+        match store.load_lineage_job(&job_id) {
+            Ok(Some(job)) if job.status == LineageJobStatus::Pending => {
+                if let Err(e) = start_implementation_run(store, &engine, &job) {
+                    let _ = engine.append_note(&job_id, &format!("could not start agent: {e}"));
+                }
+            }
+            _ => {}
+        }
+    })
+}
+
+fn next_feedback_revision(parent: &FeedbackRecord) -> FeedbackRevision {
+    FeedbackRevision {
+        number: parent.revision.number.max(1).saturating_add(1),
+        parent_feedback_id: Some(parent.id.clone()),
+        superseded_by_feedback_id: None,
+    }
+}
+
+fn persist_storyboard_screens(
+    store: &crate::store::Store,
+    feedback_id: &str,
+    payload: &SubmitFeedbackPayload,
+    budget: &mut AttachmentBudget,
+) -> Result<Vec<FeedbackScreenRecord>, String> {
+    let mut records = Vec::with_capacity(payload.screens.len());
+    for (screen_idx, screen) in payload.screens.iter().enumerate() {
+        let ordinal = screen_idx + 1;
+        let screenshot_filename = match screen.screenshot_base64.as_deref() {
+            Some(b64) if !b64.is_empty() => {
+                let label = format!("screen-{ordinal:02}-screenshot");
+                let bytes = decode_base64(&label, b64)?;
+                budget.add(&label, bytes.len())?;
+                Some(
+                    store
+                        .save_attachment(feedback_id, &format!("screen-{ordinal:02}.png"), &bytes)
+                        .map_err(store_error)?,
+                )
+            }
+            _ => None,
+        };
+
+        let mut pasted_images = Vec::with_capacity(screen.pasted_images_base64.len());
+        for (paste_idx, b64) in screen.pasted_images_base64.iter().enumerate() {
+            if b64.is_empty() {
+                continue;
+            }
+            let label = format!("screen-{ordinal:02}-pasted-image-{paste_idx}");
+            let bytes = decode_base64(&label, b64)?;
+            budget.add(&label, bytes.len())?;
+            let saved = store
+                .save_attachment(
+                    feedback_id,
+                    &format!("screen-{ordinal:02}-paste-{paste_idx}.png"),
+                    &bytes,
+                )
+                .map_err(store_error)?;
+            pasted_images.push(saved);
+        }
+
+        records.push(FeedbackScreenRecord {
+            id: if screen.id.trim().is_empty() {
+                format!("screen-{ordinal}")
+            } else {
+                screen.id.clone()
+            },
+            name: if screen.name.trim().is_empty() {
+                format!("Screen {ordinal}")
+            } else {
+                screen.name.trim().to_string()
+            },
+            description: screen.description.trim().to_string(),
+            intended_route: if screen.intended_route.trim().is_empty() {
+                format!("/screen-{ordinal}")
+            } else {
+                screen.intended_route.trim().to_string()
+            },
+            annotations: screen.annotations.clone(),
+            pasted_images,
+            screenshot_filename,
+            window_width: screen.window_width,
+            window_height: screen.window_height,
+        });
+    }
+    Ok(records)
 }
 
 /// Enumerate every known agent backend along with whether its CLI binary is
@@ -166,6 +433,110 @@ pub fn load_feedback(
         .store()
         .load_feedback(&payload.id)
         .map_err(store_error)
+}
+
+#[tauri::command]
+pub fn load_feedback_for_revision(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<Option<EditableFeedback>, String> {
+    let store = state.store();
+    let Some(feedback) = store.load_feedback(&payload.id).map_err(store_error)? else {
+        return Ok(None);
+    };
+
+    let screens = if feedback.screens.is_empty() {
+        vec![editable_screen(
+            &store,
+            &feedback.id,
+            "screen-1",
+            "Screen 1",
+            "",
+            &feedback.page_route,
+            &feedback.annotations,
+            &feedback.pasted_images,
+            feedback.window_width,
+            feedback.window_height,
+        )?]
+    } else {
+        feedback
+            .screens
+            .iter()
+            .map(|screen| {
+                editable_screen(
+                    &store,
+                    &feedback.id,
+                    &screen.id,
+                    &screen.name,
+                    &screen.description,
+                    &screen.intended_route,
+                    &screen.annotations,
+                    &screen.pasted_images,
+                    screen.window_width,
+                    screen.window_height,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(Some(EditableFeedback { feedback, screens }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn editable_screen(
+    store: &crate::store::Store,
+    feedback_id: &str,
+    id: &str,
+    name: &str,
+    description: &str,
+    intended_route: &str,
+    annotations: &[serde_json::Value],
+    pasted_images: &[String],
+    window_width: u32,
+    window_height: u32,
+) -> Result<EditableFeedbackScreen, String> {
+    let pasted_image_data_urls = pasted_images
+        .iter()
+        .map(|filename| {
+            let bytes = store
+                .read_attachment(feedback_id, filename)
+                .map_err(store_error)?;
+            Ok(bytes
+                .map(|bytes| {
+                    format!(
+                        "data:{};base64,{}",
+                        image_mime_type(&bytes),
+                        STANDARD.encode(bytes)
+                    )
+                })
+                .unwrap_or_default())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(EditableFeedbackScreen {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        intended_route: intended_route.to_string(),
+        annotations: annotations.to_vec(),
+        pasted_image_data_urls,
+        window_width,
+        window_height,
+    })
+}
+
+fn image_mime_type(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 #[tauri::command]
@@ -275,12 +646,24 @@ pub fn resume_lineage_job(
         .map_err(store_error)?
         .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
 
+    // Status guard: resuming a job whose runner is still alive would spawn
+    // a SECOND pipeline thread into the same worktree — two agents editing
+    // the same files. Only terminal-but-recoverable states may resume.
+    if matches!(
+        job.status,
+        LineageJobStatus::Implementing | LineageJobStatus::Promoted | LineageJobStatus::Merging
+    ) {
+        return Err(format!(
+            "cannot resume a job in status {:?} — wait for the current run to finish or fail",
+            job.status
+        ));
+    }
+
     // Flip to `Implementing` synchronously *before* spawning the resume
-    // thread so the UI sees the change immediately AND so the spawned
-    // thread's first writes (`append_note` + `force_status`) cannot race
-    // this status write — `save_lineage_job` is plain `fs::write`, no
-    // locking, so a write from main racing the thread's read-modify-write
-    // would silently clobber the resume note that the thread just appended.
+    // thread so the UI sees the change immediately. (Engine writes are
+    // additionally serialised by a per-job lock — see
+    // `lineage::job_write_lock` — so thread/main interleavings can no
+    // longer drop updates.)
     let updated = engine
         .force_status(&job.id, LineageJobStatus::Implementing)
         .map_err(store_error)?;
@@ -290,14 +673,147 @@ pub fn resume_lineage_job(
     Ok(updated)
 }
 
+/// Record the reviewer's answers to a paused plan's open questions and, for
+/// "Answer & re-plan", rewind `plan.stage` so the BackendPlan stage actually
+/// re-runs (a plan marked planned would only be re-validated). Returns the
+/// job and whether a re-plan should start. Pure state change — the wrapper
+/// launches the pipeline so tests can drive this without a worktree.
+pub fn answer_plan_questions_impl(
+    store: &crate::store::Store,
+    payload: crate::types::AnswerPlanQuestionsPayload,
+) -> Result<(LineageJobRecord, bool), String> {
+    use crate::types::{MAX_PLAN_ANSWERS, MAX_PLAN_ANSWER_CHARS};
+    let engine = LineageEngine::new(store);
+    let job = store
+        .load_lineage_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
+    let awaiting = job.status == LineageJobStatus::Planned
+        && job.pause_after_plan
+        && job.plan_approved_at_unix_ms.is_none();
+    if !awaiting {
+        return Err("this job is not waiting for plan review".into());
+    }
+    if payload.answers.len() > MAX_PLAN_ANSWERS {
+        return Err(format!("at most {MAX_PLAN_ANSWERS} answers per request"));
+    }
+
+    // Serialise concurrent answer calls for this job while plan.json is
+    // read-modified-written. Released before `append_note`, which takes the
+    // same (non-reentrant) per-job lock.
+    let lock = crate::lineage::job_write_lock(&job.id);
+    let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let job_dir = runner::job_workspace_dir(store.layout().root(), &job.id);
+    let mut plan = crate::plan::load_plan(&job_dir)
+        .map_err(store_error)?
+        .ok_or_else(|| "no plan.json for this job".to_string())?;
+
+    let known: std::collections::HashSet<String> = plan
+        .open_questions
+        .iter()
+        .map(|q| q.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let mut answers: Vec<(String, String)> = Vec::new();
+    for a in payload.answers {
+        let question = a.question.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !known.contains(&question) {
+            return Err(format!(
+                "not one of this plan's open questions: {:?}",
+                question.chars().take(80).collect::<String>()
+            ));
+        }
+        if a.answer.chars().count() > MAX_PLAN_ANSWER_CHARS {
+            return Err(format!(
+                "answers are limited to {MAX_PLAN_ANSWER_CHARS} characters"
+            ));
+        }
+        answers.push((question, a.answer));
+    }
+    let stored = crate::plan::record_answers(&mut plan, &answers, current_time_unix_ms());
+    if payload.replan && stored == 0 {
+        return Err(
+            "answer at least one question to re-plan (or Approve to accept the planner's guesses)"
+                .into(),
+        );
+    }
+    if stored > 0 {
+        plan.history.push(crate::plan::HistoryEntry {
+            at_unix_ms: current_time_unix_ms(),
+            stage: "backend_plan".into(),
+            kind: crate::plan::HistoryKind::Note,
+            message: format!(
+                "reviewer answered {stored} open question(s){}",
+                if payload.replan {
+                    " — re-planning"
+                } else {
+                    ""
+                }
+            ),
+        });
+    }
+    if payload.replan {
+        // Runtime-owned field: rewind so run_stage dispatches the planner
+        // instead of re-validating the old plan.
+        plan.stage = crate::plan::PlanStage::Seeded;
+    }
+    crate::plan::save_plan(&job_dir, &plan).map_err(store_error)?;
+    drop(guard);
+    if stored > 0 {
+        let _ = engine.append_note(
+            &job.id,
+            &format!(
+                "reviewer answered {stored} of {} open question(s){}",
+                plan.open_questions.len(),
+                if payload.replan {
+                    "; re-planning with the answers"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+    let job = store
+        .load_lineage_job(&job.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
+    Ok((job, payload.replan))
+}
+
+/// "Answer & re-plan" / record answers before Approve.
+#[tauri::command]
+pub fn answer_plan_questions(
+    state: State<'_, AppState>,
+    payload: crate::types::AnswerPlanQuestionsPayload,
+) -> Result<LineageJobRecord, String> {
+    let store = state.store();
+    let (job, replan) = answer_plan_questions_impl(&store, payload)?;
+    if !replan {
+        return Ok(job);
+    }
+    let engine = LineageEngine::new(&store);
+    let updated = engine
+        .force_status(&job.id, LineageJobStatus::Implementing)
+        .map_err(store_error)?;
+    if let Err(err) = runner::resume_pipeline(store.clone(), job.id.clone()) {
+        // Never leave the job "Implementing" with nothing running.
+        crate::lineage::force_status_with_retry(&engine, &job.id, LineageJobStatus::Planned);
+        let _ = engine.append_note(&job.id, &format!("re-plan could not start: {err}"));
+        return Err(format!("re-plan could not start: {err}"));
+    }
+    Ok(updated)
+}
+
 /// "Advance" button entry point. Behaviour depends on the job's current
 /// status:
 /// - `Pending` → fork the source repo into a lineage worktree, spawn
 ///   `claude -p … --dangerously-skip-permissions` in it, and return with
 ///   status `Implementing`. The run continues on a background thread;
 ///   the job will flip to `BuildReady` or `Failed` when claude exits.
-/// - `BuildReady` → advance to `Promoted` via the regular state machine
-///   (merging back to main is out of scope for this step).
+/// - `Planned` (with the plan-review gate armed) → resume implementation.
+/// - `BuildReady` → flip to `Merging` synchronously and run the real
+///   promotion merge (see `promotion::start_promotion`) on a background
+///   thread. The job lands on `Promoted` on success or bounces back to
+///   `BuildReady` with an explanatory note on any refusal/failure.
 /// - anything else → the normal state-machine transition, which will
 ///   surface an error if invalid.
 #[tauri::command]
@@ -314,6 +830,30 @@ pub fn approve_lineage_job(
         .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
     match job.status {
         LineageJobStatus::Pending => start_implementation_run(&store, &engine, &job),
+        // Plan-review gate: a job parked in `Planned` by the pipeline
+        // resumes implementation on approval instead of jumping straight
+        // to Promoted. Only fires for jobs that requested the gate —
+        // legacy Planned jobs keep the historical approve semantics.
+        LineageJobStatus::Planned if job.pause_after_plan => {
+            engine.mark_plan_approved(&job.id).map_err(store_error)?;
+            let _ = engine.append_note(
+                &job.id,
+                "plan approved by reviewer — resuming pipeline into implementation",
+            );
+            let updated = engine
+                .force_status(&job.id, LineageJobStatus::Implementing)
+                .map_err(store_error)?;
+            runner::resume_pipeline(store.clone(), job.id.clone())?;
+            Ok(updated)
+        }
+        LineageJobStatus::BuildReady => {
+            let updated = engine
+                .force_status(&job.id, LineageJobStatus::Merging)
+                .map_err(store_error)?;
+            let _ = engine.append_note(&job.id, "reviewer approved — promotion starting");
+            crate::promotion::start_promotion(store.clone(), job.id.clone());
+            Ok(updated)
+        }
         _ => engine
             .transition(&payload.id, Transition::Approve)
             .map_err(store_error),
@@ -331,12 +871,51 @@ fn start_implementation_run(
         .map_err(store_error)?
         .ok_or_else(|| format!("feedback {} not found for job {}", job.feedback_id, job.id))?;
 
+    // Jobs recorded with a retired agent (Gemini, Forge) run with Claude.
+    let job = &engine
+        .ensure_runnable_agent(job.clone())
+        .map_err(store_error)?;
+
+    // External app (desktop overlay): the agent can only start once the
+    // app's source repo is known. Resolve (and clone) it first; the run
+    // starts automatically when resolution succeeds.
+    let is_external = feedback.target_app.is_some();
+    if let Some(target) = feedback.target_app.as_ref() {
+        if target.repo_path.is_none() {
+            if crate::external::is_resolving(&feedback.id) {
+                let _ = engine.append_note(
+                    &job.id,
+                    "source repo is still being resolved — the agent starts automatically once it is ready",
+                );
+            } else {
+                let _ = engine.append_note(
+                    &job.id,
+                    &format!(
+                        "resolving the source repo for '{}' before starting the agent",
+                        target.name
+                    ),
+                );
+                crate::external::start_resolution(
+                    store.clone(),
+                    job.id.clone(),
+                    feedback.clone(),
+                    None,
+                    Some(run_after_resolution(job.id.clone())),
+                );
+            }
+            return store
+                .load_lineage_job(&job.id)
+                .map_err(store_error)?
+                .ok_or_else(|| format!("lineage job not found: {}", job.id));
+        }
+    }
+
     let prepared = runner::prepare_run(store, job, &feedback, job.agent).map_err(|e| {
         // Record the failure on the job so the reviewer sees why nothing
         // happened, then surface the error to the frontend.
         let msg = store_error(e);
         let _ = engine.append_note(&job.id, &format!("failed to prepare run: {msg}"));
-        let _ = engine.force_status(&job.id, LineageJobStatus::Failed);
+        crate::lineage::force_status_with_retry(engine, &job.id, LineageJobStatus::Failed);
         msg
     })?;
 
@@ -349,13 +928,16 @@ fn start_implementation_run(
             prepared.branch.clone(),
             prepared.log_file.display().to_string(),
             prepared.source_repo.display().to_string(),
+            prepared.base_branch.clone(),
         )
         .map_err(store_error)?;
     let updated = engine
         .force_status(&job.id, LineageJobStatus::Implementing)
         .map_err(store_error)?;
 
-    if runner::is_multi_stage_candidate(&feedback) {
+    // External repos get a single agent session: the multi-stage NewApp
+    // pipeline and its validators are specific to Evolvo-shaped apps.
+    if !is_external && runner::is_multi_stage_candidate(&feedback) {
         runner::launch_pipeline(store.clone(), job.id.clone(), feedback, prepared, job.agent);
     } else {
         runner::launch_agent_session(store.clone(), job.id.clone(), prepared, job.agent);
@@ -388,6 +970,26 @@ pub fn retry_lineage_job(
     let store = state.store();
     let engine = LineageEngine::new(&store);
 
+    // Serialize the whole soft-retry decision (checkpoint lookup, worktree
+    // reset/teardown, status flip) per job id. Without this, two
+    // concurrent retry calls on the same job (e.g. a double click, or a
+    // UI retry racing a background reconciler) can both read the same
+    // `can_retry()`-eligible status, then interleave their worktree
+    // resets/teardowns — one retry's `reset_worktree_to` can run against
+    // a worktree the other retry's `cleanup_previous_run` just deleted
+    // (TOCTOU between the `.exists()` filter below and the actual git
+    // operations a few lines later). Holding this lock for the duration
+    // turns that race into a clean second-caller failure (`can_retry()`
+    // false, or a "no longer exists" error from `reset_worktree_to`)
+    // instead of undefined worktree state.
+    //
+    // This is `job_retry_lock`, NOT `job_write_lock` — this function calls
+    // `engine.append_note` / `engine.force_status` below, which internally
+    // take `job_write_lock`; reusing that lock here would self-deadlock
+    // since `std::sync::Mutex` isn't reentrant.
+    let _retry_guard = crate::lineage::job_retry_lock(&payload.id);
+    let _retry_guard = _retry_guard.lock().unwrap_or_else(|p| p.into_inner());
+
     let job = store
         .load_lineage_job(&payload.id)
         .map_err(store_error)?
@@ -399,11 +1001,59 @@ pub fn retry_lineage_job(
         ));
     }
 
-    let source = runner::resolve_source_repo().ok_or_else(|| {
-        "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
-            .to_string()
-    })?;
     let workspace_root = store.layout().root().to_path_buf();
+
+    // Soft retry: when the multi-stage pipeline already banked green
+    // checkpoints in this worktree, reset to the last one and resume —
+    // the green stages' work survives and the Reflexion loop re-attacks
+    // only the failed stage. Far cheaper than rebuilding the worktree.
+    // Falls through to the destructive path when there's no checkpoint
+    // (legacy runs, or a pipeline that never went green) or the reset
+    // itself fails.
+    if let Some(worktree) = job
+        .worktree_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+    {
+        let job_dir = runner::job_workspace_dir(&workspace_root, &job.id);
+        if job_dir.join(crate::plan::PLAN_FILENAME).exists() {
+            if let Some(sha) = runner::last_green_checkpoint(&worktree) {
+                match runner::reset_worktree_to(&worktree, &sha) {
+                    Ok(()) => {
+                        let _ = engine.append_note(
+                            &job.id,
+                            &format!(
+                                "retry: worktree reset to last green checkpoint {} — resuming pipeline (green stages keep their work)",
+                                &sha[..sha.len().min(8)]
+                            ),
+                        );
+                        let updated = engine
+                            .force_status(&job.id, LineageJobStatus::Implementing)
+                            .map_err(store_error)?;
+                        runner::resume_pipeline(store.clone(), job.id.clone())?;
+                        return Ok(updated);
+                    }
+                    Err(e) => {
+                        let _ = engine.append_note(
+                            &job.id,
+                            &format!("retry: checkpoint reset failed ({e}) — falling back to full teardown"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Tear down against the repo the worktree was forked from — another
+    // application's repo for desktop-overlay jobs.
+    let source = match job.source_repo.as_deref().map(std::path::PathBuf::from) {
+        Some(p) if p.is_dir() => p,
+        _ => runner::resolve_source_repo().ok_or_else(|| {
+            "could not locate Evolvo source repo — set EVOLVO_SOURCE_REPO or run from within the repo"
+                .to_string()
+        })?,
+    };
     runner::cleanup_previous_run(&source, &workspace_root, &job.id).map_err(|e| {
         let msg = store_error(e);
         let _ = engine.append_note(&job.id, &format!("retry cleanup failed: {msg}"));
@@ -599,7 +1249,9 @@ fn synthesize_preview(
     if files.len() > MAX_PLANNED_FILES {
         let dropped = files.len() - MAX_PLANNED_FILES;
         files.truncate(MAX_PLANNED_FILES);
-        notes.push(format!("planned items truncated for display ({dropped} more)"));
+        notes.push(format!(
+            "planned items truncated for display ({dropped} more)"
+        ));
     }
 
     if files.is_empty() && plan.history.is_empty() {
@@ -609,7 +1261,10 @@ fn synthesize_preview(
         );
     }
 
-    (truncate(&summary_lines.join("\n"), PLAN_SUMMARY_BUDGET), files)
+    (
+        truncate(&summary_lines.join("\n"), PLAN_SUMMARY_BUDGET),
+        files,
+    )
 }
 
 fn truncate(s: &str, max_bytes: usize) -> String {
@@ -642,6 +1297,100 @@ pub fn append_lineage_note(
     engine
         .append_note(&payload.id, &payload.note)
         .map_err(store_error)
+}
+
+// --- Saved canvas designs (logic in `designs.rs`) -------------------------
+// Async + spawn_blocking: saves decode and write images, which must not
+// stall the IPC/main thread while the user keeps drawing.
+
+async fn run_design<T: Send + 'static>(
+    store: crate::store::Store,
+    f: impl FnOnce(&crate::store::Store) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || f(&store))
+        .await
+        .map_err(|e| format!("design worker failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn save_design(
+    state: State<'_, AppState>,
+    payload: crate::types::SaveDesignPayload,
+) -> Result<crate::types::DesignSummary, String> {
+    run_design(state.store(), move |s| {
+        crate::designs::save_design_impl(s, payload)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn save_design_draft(
+    state: State<'_, AppState>,
+    payload: crate::types::SaveDesignPayload,
+) -> Result<crate::types::DesignSummary, String> {
+    run_design(state.store(), move |s| {
+        crate::designs::save_design_draft_impl(s, payload)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_designs(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::types::DesignSummary>, String> {
+    run_design(state.store(), crate::designs::list_designs_impl).await
+}
+
+#[tauri::command]
+pub async fn load_design(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<Option<crate::types::EditableDesign>, String> {
+    run_design(state.store(), move |s| {
+        crate::designs::load_design_impl(s, &payload.id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn load_design_draft(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::types::EditableDesign>, String> {
+    run_design(state.store(), |s| {
+        crate::designs::load_design_impl(s, crate::types::DESIGN_DRAFT_ID)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_design(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<bool, String> {
+    run_design(state.store(), move |s| {
+        crate::designs::delete_design_impl(s, &payload.id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn clear_design_draft(state: State<'_, AppState>) -> Result<bool, String> {
+    run_design(state.store(), |s| {
+        crate::designs::delete_design_impl(s, crate::types::DESIGN_DRAFT_ID)
+    })
+    .await
+}
+
+/// Experimental: turn a text description (plus the current canvas shapes)
+/// into add/update/delete ops via the `claude` CLI. Runs on a blocking
+/// worker so the 5–30s model call never stalls the IPC/main thread.
+#[tauri::command]
+pub async fn generate_sketch(
+    payload: crate::sketch::SketchRequest,
+) -> Result<crate::sketch::SketchResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::sketch::generate_sketch(&payload))
+        .await
+        .map_err(|e| format!("sketch worker failed: {e}"))?
 }
 
 #[tauri::command]
@@ -677,6 +1426,198 @@ pub fn capture_window_png(window: tauri::WebviewWindow) -> Result<String, String
     Ok(STANDARD.encode(&buf))
 }
 
+/// The frozen desktop frame + target app the overlay is currently showing.
+/// `None` when no capture is pending (overlay closed). See `desktop.rs`.
+#[tauri::command]
+pub fn take_desktop_capture(
+    state: State<'_, crate::desktop::DesktopState>,
+) -> Result<Option<crate::desktop::DesktopSession>, String> {
+    Ok(state.current())
+}
+
+/// Window mode (W in the overlay): capture one window by its OS id.
+#[tauri::command]
+pub async fn capture_desktop_window(
+    state: State<'_, AppState>,
+    payload: CaptureDesktopWindowPayload,
+) -> Result<crate::desktop::WindowCapture, String> {
+    let store = state.store();
+    // Capture + PNG encode take a few hundred ms; keep them off the IPC thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut capture = crate::desktop::capture_window(payload.id)?;
+        // A window of a version Evolvo launched continues that job.
+        if let Some(target) = capture.target_app.as_mut() {
+            crate::apprun::link_launched_build(&store, target);
+        }
+        Ok(capture)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureDesktopWindowPayload {
+    pub id: u32,
+}
+
+/// Delete a lineage job and everything under it (running version,
+/// worktree + branch, job workspace, its feedback + attachments, record).
+/// See `deletion.rs` for what is kept and when it refuses.
+#[tauri::command]
+pub fn delete_lineage_job(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<crate::deletion::DeleteSummary, String> {
+    crate::deletion::delete_lineage_job(&state.store(), &payload.id)
+}
+
+/// Stop the new version Evolvo launched for an external-app job.
+#[tauri::command]
+pub fn stop_lineage_run(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<bool, String> {
+    let stopped = crate::apprun::stop(&payload.id);
+    if stopped {
+        let _ = LineageEngine::new(&state.store())
+            .append_note(&payload.id, "stopped the launched version");
+    }
+    Ok(stopped)
+}
+
+/// Live "what is the agent doing" view for a job: phase, recent actions
+/// from the transcript, changed files. See `activity.rs`.
+#[tauri::command]
+pub async fn read_job_activity(
+    state: State<'_, AppState>,
+    payload: EntityIdPayload,
+) -> Result<crate::activity::JobActivity, String> {
+    let store = state.store();
+    // Reads the transcript tail and runs `git diff`; keep it off the IPC thread.
+    tauri::async_runtime::spawn_blocking(move || crate::activity::job_activity(&store, &payload.id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Hide the desktop overlay and return focus to the captured app.
+#[tauri::command]
+pub fn close_desktop_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    crate::desktop::close_overlay(&app);
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveTargetRepoPayload {
+    /// Lineage job id.
+    pub id: String,
+    /// Optional local path or https clone URL chosen by the user. `None`
+    /// re-runs automatic resolution.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// (Re-)resolve the source repo of an external-app job, optionally from a
+/// user-supplied path or URL. Runs in the background; progress lands as
+/// job notes and on the feedback's `targetApp`.
+#[tauri::command]
+pub fn resolve_target_repo(
+    state: State<'_, AppState>,
+    payload: ResolveTargetRepoPayload,
+) -> Result<LineageJobRecord, String> {
+    resolve_target_repo_impl(&state.store(), payload)
+}
+
+pub fn resolve_target_repo_impl(
+    store: &crate::store::Store,
+    payload: ResolveTargetRepoPayload,
+) -> Result<LineageJobRecord, String> {
+    let job = store
+        .load_lineage_job(&payload.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", payload.id))?;
+    let mut feedback = store
+        .load_feedback(&job.feedback_id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("feedback {} not found", job.feedback_id))?;
+    let Some(target) = feedback.target_app.as_mut() else {
+        return Err("this job is about Evolvo itself, not an external app".into());
+    };
+    if !matches!(
+        job.status,
+        LineageJobStatus::Pending | LineageJobStatus::Failed
+    ) {
+        return Err(format!(
+            "the source repo can only be changed before a run starts (job is {:?})",
+            job.status
+        ));
+    }
+    let hint = payload
+        .repo
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+    // Forget the previous answer so resolution doesn't short-circuit on it.
+    target.repo_path = None;
+    target.repo_source = String::new();
+    store.save_feedback(&feedback).map_err(store_error)?;
+    if !crate::external::start_resolution(store.clone(), job.id.clone(), feedback, hint, None) {
+        return Err("the source repo is already being resolved for this job".into());
+    }
+    store
+        .load_lineage_job(&job.id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("lineage job not found: {}", job.id))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDesktopRevisionPayload {
+    pub feedback_id: String,
+    #[serde(default)]
+    pub agent: Option<crate::types::AgentKind>,
+}
+
+/// "Revise on Canvas" for desktop-overlay feedback: reopen the overlay with
+/// the original frozen frame behind the restored annotations.
+#[tauri::command]
+pub fn open_desktop_revision(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    payload: OpenDesktopRevisionPayload,
+) -> Result<(), String> {
+    let store = state.store();
+    let feedback = store
+        .load_feedback(&payload.feedback_id)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("feedback {} not found", payload.feedback_id))?;
+    let frame = desktop_revision_frame(&store, &feedback)?;
+    crate::desktop::open_revision(
+        &app,
+        &feedback.id,
+        payload.agent.unwrap_or_default(),
+        &frame,
+        feedback.target_app.clone(),
+    )
+}
+
+/// The clean frozen frame for a desktop feedback. Records captured before
+/// `frame.png` existed fall back to the submitted composite.
+pub fn desktop_revision_frame(
+    store: &crate::store::Store,
+    feedback: &FeedbackRecord,
+) -> Result<Vec<u8>, String> {
+    let name = feedback
+        .background_filename
+        .as_deref()
+        .or(feedback.screenshot_filename.as_deref())
+        .ok_or_else(|| format!("feedback {} has no captured screen to revise", feedback.id))?;
+    store
+        .read_attachment(&feedback.id, name)
+        .map_err(store_error)?
+        .ok_or_else(|| format!("captured screen {name} is missing for {}", feedback.id))
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportLineagePayload {
@@ -708,14 +1649,8 @@ pub fn export_lineage(
         Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
         _ => store.layout().root().join("exports"),
     };
-    let path = bundle::export_lineage_to_dir(
-        &store,
-        &payload.id,
-        &dest,
-        APP_NAME,
-        APP_VERSION,
-    )
-    .map_err(store_error)?;
+    let path = bundle::export_lineage_to_dir(&store, &payload.id, &dest, APP_NAME, APP_VERSION)
+        .map_err(store_error)?;
     Ok(ExportLineageResult {
         bundle_path: path.display().to_string(),
     })
@@ -736,9 +1671,7 @@ pub struct ImportLineagePayload {
 /// process with `EVOLVO_WORKSPACE_ROOT=<target>` set, since the running
 /// instance is locked to its own root.
 #[tauri::command]
-pub fn import_lineage_bundle(
-    payload: ImportLineagePayload,
-) -> Result<ImportSummary, String> {
+pub fn import_lineage_bundle(payload: ImportLineagePayload) -> Result<ImportSummary, String> {
     let bundle_path = std::path::PathBuf::from(&payload.bundle_path);
     let target_root = std::path::PathBuf::from(&payload.target_workspace_root);
     bundle::import_lineage_bundle(&bundle_path, &target_root).map_err(store_error)
@@ -781,7 +1714,7 @@ pub fn open_external_url(payload: OpenUrlPayload) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::FeedbackType;
+    use crate::types::{FeedbackScreenPayload, FeedbackType};
     use tempfile::tempdir;
 
     fn mk_payload(text: &str, pasted: usize, with_screenshot: bool) -> SubmitFeedbackPayload {
@@ -797,6 +1730,7 @@ mod tests {
             } else {
                 None
             },
+            screens: vec![],
             voice_base64: None,
             voice_mime_type: None,
             voice_transcript: None,
@@ -804,13 +1738,614 @@ mod tests {
             window_height: 768,
             agent: None,
             auto_evolve: false,
+            pause_after_plan: false,
+            parent_feedback_id: None,
+            target_app: None,
+            background_base64: None,
+            auto_launch: false,
         }
+    }
+
+    /// A job parked at the plan-review gate with two open questions.
+    fn paused_job(root: &std::path::Path) -> (crate::store::Store, String) {
+        let store = crate::store::Store::new(root.to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = FeedbackRecord {
+            id: "fb-q".into(),
+            feedback_type: FeedbackType::NewApp,
+            status: crate::types::FeedbackStatus::New,
+            page_route: "/".into(),
+            feedback_text: "suite".into(),
+            annotations: vec![],
+            pasted_images: vec![],
+            screenshot_filename: None,
+            screens: vec![],
+            voice_filename: None,
+            voice_transcript: None,
+            window_width: 1,
+            window_height: 1,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            lineage_job_id: None,
+            revision: Default::default(),
+            target_app: None,
+            background_filename: None,
+            auto_launch: false,
+        };
+        store.save_feedback(&fb).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
+        engine.request_plan_review(&job.id).unwrap();
+        engine
+            .force_status(&job.id, LineageJobStatus::Planned)
+            .unwrap();
+        let plan = crate::plan::IterationPlan {
+            stage: crate::plan::PlanStage::BackendPlanned,
+            open_questions: vec![
+                "Currency assumed single (integer cents). Correct?".into(),
+                "Auth assumed api tokens. Acceptable?".into(),
+            ],
+            ..Default::default()
+        };
+        crate::plan::save_plan(&runner::job_workspace_dir(root, &job.id), &plan).unwrap();
+        (store, job.id)
+    }
+
+    /// A Pending lineage job whose feedback targets an external app.
+    fn external_job(
+        root: &std::path::Path,
+        repo_path: Option<String>,
+    ) -> (crate::store::Store, LineageJobRecord) {
+        let store = crate::store::Store::new(root.to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = mk_payload_record("fb-ext");
+        fb.target_app = Some(crate::types::TargetApp {
+            name: "Zed".into(),
+            window_title: "notes — Zed".into(),
+            bundle_id: Some("dev.zed.Zed".into()),
+            repo_path,
+            ..Default::default()
+        });
+        store.save_feedback(&fb).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
+        (store, job)
+    }
+
+    fn mk_payload_record(id: &str) -> FeedbackRecord {
+        FeedbackRecord {
+            id: id.into(),
+            feedback_type: FeedbackType::FeatureRequest,
+            status: crate::types::FeedbackStatus::New,
+            page_route: "desktop://Zed".into(),
+            feedback_text: "add a word count to the status bar".into(),
+            annotations: vec![],
+            pasted_images: vec![],
+            screenshot_filename: None,
+            screens: vec![],
+            voice_filename: None,
+            voice_transcript: None,
+            window_width: 1,
+            window_height: 1,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            lineage_job_id: None,
+            revision: Default::default(),
+            target_app: None,
+            background_filename: None,
+            auto_launch: false,
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "external app\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    #[test]
+    fn resolve_target_repo_uses_user_path_and_remembers_it() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("zed-src");
+        init_repo(&repo);
+        let (store, job) = external_job(&tmp.path().join("ws"), None);
+        resolve_target_repo_impl(
+            &store,
+            ResolveTargetRepoPayload {
+                id: job.id.clone(),
+                repo: Some(repo.display().to_string()),
+            },
+        )
+        .unwrap();
+        let mut target = None;
+        for _ in 0..100 {
+            let fb = store.load_feedback(&job.feedback_id).unwrap().unwrap();
+            let t = fb.target_app.unwrap();
+            if t.repo_status == "resolved" {
+                target = Some(t);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let target = target.expect("resolution finished");
+        assert_eq!(target.repo_path.as_deref(), Some(repo.to_str().unwrap()));
+        assert_eq!(target.repo_source, "user");
+        let map = crate::external::load_app_map(store.layout().root());
+        assert_eq!(map["dev.zed.Zed"].repo_path, repo.display().to_string());
+    }
+
+    #[test]
+    fn resolve_target_repo_refuses_evolvo_jobs_and_running_jobs() {
+        let tmp = tempdir().unwrap();
+        let (store, id) = paused_job(tmp.path());
+        let err = resolve_target_repo_impl(&store, ResolveTargetRepoPayload { id, repo: None })
+            .unwrap_err();
+        assert!(err.contains("not an external app"), "{err}");
+
+        let tmp2 = tempdir().unwrap();
+        let (store, job) = external_job(tmp2.path(), None);
+        LineageEngine::new(&store)
+            .force_status(&job.id, LineageJobStatus::Implementing)
+            .unwrap();
+        let err = resolve_target_repo_impl(
+            &store,
+            ResolveTargetRepoPayload {
+                id: job.id,
+                repo: Some("/tmp".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("before a run starts"), "{err}");
+    }
+
+    #[test]
+    fn prepare_run_forks_the_external_repo_with_the_external_prompt() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("zed-src");
+        init_repo(&repo);
+        let (store, job) = external_job(&tmp.path().join("ws"), Some(repo.display().to_string()));
+        let fb = store.load_feedback(&job.feedback_id).unwrap().unwrap();
+        let prepared = runner::prepare_run(&store, &job, &fb, AgentKind::ClaudeCode).unwrap();
+        assert!(prepared.external);
+        assert_eq!(prepared.source_repo, repo);
+        assert_eq!(prepared.base_branch.as_deref(), Some("main"));
+        assert!(prepared.worktree.join("README.md").exists());
+        assert!(!prepared.worktree.join("AGENTS.md").exists());
+        assert!(prepared.prompt.contains("Zed"));
+        assert!(prepared.prompt.contains("add a word count"));
+        assert!(!prepared.prompt.contains("Evolvo shell"));
+    }
+
+    #[test]
+    fn prepare_run_refuses_external_job_without_repo() {
+        let tmp = tempdir().unwrap();
+        let (store, job) = external_job(tmp.path(), None);
+        let fb = store.load_feedback(&job.feedback_id).unwrap().unwrap();
+        let err = match runner::prepare_run(&store, &job, &fb, AgentKind::ClaudeCode) {
+            Ok(_) => panic!("must not prepare without a repo"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no source repo resolved"), "{err}");
+    }
+
+    #[test]
+    fn desktop_revision_frame_prefers_clean_frame() {
+        let tmp = tempdir().unwrap();
+        let store = crate::store::Store::new(tmp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let mut fb = mk_payload_record("fb-frame");
+        fb.screenshot_filename = Some(
+            store
+                .save_attachment("fb-frame", "canvas.png", b"composite")
+                .unwrap(),
+        );
+        assert_eq!(desktop_revision_frame(&store, &fb).unwrap(), b"composite");
+        fb.background_filename = Some(
+            store
+                .save_attachment("fb-frame", "frame.png", b"clean")
+                .unwrap(),
+        );
+        assert_eq!(desktop_revision_frame(&store, &fb).unwrap(), b"clean");
+        fb.screenshot_filename = None;
+        fb.background_filename = None;
+        assert!(desktop_revision_frame(&store, &fb).is_err());
+    }
+
+    fn answer(q: &str, a: &str) -> crate::types::PlanAnswerPayload {
+        crate::types::PlanAnswerPayload {
+            question: q.into(),
+            answer: a.into(),
+        }
+    }
+
+    fn plan_of(root: &std::path::Path, id: &str) -> crate::plan::IterationPlan {
+        crate::plan::load_plan(&runner::job_workspace_dir(root, id))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn answering_records_answers_without_replanning() {
+        let tmp = tempdir().unwrap();
+        let (store, id) = paused_job(tmp.path());
+        let (job, replan) = answer_plan_questions_impl(
+            &store,
+            crate::types::AnswerPlanQuestionsPayload {
+                id: id.clone(),
+                answers: vec![
+                    answer(
+                        "Currency assumed single (integer cents). Correct?",
+                        "Yes, but store a currency code",
+                    ),
+                    answer("Auth assumed api tokens. Acceptable?", "  "),
+                ],
+                replan: false,
+            },
+        )
+        .unwrap();
+        assert!(!replan);
+        assert_eq!(
+            job.status,
+            LineageJobStatus::Planned,
+            "recording alone keeps the pause"
+        );
+        let plan = plan_of(tmp.path(), &id);
+        assert_eq!(
+            plan.answered_questions.len(),
+            1,
+            "blank answer = accept the guess"
+        );
+        assert_eq!(plan.stage, crate::plan::PlanStage::BackendPlanned);
+        assert!(job.notes.iter().any(|n| n.contains("answered 1 of 2")));
+    }
+
+    #[test]
+    fn replan_rewinds_the_plan_stage_so_the_planner_reruns() {
+        let tmp = tempdir().unwrap();
+        let (store, id) = paused_job(tmp.path());
+        let (_, replan) = answer_plan_questions_impl(
+            &store,
+            crate::types::AnswerPlanQuestionsPayload {
+                id: id.clone(),
+                // Whitespace differences still match the planner's question.
+                answers: vec![answer(
+                    "Auth  assumed api tokens.\nAcceptable?",
+                    "Tokens hashed, admin can revoke",
+                )],
+                replan: true,
+            },
+        )
+        .unwrap();
+        assert!(replan);
+        let plan = plan_of(tmp.path(), &id);
+        assert_eq!(plan.stage, crate::plan::PlanStage::Seeded);
+        assert_eq!(
+            plan.answered_questions[0].answer,
+            "Tokens hashed, admin can revoke"
+        );
+        assert!(plan
+            .history
+            .iter()
+            .any(|h| h.message.contains("re-planning")));
+    }
+
+    #[test]
+    fn answer_rejections_leave_the_plan_untouched() {
+        let tmp = tempdir().unwrap();
+        let (store, id) = paused_job(tmp.path());
+        let before = plan_of(tmp.path(), &id);
+        let call = |answers, replan| {
+            answer_plan_questions_impl(
+                &store,
+                crate::types::AnswerPlanQuestionsPayload {
+                    id: id.clone(),
+                    answers,
+                    replan,
+                },
+            )
+        };
+        // Not one of the plan's questions.
+        assert!(call(vec![answer("Invented question?", "x")], false).is_err());
+        // Re-plan with nothing answered.
+        assert!(call(
+            vec![answer("Auth assumed api tokens. Acceptable?", "")],
+            true
+        )
+        .is_err());
+        // Oversized answer.
+        let long = "x".repeat(crate::types::MAX_PLAN_ANSWER_CHARS + 1);
+        assert!(call(
+            vec![answer("Auth assumed api tokens. Acceptable?", &long)],
+            false
+        )
+        .is_err());
+        assert_eq!(plan_of(tmp.path(), &id), before);
+
+        // A job that isn't paused for review refuses answers.
+        LineageEngine::new(&store).mark_plan_approved(&id).unwrap();
+        let err = call(
+            vec![answer("Auth assumed api tokens. Acceptable?", "ok")],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not waiting for plan review"));
     }
 
     fn state_with_tmp() -> (tempfile::TempDir, AppState) {
         let temp = tempdir().unwrap();
         let state = AppState::with_root(temp.path().to_path_buf());
         (temp, state)
+    }
+
+    #[test]
+    fn estimated_decoded_len_matches_actual_decode() {
+        for len in [0usize, 3, 8, 1024, 1_000_000] {
+            let bytes = vec![7u8; len];
+            let b64 = STANDARD.encode(&bytes);
+            let estimate = estimated_decoded_len(&b64);
+            // The pre-decode estimate must never be smaller than the real
+            // decoded size, or an attacker could sneak an oversized payload
+            // past the cheap check and force a large allocation anyway.
+            assert!(
+                estimate >= len,
+                "estimate {estimate} underestimated actual decoded len {len}"
+            );
+            // And it should be a tight bound, not wildly over.
+            assert!(
+                estimate - len <= 2,
+                "estimate {estimate} too loose for {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_encoded_size_rejects_before_decoding() {
+        let oversized = STANDARD.encode(vec![0u8; MAX_ATTACHMENT_BYTES + 1]);
+        let err = check_encoded_size("screenshot", &oversized).unwrap_err();
+        assert!(err.contains("screenshot"));
+        assert!(err.contains(&MAX_ATTACHMENT_BYTES.to_string()));
+
+        let ok = STANDARD.encode(vec![0u8; 1024]);
+        assert!(check_encoded_size("screenshot", &ok).is_ok());
+    }
+
+    #[test]
+    fn decode_base64_rejects_oversized_attachment() {
+        let oversized = STANDARD.encode(vec![0u8; MAX_ATTACHMENT_BYTES + 1]);
+        let err = decode_base64("voice", &oversized).unwrap_err();
+        assert!(err.contains("voice"));
+        assert!(err.to_lowercase().contains("exceeds"));
+    }
+
+    #[test]
+    fn attachment_budget_rejects_aggregate_over_cap() {
+        let mut budget = AttachmentBudget::new();
+        // Two attachments, each under the per-attachment cap, whose sum
+        // exceeds the aggregate cap.
+        let half = MAX_TOTAL_ATTACHMENT_BYTES / 2 + 1;
+        budget.add("first", half).unwrap();
+        let err = budget.add("second", half).unwrap_err();
+        assert!(err.contains("second"));
+        assert!(err.contains(&MAX_TOTAL_ATTACHMENT_BYTES.to_string()));
+    }
+
+    #[test]
+    fn attachment_budget_allows_normal_totals() {
+        let mut budget = AttachmentBudget::new();
+        budget.add("screenshot", 2 * 1024 * 1024).unwrap();
+        budget.add("pasted-image-0", 1024 * 1024).unwrap();
+        budget.add("voice", 512 * 1024).unwrap();
+    }
+
+    /// Replicates `submit_feedback`'s attachment pipeline (decode + budget +
+    /// `Store::save_attachment`) directly against a tempdir-backed `Store`,
+    /// since the `#[tauri::command]` shim needs a live `State<'_, AppState>`
+    /// that isn't practical to construct in a unit test (see the project's
+    /// "test the body, not the shim" convention).
+    fn run_attachment_pipeline(
+        store: &crate::store::Store,
+        id: &str,
+        payload: &SubmitFeedbackPayload,
+    ) -> Result<(Option<String>, Vec<String>, Option<String>), String> {
+        let mut budget = AttachmentBudget::new();
+
+        let screenshot_filename = match payload.screenshot_base64.as_deref() {
+            Some(b64) if !b64.is_empty() => {
+                let bytes = decode_base64("screenshot", b64)?;
+                budget.add("screenshot", bytes.len())?;
+                Some(
+                    store
+                        .save_attachment(id, "canvas.png", &bytes)
+                        .map_err(store_error)?,
+                )
+            }
+            _ => None,
+        };
+
+        let mut pasted_images = Vec::new();
+        for (idx, b64) in payload.pasted_images_base64.iter().enumerate() {
+            if b64.is_empty() {
+                continue;
+            }
+            let name = format!("pasted-image-{idx}");
+            let bytes = decode_base64(&name, b64)?;
+            budget.add(&name, bytes.len())?;
+            let filename = format!("paste-{idx}.png");
+            let saved = store
+                .save_attachment(id, &filename, &bytes)
+                .map_err(store_error)?;
+            pasted_images.push(saved);
+        }
+
+        let voice_filename = match payload.voice_base64.as_deref() {
+            Some(b64) if !b64.is_empty() => {
+                let bytes = decode_base64("voice", b64)?;
+                budget.add("voice", bytes.len())?;
+                Some(
+                    store
+                        .save_attachment(id, "voice.webm", &bytes)
+                        .map_err(store_error)?,
+                )
+            }
+            _ => None,
+        };
+
+        Ok((screenshot_filename, pasted_images, voice_filename))
+    }
+
+    #[test]
+    fn submit_feedback_pipeline_rejects_oversized_single_attachment() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+
+        let mut payload = mk_payload("hi", 0, false);
+        payload.screenshot_base64 = Some(STANDARD.encode(vec![0u8; MAX_ATTACHMENT_BYTES + 1]));
+
+        let err = run_attachment_pipeline(&store, "fb-oversize", &payload).unwrap_err();
+        assert!(err.contains("screenshot"));
+        assert!(store
+            .read_attachment("fb-oversize", "canvas.png")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn submit_feedback_pipeline_rejects_oversized_aggregate() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+
+        // Five pasted images, each safely under the 8 MiB per-attachment
+        // cap, but summing past the 32 MiB aggregate cap.
+        let chunk = 7 * 1024 * 1024;
+        assert!(chunk < MAX_ATTACHMENT_BYTES);
+        let mut payload = mk_payload("hi", 0, false);
+        payload.pasted_images_base64 = (0..5)
+            .map(|i| STANDARD.encode(vec![i as u8; chunk]))
+            .collect();
+
+        let err = run_attachment_pipeline(&store, "fb-aggregate", &payload).unwrap_err();
+        assert!(err.contains("exceeds"));
+        assert!(err.contains(&MAX_TOTAL_ATTACHMENT_BYTES.to_string()));
+    }
+
+    #[test]
+    fn submit_feedback_pipeline_succeeds_for_normal_sized_attachments() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+
+        let payload = mk_payload("hello world", 2, true);
+        let (screenshot, pasted, voice) =
+            run_attachment_pipeline(&store, "fb-normal", &payload).unwrap();
+
+        assert_eq!(screenshot.as_deref(), Some("canvas.png"));
+        assert_eq!(pasted.len(), 2);
+        assert!(voice.is_none());
+        assert!(store
+            .read_attachment("fb-normal", "canvas.png")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn storyboard_screens_persist_as_separate_ordered_attachments() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+        let png = STANDARD.encode([137u8, 80, 78, 71, 13, 10, 26, 10]);
+        let mut payload = mk_payload("two-screen app", 0, false);
+        payload.screens = vec![
+            FeedbackScreenPayload {
+                id: "dashboard".into(),
+                name: "Dashboard".into(),
+                description: "Overview".into(),
+                intended_route: "/".into(),
+                annotations: vec![serde_json::json!({"type": "rect"})],
+                pasted_images_base64: vec![],
+                screenshot_base64: Some(png.clone()),
+                window_width: 1200,
+                window_height: 800,
+            },
+            FeedbackScreenPayload {
+                id: "settings".into(),
+                name: "Settings".into(),
+                description: "Account preferences".into(),
+                intended_route: "/settings".into(),
+                annotations: vec![],
+                pasted_images_base64: vec![png.clone()],
+                screenshot_base64: Some(png),
+                window_width: 1200,
+                window_height: 800,
+            },
+        ];
+
+        let mut budget = AttachmentBudget::new();
+        let records =
+            persist_storyboard_screens(&store, "fb-storyboard", &payload, &mut budget).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, "Dashboard");
+        assert_eq!(records[1].intended_route, "/settings");
+        assert_eq!(
+            records[0].screenshot_filename.as_deref(),
+            Some("screen-01.png")
+        );
+        assert_eq!(records[1].pasted_images, vec!["screen-02-paste-0.png"]);
+        assert!(store
+            .read_attachment("fb-storyboard", "screen-02.png")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn editable_screen_restores_attachment_data_urls_without_host_paths() {
+        let (_temp, app) = state_with_tmp();
+        let store = app.store();
+        let png = [137u8, 80, 78, 71, 13, 10, 26, 10];
+        store
+            .save_attachment("fb-edit", "paste-0.png", &png)
+            .unwrap();
+
+        let editable = editable_screen(
+            &store,
+            "fb-edit",
+            "screen-1",
+            "Home",
+            "Landing page",
+            "/",
+            &[serde_json::json!({
+                "type": "image", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4,
+                "assetIndex": 0
+            })],
+            &["paste-0.png".into()],
+            1200,
+            800,
+        )
+        .unwrap();
+
+        assert_eq!(editable.name, "Home");
+        assert_eq!(editable.pasted_image_data_urls.len(), 1);
+        assert!(editable.pasted_image_data_urls[0].starts_with("data:image/png;base64,"));
+        assert!(!editable.pasted_image_data_urls[0].contains("fb-edit"));
     }
 
     #[test]
@@ -834,6 +2369,7 @@ mod tests {
                 annotations: payload.annotations.clone(),
                 pasted_images: vec![],
                 screenshot_filename: None,
+                screens: vec![],
                 voice_filename: None,
                 voice_transcript: None,
                 window_width: payload.window_width,
@@ -841,6 +2377,10 @@ mod tests {
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
                 lineage_job_id: None,
+                revision: Default::default(),
+                target_app: None,
+                background_filename: None,
+                auto_launch: false,
             };
             store.save_feedback(&rec).unwrap();
             let engine = LineageEngine::new(&store);
@@ -853,6 +2393,13 @@ mod tests {
         assert!(record.lineage_job_id.is_some());
         assert_eq!(store.list_feedback().unwrap().len(), before_len + 1);
         assert_eq!(store.list_lineage_jobs().unwrap().len(), 1);
+        let revision = next_feedback_revision(&record);
+        assert_eq!(revision.number, 2);
+        assert_eq!(
+            revision.parent_feedback_id.as_deref(),
+            Some(record.id.as_str())
+        );
+        assert!(revision.superseded_by_feedback_id.is_none());
     }
 
     #[test]
@@ -880,6 +2427,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 100,
@@ -887,6 +2435,10 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             lineage_job_id: None,
+            revision: Default::default(),
+            target_app: None,
+            background_filename: None,
+            auto_launch: false,
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(&store);
@@ -917,6 +2469,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 800,
@@ -924,6 +2477,10 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             lineage_job_id: None,
+            revision: Default::default(),
+            target_app: None,
+            background_filename: None,
+            auto_launch: false,
         };
         store.save_feedback(&rec).unwrap();
         let engine = LineageEngine::new(store);
@@ -943,10 +2500,7 @@ mod tests {
         assert_eq!(preview.agent, AgentKind::ClaudeCode);
         assert!(preview.planned_files.is_empty());
         assert!(
-            preview
-                .notes
-                .iter()
-                .any(|n| n.contains("No plan recorded")),
+            preview.notes.iter().any(|n| n.contains("No plan recorded")),
             "expected a 'no plan recorded' note, got: {:?}",
             preview.notes
         );
@@ -983,6 +2537,8 @@ mod tests {
             output: "Budget".into(),
             motivated_by_regions: vec!["R1".into()],
             summary: "Create a budget".into(),
+            body_sketch: "Generate id, build Budget, persist via store.save_budget(rec).".into(),
+            anchors: vec!["save_budget".into()],
         });
         plan.frontend.components.push(ComponentPlan {
             name: "BudgetForm".into(),

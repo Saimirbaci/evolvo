@@ -19,10 +19,17 @@
     "regions": [
       {
         "id": "R1",
-        "bbox": [120, 200, 420, 48],
+        "bbox": [
+          120,
+          200,
+          420,
+          48
+        ],
         "strokeCount": 2,
         "dominantColor": "#ff0000",
-        "labels": ["add task"]
+        "labels": [
+          "add task"
+        ]
       }
     ]
   },
@@ -31,8 +38,14 @@
   "templates": {
     "useTemplates": [],
     "declined": [
-      {"name": "openrouter", "reason": "app has no AI surface"},
-      {"name": "google_oauth", "reason": "app has no Google integration"}
+      {
+        "name": "openrouter",
+        "reason": "app has no AI surface"
+      },
+      {
+        "name": "google_oauth",
+        "reason": "app has no Google integration"
+      }
     ]
   },
   "backend": {
@@ -40,54 +53,166 @@
       {
         "name": "Task",
         "fields": [
-          {"name": "id", "ty": "String", "required": true},
-          {"name": "title", "ty": "String", "required": true},
-          {"name": "done", "ty": "bool", "required": true},
-          {"name": "createdAtUnixMs", "ty": "u64", "required": true}
+          {
+            "name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "name": "title",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "name": "done",
+            "ty": "bool",
+            "required": true
+          },
+          {
+            "name": "createdAtUnixMs",
+            "ty": "u64",
+            "required": true
+          }
         ],
-        "motivatedByRegions": ["R1"]
+        "motivatedByRegions": [
+          "R1"
+        ]
       }
     ],
     "commands": [
-      {"name": "create_task",  "input": "CreateTaskPayload", "output": "Task",      "motivatedByRegions": ["R1"], "summary": "Persist a new task with a generated id and return it."},
-      {"name": "list_tasks",   "input": "()",                "output": "Vec<Task>", "motivatedByRegions": ["R1"], "summary": "Return all tasks in creation order."},
-      {"name": "toggle_task",  "input": "EntityIdPayload",   "output": "Task",      "motivatedByRegions": ["R1"], "summary": "Flip the `done` flag on the task with the given id."},
-      {"name": "delete_task",  "input": "EntityIdPayload",   "output": "bool",      "motivatedByRegions": ["R1"], "summary": "Remove the task and return true if it existed."}
+      {
+        "name": "create_task",
+        "input": "CreateTaskPayload",
+        "output": "Task",
+        "motivatedByRegions": [
+          "R1"
+        ],
+        "summary": "Persist a new task with a generated id and return it."
+      },
+      {
+        "name": "list_tasks",
+        "input": "()",
+        "output": "Vec<Task>",
+        "motivatedByRegions": [
+          "R1"
+        ],
+        "summary": "Return all tasks in creation order."
+      },
+      {
+        "name": "toggle_task",
+        "input": "EntityIdPayload",
+        "output": "Task",
+        "motivatedByRegions": [
+          "R1"
+        ],
+        "summary": "Flip the `done` flag on the task with the given id."
+      },
+      {
+        "name": "delete_task",
+        "input": "EntityIdPayload",
+        "output": "bool",
+        "motivatedByRegions": [
+          "R1"
+        ],
+        "summary": "Remove the task and return true if it existed."
+      }
     ],
     "tests": [
-      {"name": "task_round_trips",           "module": "store::tests",    "covers": "save+load preserves all fields"},
-      {"name": "create_and_list_tasks",      "module": "commands::tests", "covers": "happy path"},
-      {"name": "toggle_missing_returns_err", "module": "commands::tests", "covers": "edge case"}
+      {
+        "name": "task_round_trips",
+        "module": "store::tests",
+        "covers": "save+load preserves all fields"
+      },
+      {
+        "name": "create_and_list_tasks",
+        "module": "commands::tests",
+        "covers": "happy path"
+      },
+      {
+        "name": "toggle_missing_returns_err",
+        "module": "commands::tests",
+        "covers": "edge case"
+      }
     ],
-    "storage": {"kind": "json_per_entity", "path": "tasks"},
-    "budget": {"minEntities": 1, "minCommands": 4, "minTests": 3}
+    "storage": {
+      "kind": "json_per_entity",
+      "path": "tasks"
+    },
+    "budget": {
+      "minEntities": 1,
+      "minCommands": 4,
+      "minTests": 3
+    },
+    "behaviors": [
+      {
+        "name": "toggle_updates_remaining_count",
+        "trigger": "userAction",
+        "triggeredBy": "toggle_task",
+        "effect": "Checking a task strikes it through and the 'N left' counter drops by one; unchecking restores both.",
+        "changesState": [
+          "Task.done"
+        ],
+        "engine": "deterministic",
+        "implementedIn": "toggle_task_impl",
+        "bodySketch": "1. load_task(id).\n2. Flip done.\n3. save_task(&rec).\n4. Return rec; the UI recomputes remaining from list_tasks.",
+        "anchors": [
+          "load_task",
+          "save_task"
+        ],
+        "motivatedByRegions": [
+          "R1"
+        ]
+      }
+    ]
   },
   "frontend": {
     "routes": [
       {
         "path": "/",
         "component": "TaskListPage",
-        "usesCommands": ["list_tasks", "create_task", "toggle_task", "delete_task"],
-        "motivatedByRegions": ["R1"]
+        "usesCommands": [
+          "list_tasks",
+          "create_task",
+          "toggle_task",
+          "delete_task"
+        ],
+        "motivatedByRegions": [
+          "R1"
+        ]
       }
     ],
     "components": [
       {
         "name": "TaskListPage",
         "module": "app.rs",
-        "usesCommands": ["list_tasks", "create_task", "toggle_task", "delete_task"],
+        "usesCommands": [
+          "list_tasks",
+          "create_task",
+          "toggle_task",
+          "delete_task"
+        ],
         "summary": "Full-page CRUD: header with input, list of tasks with toggle + delete.",
-        "motivatedByRegions": ["R1"]
+        "motivatedByRegions": [
+          "R1"
+        ]
       },
       {
         "name": "TaskRow",
         "module": "app.rs",
-        "usesCommands": ["toggle_task", "delete_task"],
+        "usesCommands": [
+          "toggle_task",
+          "delete_task"
+        ],
         "summary": "Single row: checkbox + trash icon.",
-        "motivatedByRegions": ["R1"]
+        "motivatedByRegions": [
+          "R1"
+        ]
       }
     ],
-    "budget": {"minRoutes": 1, "minComponents": 2}
+    "budget": {
+      "minRoutes": 1,
+      "minComponents": 2
+    }
   },
   "e2e": {
     "scenarios": [
@@ -103,7 +228,12 @@
           "Click the trash icon on the 'Buy milk' row.",
           "Expect the list to no longer contain 'Buy milk'."
         ],
-        "motivatedByRegions": ["R1"]
+        "motivatedByRegions": [
+          "R1"
+        ],
+        "verifiesBehaviors": [
+          "toggle_updates_remaining_count"
+        ]
       },
       {
         "id": "persistence_across_reload",
@@ -113,18 +243,59 @@
           "Re-launch the app.",
           "Expect 'Persist me' in the list."
         ],
-        "motivatedByRegions": ["R1"]
+        "motivatedByRegions": [
+          "R1"
+        ],
+        "verifiesBehaviors": []
       }
     ],
-    "persistenceSmoke": {"entity": "Task", "expectedDirectory": "tasks"}
+    "persistenceSmoke": {
+      "entity": "Task",
+      "expectedDirectory": "tasks"
+    }
   },
   "history": [
-    {"atUnixMs": 1700000001000, "stage": "backend_plan",   "kind": "validated", "message": "7 checks passed (7/7)"},
-    {"atUnixMs": 1700000002000, "stage": "backend_impl",   "kind": "validated", "message": "12 checks passed (12/12)"},
-    {"atUnixMs": 1700000003000, "stage": "frontend_plan",  "kind": "validated", "message": "3 checks passed (3/3)"},
-    {"atUnixMs": 1700000004000, "stage": "frontend_impl",  "kind": "validated", "message": "8 checks passed (8/8)"},
-    {"atUnixMs": 1700000005000, "stage": "e2e_plan",       "kind": "validated", "message": "2 checks passed (2/2)"},
-    {"atUnixMs": 1700000006000, "stage": "e2e_impl",       "kind": "note",      "message": "happy_path_crud: pass"},
-    {"atUnixMs": 1700000007000, "stage": "final_review",   "kind": "note",      "message": "ready — port 1531"}
+    {
+      "atUnixMs": 1700000001000,
+      "stage": "backend_plan",
+      "kind": "validated",
+      "message": "7 checks passed (7/7)"
+    },
+    {
+      "atUnixMs": 1700000002000,
+      "stage": "backend_impl",
+      "kind": "validated",
+      "message": "12 checks passed (12/12)"
+    },
+    {
+      "atUnixMs": 1700000003000,
+      "stage": "frontend_plan",
+      "kind": "validated",
+      "message": "3 checks passed (3/3)"
+    },
+    {
+      "atUnixMs": 1700000004000,
+      "stage": "frontend_impl",
+      "kind": "validated",
+      "message": "8 checks passed (8/8)"
+    },
+    {
+      "atUnixMs": 1700000005000,
+      "stage": "e2e_plan",
+      "kind": "validated",
+      "message": "2 checks passed (2/2)"
+    },
+    {
+      "atUnixMs": 1700000006000,
+      "stage": "e2e_impl",
+      "kind": "note",
+      "message": "happy_path_crud: pass"
+    },
+    {
+      "atUnixMs": 1700000007000,
+      "stage": "final_review",
+      "kind": "note",
+      "message": "ready — port 1531"
+    }
   ]
 }

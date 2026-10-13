@@ -1,0 +1,154 @@
+/* markdown_editor — append to app/ui/styles/app.css. ~80 lines.
+   Uses var(--...) tokens from app/ui/styles/tokens.css — no raw hex/rgb. */
+
+.md-editor-page {
+  display: grid;
+  grid-template-columns: 240px 1fr 1fr;
+  height: calc(100vh - 56px); /* 56px = app bar height */
+  background: var(--bg);
+  color: var(--fg);
+  overflow: hidden;
+}
+
+.md-editor-sidebar {
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  background: var(--bg);
+}
+
+.md-editor-sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.md-editor-sidebar-title {
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.md-editor-new-btn {
+  font-size: var(--text-xs);
+  padding: var(--space-1) var(--space-3);
+}
+
+.md-editor-doc-list {
+  list-style: none;
+  margin: 0;
+  padding: var(--space-2) 0;
+}
+
+.md-editor-doc-list-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-4);
+  background: transparent;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.md-editor-doc-list-item:hover {
+  background: color-mix(in srgb, black 4%, transparent);
+}
+
+.md-editor-doc-list-item.active {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.md-editor-doc-title {
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.md-editor-doc-meta {
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+
+.md-editor-empty {
+  padding: var(--space-6) var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--muted);
+  text-align: center;
+}
+
+.md-editor-source {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.md-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.md-editor-title-input {
+  flex: 1;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+}
+
+.md-editor-toolbar-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.md-editor-source-area {
+  flex: 1;
+  border: 0;
+  resize: none;
+  outline: none;
+  padding: var(--space-4);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: var(--text-base);
+  line-height: 1.55;
+  background: transparent;
+  color: inherit;
+}
+
+.md-editor-error {
+  padding: var(--space-2) var(--space-4);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  border-top: 1px solid color-mix(in srgb, var(--danger) 20%, transparent);
+  font-size: var(--text-sm);
+}
+
+.md-editor-preview {
+  overflow-y: auto;
+  background: var(--surface-sunken);
+  padding: var(--space-4);
+}
+
+.md-editor-preview-pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+}

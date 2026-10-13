@@ -1,0 +1,128 @@
+/* data_grid — append to app/ui/styles/app.css. ~80 lines.
+   Uses var(--...) tokens from app/ui/styles/tokens.css — no raw hex/rgb. */
+
+.grid-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 56px);
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.grid-toolbar {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.grid-filter {
+  flex: 1;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-base);
+  background: transparent;
+  color: inherit;
+}
+
+.grid-error {
+  padding: var(--space-2) var(--space-4);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 20%, transparent);
+  font-size: var(--text-sm);
+}
+
+.grid-scroll {
+  flex: 1;
+  overflow: auto;
+}
+
+.grid-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.grid-th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-sunken);
+  border-bottom: 1px solid var(--border);
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  font-weight: var(--weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: var(--text-xs);
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.grid-th:hover {
+  background: color-mix(in srgb, black 3%, transparent);
+}
+
+.grid-sort {
+  margin-left: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.grid-th-actions {
+  width: 36px;
+  cursor: default;
+}
+
+.grid-row:hover {
+  background: color-mix(in srgb, black 2%, transparent);
+}
+
+.grid-td {
+  border-bottom: 1px solid var(--border);
+  padding: 0;
+}
+
+.grid-cell-input {
+  width: 100%;
+  border: 0;
+  outline: none;
+  background: transparent;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  font-family: inherit;
+  color: inherit;
+}
+
+.grid-cell-input:focus {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.grid-td-actions {
+  text-align: center;
+  padding: 0 var(--space-1);
+}
+
+.grid-row-delete {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: var(--text-lg);
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+.grid-row-delete:hover {
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+}
+
+.grid-empty {
+  text-align: center;
+  padding: var(--space-6);
+  color: var(--muted);
+}

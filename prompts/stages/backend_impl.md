@@ -1,15 +1,26 @@
 # Stage 2 / 7 — Backend implementation
 
+{{CONTRACT}}
+
 You are implementing the backend plan committed to `{{PLAN_PATH}}` for
-Evolvo iteration `{{ITERATION}}` (job `{{JOB_ID}}`). The BackendPlan stage
-has already written the plan; your job is to make it real in the worktree
-at `{{WORKTREE}}`.
+Evolvo job `{{JOB_ID}}`. The BackendPlan stage has already written the
+plan; your job is to make it real in the worktree at `{{WORKTREE}}`.
+
+## Preconditions (fail fast)
+
+1. `{{PLAN_PATH}}` exists, parses, and has a non-empty
+   `backend.commands` array. Otherwise:
+   `STAGE_RESULT: fail: backend plan missing or empty`.
+2. `cargo` and `git` are on PATH. Otherwise: `STAGE_RESULT: fail: cargo not on PATH`.
+3. The worktree is clean of unrelated edits (`git status` shows only
+   files this stage will touch). If a prior stage left dirty state,
+   continue — but note it in `plan.history`.
 
 ## Your inputs
 
 1. **Read `{{PLAN_PATH}}` first**. Treat `backend.entities`,
-   `backend.commands`, `backend.tests`, `backend.storage`, and
-   `templates.useTemplates` as the spec. Do not improvise new commands; if
+   `backend.commands`, `backend.behaviors`, `backend.tests`,
+   `backend.storage`, and `templates.useTemplates` as the spec. Do not improvise new commands; if
    the plan is wrong, note it in `history` but implement what it says and
    let the validator catch drift.
 2. **Read the canvas PNG** at `{{CANVAS_PNG}}` whenever you are making a
@@ -34,21 +45,172 @@ at `{{WORKTREE}}`.
 - **Registration**: add every new command to the `invoke_handler!` list in
   `app/src-tauri/src/lib.rs` (and/or `main.rs`). This is the single most
   common regression — grep for the new names after you add them.
-- **Templates**: for every name in `templates.useTemplates`, follow
-  `templates/integrations/<name>/README.md` — copy `host.rs` / `ui.rs` into
-  place, merge `deps.toml`, and register the commands. Do not hand-roll
-  what a template already ships.
+- **Integration templates**: for every name in `templates.useTemplates`,
+  follow `templates/integrations/<name>/README.md` — copy `host.rs` /
+  `ui.rs` into place, merge `deps.toml`, and register the commands. Do
+  not hand-roll what a template already ships.
+- **App-shape template** (when `templates.useAppShape` is set): follow
+  `templates/app_shapes/<name>/SKILL.md` end-to-end. In short:
+  1. Copy `host.rs` to the path declared in the manifest's
+     `[layout].host_module` (typically
+     `app/src-tauri/src/app_shapes/<name>.rs`). Add
+     `pub mod app_shapes;` and `pub mod <name>;` to the appropriate
+     `mod.rs` files (create `app_shapes/mod.rs` if it doesn't exist).
+  2. Register every `#[tauri::command]` from the scaffold's `host.rs` in
+     `invoke_handler!` (lib.rs). Grep for the command names afterwards
+     to confirm.
+  3. Merge `deps.toml` if any optional renderer / dependency is used.
+  4. Walk every `// FILL: …` marker in the copied files and replace it
+     with job-specific code based on the user's request and the
+     plan's `entities` list. The validator (planned) refuses any `// FILL:`
+     surviving in the final diff.
+  5. If `templates.backendBindings.<name>` is set AND the integration's
+     `seam_<name>.rs` adapter exists, replace the scaffold's default
+     `*Store` impl factory (`build_store`) with the seam's adapter. If
+     the seam isn't shipped yet, fall back to the default JSON impl and
+     append a `history` entry on `plan.json` recording the missing seam
+     — never silently bake in a half-implemented adapter.
+  6. Tests: reuse the scaffold's existing `#[cfg(test)] mod tests`
+     verbatim. The plan's `tests[]` should already name those test
+     functions; if it doesn't, add them.
 - **Tests**: add each planned test by its exact name as a `#[test] fn
   <name>` in the module the plan names. Use `tempfile::tempdir()`;
   `EVOLVO_WORKSPACE_ROOT` must not leak into real disk.
 
 ## Zero-tolerance stub smells
 
-The validator will grep your diff for `TODO`, `unimplemented!`, and
-`todo!()`. Any of those in new code fails the stage. If you cannot
-implement something inside the iteration budget, shrink the plan (edit
-`{{PLAN_PATH}}` to remove the command), then implement the reduced set
-fully.
+The validator will grep your diff for **the full set of stub
+shapes** — not just the ones Claude knows to avoid by default. Each
+of these will fail the stage:
+
+- `TODO`, `unimplemented!`, `todo!()` (historic)
+- `Err("not impl…")`, `Err("nyi…")`, `Err("todo…")`, `Err("not yet…")`
+- `panic!("not impl…")`, `panic!("nyi…")`, `panic!("not yet…")`
+- A **trailing** empty default at the end of a function body:
+  `Ok(Vec::new())`, `Ok(vec![])`, `Ok(Default::default())`,
+  `Ok(HashMap::new())`, `Ok(BTreeMap::new())`, `Ok(HashSet::new())`
+  immediately followed by `}`. If you legitimately need to return
+  an empty container, route through `state.store().list_*()` — the
+  empty case is the store's job, not the command's.
+
+If you cannot implement something inside this job's budget, shrink
+the plan (edit `{{PLAN_PATH}}` to remove the command), then
+implement the reduced set fully.
+
+## Anchor contract — the plan tells you what each body must mention
+
+Every command in `plan.backend.commands` carries a `bodySketch` (and
+optionally explicit `anchors`). The validator extracts identifier-
+shaped tokens from these and asserts at least one appears in your
+implemented function body. Examples:
+
+- A command with `anchors: ["save_task", "current_time_unix_ms"]`
+  must mention at least one of those identifiers in the body. If your
+  body says `Ok(Task::default())` and never calls `save_task`, the
+  validator fails the stage.
+- A command with only a `bodySketch` (no explicit anchors) has its
+  anchors derived from the sketch — typically the store method names
+  and helper function names the planner referenced.
+
+### The thin-wrapper pattern is recognised
+
+This file already tells you to ship every command as a thin
+`#[tauri::command] fn <name>` wrapping a plain `fn <name>_impl(&Store,
+…)` so tests can hit the logic without the macro. The anchor check
+**looks at both bodies** — `<name>` and `<name>_impl` — and accepts a
+match in either. The canonical shape is:
+
+```rust
+pub fn create_task_impl(
+    store: &crate::store::Store,
+    payload: CreateTaskPayload,
+) -> Result<Task, String> {
+    let now = current_time_unix_ms();       // ← anchor lives here
+    let rec = Task { id: format!("task-{now}"), title: payload.title, done: false };
+    store.save_task(&rec).map_err(store_error)?;   // ← anchor lives here
+    Ok(rec)
+}
+
+#[tauri::command]
+pub fn create_task(
+    state: State<'_, AppState>,
+    payload: CreateTaskPayload,
+) -> Result<Task, String> {
+    create_task_impl(&state.store(), payload)
+}
+```
+
+The wrapper body is empty of anchors — that's fine, the validator
+reads `create_task_impl` too. **Don't fake the anchors by stuffing
+them as comments into the wrapper just to satisfy the check.** If the
+plan's `bodySketch` says "call store.save_task", the `_impl` body
+must actually call `save_task`. Naming the function correctly is no
+longer enough.
+
+## Behaviors — make the app actually do things
+
+Every `backend.behaviors[]` entry is a process the user expects to see
+happen. Implement each one in `fn <implementedIn>` (plus an optional
+`<implementedIn>_impl`), and **wire it to its trigger**:
+
+- `userAction` — the command named in `triggeredBy` calls (or spawns) it.
+  Work longer than ~1s runs on `std::thread::spawn` so the command
+  returns immediately with the record in its "working" state
+  (`status: active`, `running`, …).
+- `timer` — start a loop thread once at app setup (e.g. from the
+  Tauri `setup` hook in `main.rs`/`lib.rs`) that sleeps for the cadence
+  and calls the behavior.
+- `backgroundWorker` — spawned by its triggering command; persists every
+  transition (`queued → running → done | failed`) so a reload mid-run
+  shows real progress, and records failures on the entity instead of
+  swallowing them.
+- `externalEvent` — the listener (watcher, webhook template) calls it.
+
+After a behavior changes state, the UI must find out: emit a Tauri event
+(`app_handle.emit("app://changed", ...)`) that the frontend listens to,
+or document in `plan.history` that the frontend polls the relevant
+`list_*` command. Either is fine; silence is not.
+
+**`engine: "llm"` behaviors call a real model.** Copy
+`templates/integrations/claude_cli/` per its README (or `openrouter/`
+if the plan chose it) and call `engine.complete(...)` from the behavior.
+Keep the engine behind the template's `LlmEngine` trait held in app
+state, so `cargo test` uses its `ScriptedEngine` instead of the real CLI.
+A behavior that fabricates a reply string, picks from canned
+responses, or sleeps and flips a status is **simulated** — that is the
+mockup failure mode this stage exists to prevent. If the model call
+fails, persist the error on the entity (status `failed`, message) so
+the UI can show it.
+
+Seed data may fill an empty first run, but must never be the only way a
+drawn value appears: if the canvas shows "Build #118 ready for testing",
+the seed may show it once, and a behavior must be able to produce
+messages like it.
+
+Write at least one test per behavior that drives it through its `_impl`
+(with `ScriptedEngine` for llm behaviors) and asserts the state change.
+
+## Persistence layer — every entity needs CRUD in store.rs
+
+For each entity in `plan.backend.entities`, the validator requires at
+least 3 of the 4 CRUD verbs to be implemented in the host crate
+(typically in `app/src-tauri/src/store.rs`, but any module is fine):
+
+- `fn save_<entity>` / `fn save_<entity_plural>`
+- `fn load_<entity>`
+- `fn list_<entity_plural>` (or `fn list_<entity>` as a tolerated alias)
+- `fn delete_<entity>`
+
+This is what prevents the "command returns fake data, never wrote
+to disk" failure mode. A command that just builds a default value
+and returns it passes neither the anchor check nor this CRUD
+check — surface area is properly bounded.
+
+`// FILL: …` markers from app-shape scaffolds count as stub smells once
+the scaffold has been copied in: every `FILL` you do not legitimately
+delete (because it doesn't apply to this iteration) you MUST replace
+with real code. Leaving a `// FILL: …` comment in the diff fails the
+stage the same way `TODO` does.
 
 ## Validation this stage will face
 
@@ -61,6 +223,11 @@ The `validate_backend_impl` validator runs after you finish and checks:
 - `cargo check -p evolvo_desktop` and `cargo test -p evolvo_desktop --lib`
   both exit 0.
 - No stub smells in `commands.rs`.
+- Every planned behavior: `fn <implementedIn>` exists anywhere in the host
+  crate, its body (or `_impl`'s) contains one of the planned `anchors`,
+  something other than its own definition references it (registration,
+  call, spawn), and `llm` behaviors have the `claude_cli` / `openrouter`
+  integration in the crate.
 
 Run these yourself before you exit:
 
@@ -86,6 +253,9 @@ touches:
 
 ## When finished
 
-1. Make sure `cargo check` and `cargo test` are green.
-2. Reply in chat with ONLY `backend_impl done`. The validator reads the
-   worktree, not your reply.
+1. Make sure `cargo check` and `cargo test` are green. If either fails
+   and you cannot fix it inside this stage's scope, reply
+   `STAGE_RESULT: fail: cargo check|test failed: <one-line cause>`.
+2. Otherwise reply per the Operating contract — a short summary if
+   useful, then a final line `STAGE_RESULT: ok`. The validator reads
+   the worktree; the sentinel is the runtime's signal.

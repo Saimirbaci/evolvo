@@ -1,0 +1,48 @@
+# See ../SCHEMA.md for the full schema.
+[template]
+name = "calendar"
+description = "Month-grid calendar with events (title, start/end, all-day, notes)."
+tags = ["calendar", "scheduling", "events", "time-management"]
+
+[layout]
+host_module = "app/src-tauri/src/app_shapes/calendar.rs"
+register_in = "app/src-tauri/src/lib.rs"
+ui_app      = "app/ui/src/app_shape_calendar.rs"
+ui_modules  = []
+styles_file = "app/ui/styles.css"
+
+[data_interface]
+default      = "json_store"
+storage_path = "calendar/events"
+
+  [data_interface.entity]
+  name   = "CalendarEvent"
+  fields = [
+    { name = "id",      ty = "String",         required = true },
+    { name = "title",   ty = "String",         required = true },
+    { name = "startMs", ty = "u64",            required = true },
+    { name = "endMs",   ty = "u64",            required = true },
+    { name = "allDay",  ty = "bool",           required = false },
+    { name = "notes",   ty = "Option<String>", required = false },
+  ]
+
+  [data_interface.commands]
+  list   = "list_events_in_range"
+  load   = "load_event"
+  save   = "save_event"
+  delete = "delete_event"
+
+[backend_seams]
+google_oauth = "Sync events bidirectionally with the user's primary Google Calendar via google_oauth + the calendar.events scope. The seam wraps Google's CalendarList + Events APIs, mapping CalendarEvent ↔ Google's `Event` resource. Headline pairing for this scaffold."
+sqlite       = "Replace JsonCalendarStore with `events(id TEXT PRIMARY KEY, title TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, all_day INTEGER NOT NULL, notes TEXT)` + `CREATE INDEX events_by_start ON events(start_ms)`. Required once a user has hundreds of events to keep range queries fast."
+http_json    = "Proxy CRUD to a CalDAV / iCal-over-HTTP backend. Out-of-scope for the prototype but the manifest entry reserves the seam slot."
+
+[fill_markers]
+required = [
+  "FILL: event categories",
+]
+optional = [
+  "FILL: week view",
+  "FILL: agenda view",
+  "FILL: timezone handling",
+]

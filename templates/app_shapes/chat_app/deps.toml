@@ -1,0 +1,7 @@
+# chat_app scaffold — Cargo dependencies to merge.
+# Default JSON backend uses only crates already in the workspace.
+# When `openrouter` seam is bound, that integration's deps.toml supplies
+# what's needed (reqwest, tokio, etc.).
+
+[workspace.dependencies]
+# (none required)

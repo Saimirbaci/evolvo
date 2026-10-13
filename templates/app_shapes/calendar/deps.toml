@@ -1,0 +1,8 @@
+# calendar scaffold — Cargo dependencies to merge.
+# Default backend uses only crates already in the workspace. The UI uses
+# js_sys::Date for date math (no chrono required in WASM).
+# When `google_oauth` seam is bound for Google Calendar sync, that
+# integration's deps.toml supplies reqwest + serde glue.
+
+[workspace.dependencies]
+# (none required)

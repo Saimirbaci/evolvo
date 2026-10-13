@@ -1,0 +1,50 @@
+# See ../SCHEMA.md for the full schema.
+[template]
+name = "markdown_editor"
+description = "Two-pane markdown editor: document list, source pane, rendered preview."
+tags = ["text-editing", "single-document", "writing", "notes"]
+
+[layout]
+host_module = "app/src-tauri/src/app_shapes/markdown_editor.rs"
+register_in = "app/src-tauri/src/lib.rs"
+ui_app      = "app/ui/src/app_shape_markdown_editor.rs"
+ui_modules  = [
+  "app/ui/src/markdown_editor_doc_list.rs",
+  "app/ui/src/markdown_editor_preview.rs",
+]
+styles_file = "app/ui/styles.css"
+
+[data_interface]
+default      = "json_store"
+storage_path = "markdown_editor/documents"
+
+  [data_interface.entity]
+  name   = "Document"
+  fields = [
+    { name = "id",        ty = "String", required = true },
+    { name = "title",     ty = "String", required = true },
+    { name = "body",      ty = "String", required = true },
+    { name = "updatedAt", ty = "u64",    required = true },
+  ]
+
+  [data_interface.commands]
+  list   = "list_documents"
+  load   = "load_document"
+  save   = "save_document"
+  delete = "delete_document"
+
+[backend_seams]
+sqlite       = "Replace DocumentStore default impl with a sqlite-backed `documents(id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, updated_at INTEGER NOT NULL)` table; the integration's `seam_markdown_editor.rs` provides the adapter."
+http_json    = "Proxy CRUD to a remote REST API at a base URL the user configures; useful when documents must sync across devices. Adapter implements DocumentStore by hitting `<base>/documents` with GET/POST/DELETE."
+google_oauth = "Persist documents as `.md` files inside an `Evolvo Notes/` folder in the user's Google Drive. Requires google_oauth + the `drive.file` scope; not currently shipped — would require an adapter file in the google_oauth integration template."
+
+[fill_markers]
+required = [
+  "FILL: domain-specific document actions",
+  "FILL: domain-specific document fields",
+  "FILL: list-side affordances",
+]
+optional = [
+  "FILL: keyboard shortcuts",
+  "FILL: empty-state copy",
+]

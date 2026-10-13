@@ -1,7 +1,16 @@
 # Stage 3 / 7 — Frontend plan
 
+{{CONTRACT}}
+
 Backend is real: types, storage, Tauri commands, and host tests exist in
 `{{WORKTREE}}`. Your job is to plan the Leptos UI that drives it.
+
+## Preconditions (fail fast)
+
+1. `{{PLAN_PATH}}` parses and `backend.commands` has at least one entry.
+   Otherwise: `STAGE_RESULT: fail: backend plan empty — cannot plan frontend`.
+2. `{{CANVAS_PNG}}` is `<none>` OR readable. If a path is given but
+   unreadable: `STAGE_RESULT: fail: canvas png unreadable`.
 
 ## Your inputs
 
@@ -28,6 +37,25 @@ Mutate `{{PLAN_PATH}}` to fill `frontend`:
   suffix, no prefix — the validator greps for exactly `fn <name>`).
 - `budget`: keep `{minRoutes: 1, minComponents: 2}` unless the plan
   deliberately wants more.
+- **Live state.** For every `backend.behaviors[]` entry, decide how the
+  screen learns about its effect — listen for the backend's
+  `app://changed` event or poll the relevant `list_*` command while
+  something is in flight — and show in-progress / failed states (an
+  agent "thinking…", a task "running", a model error). Name the
+  component that owns that refresh in its `summary`. A UI that only
+  re-reads data after the user's own clicks will hide every behavior.
+
+### When `templates.useAppShape` is set
+
+Read `templates/app_shapes/<name>/SKILL.md` first. Its "What you get"
+list pre-populates much of `components[]` — the scaffold names the
+top-level page (e.g. `MarkdownEditorPage`) and any sub-components
+(e.g. `DocList`, `MarkdownPreview`). Plan the route as
+`{ path: "/", component: "<TopLevelPage>" }` and list every component the
+scaffold ships under `components[]` so the validator's `fn <name>` grep
+finds them. You may add job-specific components on top of these
+when the user's request implies UI affordances the scaffold doesn't
+already provide.
 
 ## The hard constraint
 
@@ -74,4 +102,5 @@ For the todo-app spec:
 ## When finished
 
 1. Save the plan.
-2. Reply in chat with ONLY `frontend_plan done`.
+2. Reply per the Operating contract — final line `STAGE_RESULT: ok` (or
+   `STAGE_RESULT: fail: <reason>`).

@@ -2,19 +2,42 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::types::{FeedbackRecord, LineageJobRecord};
+use crate::fsutil;
+use crate::types::{DesignRecord, FeedbackRecord, LineageJobRecord};
 
 const WORKSPACE_DIR_NAME: &str = "evolvo_workspace";
 const FEEDBACK_DIR: &str = "feedback";
 const SANDBOX_JOBS_DIR: &str = "lineage_jobs";
 const ATTACHMENTS_DIR: &str = "attachments";
+const DESIGNS_DIR: &str = "designs";
+/// Per-design asset directory suffix: `designs/<id>.assets/`. Not a
+/// `.json` file, so `list_json_entities` never walks it as an entity.
+const DESIGN_ASSETS_SUFFIX: &str = ".assets";
 const ITERATION_FILE: &str = "iteration.json";
+/// Sibling directory (inside each entity dir) that unparseable JSON files
+/// get moved into instead of being silently skipped. Not a `.json` file
+/// itself, so `list_json_entities`'s extension filter naturally excludes
+/// it from being walked as an entity — see the `.corrupted` dir doesn't
+/// leak back into listings" test.
+const CORRUPTED_DIR: &str = ".corrupted";
+
+/// Hard ceiling on a single attachment's decoded byte size (canvas
+/// screenshot, one pasted image, or the voice recording). Enforced again
+/// here as defense in depth even though `commands::submit_feedback`
+/// rejects oversized payloads before decoding — nothing should reach
+/// `Store` without going through this check.
+pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum StoreError {
     Io(io::Error),
     Serde(serde_json::Error),
     Other(String),
+    AttachmentTooLarge {
+        filename: String,
+        size: usize,
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -23,6 +46,14 @@ impl std::fmt::Display for StoreError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Serde(e) => write!(f, "serde: {e}"),
             Self::Other(msg) => write!(f, "{msg}"),
+            Self::AttachmentTooLarge {
+                filename,
+                size,
+                limit,
+            } => write!(
+                f,
+                "attachment {filename} is {size} bytes, which exceeds the {limit}-byte limit"
+            ),
         }
     }
 }
@@ -79,12 +110,17 @@ impl WorkspaceLayout {
         self.root.join(ATTACHMENTS_DIR).join(id)
     }
 
+    pub fn designs_dir(&self) -> PathBuf {
+        self.root.join(DESIGNS_DIR)
+    }
+
     pub fn directories(&self) -> Vec<PathBuf> {
         vec![
             self.root.clone(),
             self.feedback_dir(),
             self.lineage_jobs_dir(),
             self.root.join(ATTACHMENTS_DIR),
+            self.designs_dir(),
         ]
     }
 }
@@ -107,8 +143,21 @@ impl Store {
 
     pub fn init_workspace(&self) -> Result<(), StoreError> {
         for dir in self.layout.directories() {
-            fs::create_dir_all(&dir)?;
+            fsutil::create_dir_all_private(&dir)?;
+            // Best-effort: a directory created by an older Evolvo build
+            // (before 0700 hardening landed) keeps whatever permissive
+            // mode it already has — `create_dir_all` is a no-op on an
+            // existing dir, so it never gets the tightened mode without
+            // this explicit chmod.
+            fsutil::tighten_permissions_best_effort(&dir);
         }
+        // Sweep `.tmp` debris `write_atomic` can leave behind if the
+        // process crashed between `fs::write(&tmp, ..)` and the rename.
+        // These never match the `.json` extension filter, so they're
+        // otherwise invisible clutter that accumulates forever.
+        sweep_tmp_files(&self.layout.feedback_dir());
+        sweep_tmp_files(&self.layout.lineage_jobs_dir());
+        sweep_tmp_files(&self.layout.designs_dir());
         Ok(())
     }
 
@@ -123,7 +172,7 @@ impl Store {
     pub fn save_feedback(&self, rec: &FeedbackRecord) -> Result<(), StoreError> {
         self.init_workspace()?;
         let json = serde_json::to_string_pretty(rec)?;
-        fs::write(self.feedback_path(&rec.id), json)?;
+        write_atomic(&self.feedback_path(&rec.id), json.as_bytes())?;
         Ok(())
     }
 
@@ -151,10 +200,27 @@ impl Store {
         Ok(true)
     }
 
+    /// Remove a lineage job record. Callers own cleanup of its workspace —
+    /// see `deletion::delete_lineage_job`.
+    pub fn delete_lineage_job(&self, id: &str) -> Result<bool, StoreError> {
+        let path = self.lineage_job_path(id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&path)?;
+        Ok(true)
+    }
+
     pub fn save_lineage_job(&self, rec: &LineageJobRecord) -> Result<(), StoreError> {
         self.init_workspace()?;
         let json = serde_json::to_string_pretty(rec)?;
-        fs::write(self.lineage_job_path(&rec.id), json)?;
+        write_atomic(&self.lineage_job_path(&rec.id), json.as_bytes())?;
+        // Persistence remains the source of truth. Publishing happens only
+        // after the atomic write succeeds and is deliberately best-effort:
+        // a closed window must never turn a valid lineage transition into a
+        // failed mutation. The initial UI snapshot/reconciliation catches up
+        // when no listener is present.
+        crate::lineage_events::publish_job_upserted(self.layout.root(), rec);
         Ok(())
     }
 
@@ -170,6 +236,18 @@ impl Store {
 
     pub fn list_lineage_jobs(&self) -> Result<Vec<LineageJobRecord>, StoreError> {
         list_json_entities::<LineageJobRecord>(&self.layout.lineage_jobs_dir())
+    }
+
+    /// Total number of `.corrupted/` entries across the feedback and
+    /// lineage-jobs directories. Computed on demand (rather than threaded
+    /// through `list_feedback`/`list_lineage_jobs`, which would change
+    /// their signatures and every call site) for `app_health` to surface
+    /// as `AppHealth::corrupted_entity_count`. Best-effort: an unreadable
+    /// `.corrupted` dir counts as zero rather than failing the health
+    /// check.
+    pub fn count_quarantined_entities(&self) -> usize {
+        count_entries(&self.layout.feedback_dir().join(CORRUPTED_DIR))
+            + count_entries(&self.layout.lineage_jobs_dir().join(CORRUPTED_DIR))
     }
 
     /// Allocate the next iteration number for this workspace. The counter is
@@ -193,7 +271,7 @@ impl Store {
         };
         let next = current.saturating_add(1);
         let body = serde_json::json!({ "nextIteration": next });
-        fs::write(&path, serde_json::to_string_pretty(&body)?)?;
+        write_atomic(&path, serde_json::to_string_pretty(&body)?.as_bytes())?;
         Ok(current)
     }
 
@@ -203,16 +281,145 @@ impl Store {
         filename: &str,
         bytes: &[u8],
     ) -> Result<String, StoreError> {
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(StoreError::AttachmentTooLarge {
+                filename: filename.to_string(),
+                size: bytes.len(),
+                limit: MAX_ATTACHMENT_BYTES,
+            });
+        }
+
         let dir = self.layout.attachments_dir(feedback_id);
-        fs::create_dir_all(&dir)?;
+        fsutil::create_dir_all_private(&dir)?;
 
         let safe = sanitise_filename(filename);
         if safe.is_empty() {
             return Err("attachment filename cannot be empty".into());
         }
         let path = dir.join(&safe);
-        fs::write(&path, bytes)?;
+        write_atomic(&path, bytes)?;
         Ok(safe)
+    }
+
+    // --- Saved canvas designs ------------------------------------------
+    //
+    // `designs/<id>.json` holds the record; `designs/<id>.assets/` holds its
+    // images under content-addressed names (`<sha256-prefix>.<ext>`). An
+    // unchanged image is never rewritten (cheap autosave), and the record is
+    // only written after every asset it references exists — a crash at any
+    // point leaves the previous record and its assets intact. Unreferenced
+    // assets are collected after the new record lands.
+
+    fn design_path(&self, id: &str) -> Result<PathBuf, StoreError> {
+        ensure_design_id(id)?;
+        Ok(self.layout.designs_dir().join(format!("{id}.json")))
+    }
+
+    fn design_assets_dir(&self, id: &str) -> Result<PathBuf, StoreError> {
+        ensure_design_id(id)?;
+        Ok(self
+            .layout
+            .designs_dir()
+            .join(format!("{id}{DESIGN_ASSETS_SUFFIX}")))
+    }
+
+    pub fn save_design(&self, rec: &DesignRecord) -> Result<(), StoreError> {
+        self.init_workspace()?;
+        let json = serde_json::to_string_pretty(rec)?;
+        write_atomic(&self.design_path(&rec.id)?, json.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn load_design(&self, id: &str) -> Result<Option<DesignRecord>, StoreError> {
+        let path = self.design_path(id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    pub fn list_designs(&self) -> Result<Vec<DesignRecord>, StoreError> {
+        list_json_entities::<DesignRecord>(&self.layout.designs_dir())
+    }
+
+    pub fn delete_design(&self, id: &str) -> Result<bool, StoreError> {
+        let path = self.design_path(id)?;
+        let assets = self.design_assets_dir(id)?;
+        let existed = path.exists();
+        if existed {
+            fs::remove_file(&path)?;
+        }
+        if assets.exists() {
+            fs::remove_dir_all(&assets)?;
+        }
+        Ok(existed)
+    }
+
+    /// Store one design image; returns its content-addressed filename.
+    pub fn write_design_asset(
+        &self,
+        design_id: &str,
+        bytes: &[u8],
+        extension: &str,
+    ) -> Result<String, StoreError> {
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(StoreError::AttachmentTooLarge {
+                filename: format!("design image .{extension}"),
+                size: bytes.len(),
+                limit: MAX_ATTACHMENT_BYTES,
+            });
+        }
+        let ext = sanitise_filename(extension);
+        if ext.is_empty() {
+            return Err("design asset needs an extension".into());
+        }
+        let dir = self.design_assets_dir(design_id)?;
+        fsutil::create_dir_all_private(&dir)?;
+        let filename = format!("{}.{ext}", content_hash(bytes));
+        let path = dir.join(&filename);
+        if !path.exists() {
+            write_atomic(&path, bytes)?;
+        }
+        Ok(filename)
+    }
+
+    pub fn read_design_asset(
+        &self,
+        design_id: &str,
+        filename: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let safe = sanitise_filename(filename);
+        if safe.is_empty() {
+            return Ok(None);
+        }
+        let path = self.design_assets_dir(design_id)?.join(&safe);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read(&path)?))
+    }
+
+    /// Delete asset files the current record no longer references (and
+    /// stale `.tmp` debris). Best-effort per file: a failed delete only
+    /// leaves clutter, never breaks the design.
+    pub fn collect_design_assets(
+        &self,
+        design_id: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<usize, StoreError> {
+        let dir = self.design_assets_dir(design_id)?;
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for entry in fs::read_dir(&dir)?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !keep.contains(&name) && fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     pub fn read_attachment(
@@ -232,6 +439,22 @@ impl Store {
     }
 }
 
+/// Write `bytes` to `path` atomically. Thin wrapper over `fsutil::write_atomic`
+/// that maps `io::Error` into `StoreError` — kept so existing call sites in
+/// this file don't need `.map_err`.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    fsutil::write_atomic(path, bytes)?;
+    Ok(())
+}
+
+/// List every well-formed `T` in `dir`'s `*.json` files. A file that fails
+/// to parse is moved into `dir/.corrupted/` (preserving its filename, or
+/// appending a unix-ms suffix on a collision) rather than silently skipped
+/// — a corrupt record used to just vanish from the UI with no trace beyond
+/// an `eprintln!`; quarantining keeps the bytes recoverable and lets
+/// `Store::count_quarantined_entities` surface a non-zero count via
+/// `AppHealth`. `.corrupted` itself has no `.json` extension, so it's
+/// naturally excluded from being walked as an entity on the next pass.
 fn list_json_entities<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<T>, StoreError> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -249,15 +472,113 @@ fn list_json_entities<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<
         }) {
             Ok(rec) => items.push(rec),
             Err(err) => {
-                eprintln!("skip unreadable entity at {}: {err}", path.display());
-                continue;
+                eprintln!(
+                    "quarantining unreadable entity at {}: {err}",
+                    path.display()
+                );
+                quarantine_file(dir, &path);
             }
         }
     }
     Ok(items)
 }
 
-fn sanitise_filename(name: &str) -> String {
+/// Move `path` into `dir/.corrupted/`, keeping the original filename
+/// unless that name is already taken there, in which case a unix-ms
+/// suffix is appended so a repeated corruption of the same id doesn't
+/// clobber an earlier quarantined copy. Best-effort: if the move itself
+/// fails (e.g. permissions), logs and leaves the original file in place
+/// rather than losing it.
+fn quarantine_file(dir: &Path, path: &Path) {
+    let corrupted_dir = dir.join(CORRUPTED_DIR);
+    if let Err(err) = fs::create_dir_all(&corrupted_dir) {
+        eprintln!(
+            "failed to create quarantine dir {}: {err}",
+            corrupted_dir.display()
+        );
+        return;
+    }
+    let Some(file_name) = path.file_name() else {
+        return;
+    };
+    let mut dest = corrupted_dir.join(file_name);
+    if dest.exists() {
+        let now = crate::types::current_time_unix_ms();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("entity");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
+        dest = corrupted_dir.join(format!("{stem}.{now}.{ext}"));
+    }
+    if let Err(err) = fs::rename(path, &dest) {
+        eprintln!(
+            "failed to quarantine {} to {}: {err}",
+            path.display(),
+            dest.display()
+        );
+    }
+}
+
+/// Count regular files directly inside `dir` (non-recursive). Returns `0`
+/// for a missing directory rather than erroring — the quarantine dir
+/// legitimately doesn't exist until the first corrupt file shows up.
+fn count_entries(dir: &Path) -> usize {
+    if !dir.exists() {
+        return 0;
+    }
+    fs::read_dir(dir)
+        .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
+        .unwrap_or(0)
+}
+
+/// Remove leftover `*.tmp` files from a `write_atomic` that crashed
+/// between the write and the rename. Called from `init_workspace` so
+/// every store construction sweeps debris rather than letting it
+/// accumulate silently. Best-effort — an unreadable directory or a
+/// removal that fails (e.g. permissions) is logged, not propagated,
+/// since this must never block startup.
+fn sweep_tmp_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            if let Err(err) = fs::remove_file(&path) {
+                eprintln!("failed to sweep stale tmp file {}: {err}", path.display());
+            }
+        }
+    }
+}
+
+/// Design ids are minted by the host (`design-<unix_ms>`) plus the one
+/// reserved autosave slot (`draft`). Anything else is refused before it
+/// can become a path component.
+pub fn is_valid_design_id(id: &str) -> bool {
+    id == crate::types::DESIGN_DRAFT_ID
+        || id.strip_prefix("design-").is_some_and(|rest| {
+            !rest.is_empty() && rest.len() <= 20 && rest.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+fn ensure_design_id(id: &str) -> Result<(), StoreError> {
+    if is_valid_design_id(id) {
+        Ok(())
+    } else {
+        Err(StoreError::Other(format!("invalid design id: {id:?}")))
+    }
+}
+
+/// First 32 hex chars of the SHA-256 of `bytes` — a collision-safe,
+/// filesystem-safe asset name.
+fn content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn sanitise_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -295,6 +616,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 100,
@@ -302,6 +624,10 @@ mod tests {
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10,
             lineage_job_id: None,
+            revision: Default::default(),
+            target_app: None,
+            background_filename: None,
+            auto_launch: false,
         }
     }
 
@@ -322,6 +648,27 @@ mod tests {
         assert!(store.delete_feedback("a").unwrap());
         assert!(store.load_feedback("a").unwrap().is_none());
         assert!(!store.delete_feedback("a").unwrap());
+    }
+
+    #[test]
+    fn save_attachment_rejects_oversized_bytes() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        let oversized = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+        let err = store
+            .save_attachment("fb-1", "huge.png", &oversized)
+            .unwrap_err();
+        match err {
+            StoreError::AttachmentTooLarge { filename, size, .. } => {
+                assert_eq!(filename, "huge.png");
+                assert_eq!(size, MAX_ATTACHMENT_BYTES + 1);
+            }
+            other => panic!("expected AttachmentTooLarge, got {other}"),
+        }
+        // Nothing should have been written to disk.
+        assert!(store.read_attachment("fb-1", "huge.png").unwrap().is_none());
     }
 
     #[test]
@@ -364,8 +711,14 @@ mod tests {
             log_path: None,
             source_repo: None,
             iteration: 0,
+            freedom: crate::types::FreedomLevel::Auto,
             stages: Vec::new(),
             agent: AgentKind::ClaudeCode,
+            pause_after_plan: false,
+            plan_approved_at_unix_ms: None,
+            base_branch: None,
+            promoted_at_unix_ms: None,
+            promoted_commit: None,
         };
         store.save_lineage_job(&job).unwrap();
         assert_eq!(store.list_lineage_jobs().unwrap().len(), 1);
@@ -389,6 +742,84 @@ mod tests {
         let all = store.list_feedback().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "good");
+
+        // The corrupt file is quarantined, not deleted, and no longer
+        // shows up on subsequent listings (it's not a `.json` sibling of
+        // the entity dir anymore).
+        let quarantined = store
+            .layout()
+            .feedback_dir()
+            .join(".corrupted")
+            .join("bad.json");
+        assert!(quarantined.exists());
+        assert!(!store.layout().feedback_dir().join("bad.json").exists());
+        let all_again = store.list_feedback().unwrap();
+        assert_eq!(all_again.len(), 1);
+    }
+
+    #[test]
+    fn quarantine_count_is_reported_and_survives_collisions() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        store.save_feedback(&sample("good")).unwrap();
+        fs::write(store.layout().feedback_dir().join("bad1.json"), b"{oops").unwrap();
+        store.list_feedback().unwrap();
+        assert_eq!(store.count_quarantined_entities(), 1);
+
+        // A second corruption of a file with the same name must not
+        // clobber the first quarantined copy.
+        fs::write(store.layout().feedback_dir().join("bad1.json"), b"{oops2").unwrap();
+        store.list_feedback().unwrap();
+        assert_eq!(store.count_quarantined_entities(), 2);
+
+        fs::write(
+            store.layout().lineage_jobs_dir().join("badjob.json"),
+            b"not json",
+        )
+        .unwrap();
+        store.list_lineage_jobs().unwrap();
+        assert_eq!(store.count_quarantined_entities(), 3);
+    }
+
+    #[test]
+    fn init_workspace_sweeps_leftover_tmp_files() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        // Simulate a crash between `fs::write(&tmp, ..)` and the rename.
+        fs::write(store.layout().feedback_dir().join("fb-1.json.tmp"), b"{}").unwrap();
+        fs::write(
+            store.layout().lineage_jobs_dir().join("job-1.json.tmp"),
+            b"{}",
+        )
+        .unwrap();
+
+        store.init_workspace().unwrap();
+
+        assert!(!store.layout().feedback_dir().join("fb-1.json.tmp").exists());
+        assert!(!store
+            .layout()
+            .lineage_jobs_dir()
+            .join("job-1.json.tmp")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_workspace_creates_dirs_with_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+
+        for dir in store.layout().directories() {
+            let mode = fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{} was not 0700", dir.display());
+        }
     }
 
     #[test]

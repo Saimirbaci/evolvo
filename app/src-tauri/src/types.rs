@@ -19,24 +19,36 @@ pub enum AgentKind {
     #[default]
     ClaudeCode,
     CodexCli,
+    /// xAI Grok Build CLI — `grok -p <prompt>` headless, transcript in the
+    /// Anthropic Messages NDJSON format.
+    GrokCli,
+    /// Retired (no longer selectable or runnable). Kept so lineage jobs
+    /// recorded by older builds still deserialise and show who ran them.
     GeminiCli,
-    /// ForgeCode (forgecode.dev) — `forge -p <prompt>` runs a single
-    /// non-interactive turn. The `open_code` alias keeps lineage jobs
-    /// persisted by older builds (which ran the OpenCode CLI under the
-    /// same slot) deserialisable; those records render as Forge in the
-    /// UI even though they were originally executed by `opencode`.
+    /// Retired ForgeCode slot; see `GeminiCli`. The `open_code` alias keeps
+    /// even older records (OpenCode ran under this slot) loadable.
     #[serde(alias = "open_code")]
     Forge,
 }
 
 impl AgentKind {
-    pub fn all() -> [AgentKind; 4] {
-        [
-            Self::ClaudeCode,
-            Self::CodexCli,
-            Self::GeminiCli,
-            Self::Forge,
-        ]
+    /// Agents that can be selected and run.
+    pub fn all() -> [AgentKind; 3] {
+        [Self::ClaudeCode, Self::CodexCli, Self::GrokCli]
+    }
+
+    /// Recorded on old jobs only; Retry/Resume run them with Claude Code.
+    pub fn is_retired(self) -> bool {
+        matches!(self, Self::GeminiCli | Self::Forge)
+    }
+
+    /// The agent that actually runs a job recorded with `self`.
+    pub fn runnable(self) -> AgentKind {
+        if self.is_retired() {
+            Self::ClaudeCode
+        } else {
+            self
+        }
     }
 
     /// Short human label used in the UI and in job notes.
@@ -44,8 +56,9 @@ impl AgentKind {
         match self {
             Self::ClaudeCode => "Claude Code",
             Self::CodexCli => "Codex",
-            Self::GeminiCli => "Gemini",
-            Self::Forge => "Forge",
+            Self::GrokCli => "Grok",
+            Self::GeminiCli => "Gemini (retired)",
+            Self::Forge => "Forge (retired)",
         }
     }
 
@@ -55,6 +68,7 @@ impl AgentKind {
         match self {
             Self::ClaudeCode => "claude",
             Self::CodexCli => "codex",
+            Self::GrokCli => "grok",
             Self::GeminiCli => "gemini",
             Self::Forge => "forge",
         }
@@ -78,6 +92,73 @@ pub enum FeedbackType {
     /// product invariants (Feedback Overlay, Canvas per-page overlay, Inbox,
     /// Lineage pipeline).
     NewApp,
+}
+
+/// How much architectural freedom the agent has on this lineage job. The
+/// runtime computes a default from `(iteration, feedback_type)` the first
+/// time a job runs, but the field is overridable — a reviewer can lock a
+/// late-iteration job into `Bootstrap` (or vice versa) by editing the
+/// stored value. Substituted into the prompt as `{phase}` / `{latitude}`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FreedomLevel {
+    /// Sentinel meaning "derive from (iteration, feedback_type) at run
+    /// time". Persisted records that pre-date this field deserialize to
+    /// `Auto` and get resolved on first run.
+    #[default]
+    Auto,
+    /// Wide latitude. Treat existing code as scaffolding; restructure freely.
+    Bootstrap,
+    /// Cohesive feature additions; refactor when it serves the change.
+    Shaping,
+    /// Targeted changes that extend / refine; restructure only if blocked.
+    Consolidation,
+    /// Minimal surgical change. No unrelated refactors.
+    Maturation,
+    /// User explicitly asked for a new app. Full bootstrap latitude plus
+    /// the NewApp banner, regardless of iteration number.
+    NewApp,
+}
+
+impl FreedomLevel {
+    /// Derive a level from the iteration counter + feedback type. This is
+    /// the default heuristic stamped onto a job at first run; reviewers
+    /// can override the stored value.
+    pub fn from_iteration_and_kind(iteration: u32, ty: FeedbackType) -> Self {
+        if matches!(ty, FeedbackType::NewApp) {
+            return Self::NewApp;
+        }
+        match iteration.max(1) {
+            1..=5 => Self::Bootstrap,
+            6..=9 => Self::Shaping,
+            10..=12 => Self::Consolidation,
+            _ => Self::Maturation,
+        }
+    }
+
+    /// Returns `self` unless it's `Auto`, in which case derives from
+    /// `(iteration, ty)`. Use this at prompt-build sites so the
+    /// resolved level is always concrete.
+    pub fn resolve(self, iteration: u32, ty: FeedbackType) -> Self {
+        match self {
+            Self::Auto => Self::from_iteration_and_kind(iteration, ty),
+            other => other,
+        }
+    }
+
+    /// Human label substituted as `{phase}` in the iteration guidance
+    /// preamble. `Auto` only appears when an unresolved value leaks; the
+    /// label is intentionally noisy so we notice.
+    pub fn phase_label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (unresolved)",
+            Self::Bootstrap => "Bootstrap phase",
+            Self::Shaping => "Shaping phase",
+            Self::Consolidation => "Consolidation phase",
+            Self::Maturation => "Maturation phase",
+            Self::NewApp => "Bootstrap phase (NewApp)",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -104,6 +185,11 @@ pub struct FeedbackRecord {
     #[serde(default)]
     pub pasted_images: Vec<String>,
     pub screenshot_filename: Option<String>,
+    /// Ordered storyboard screens submitted together for a NewApp request.
+    /// Empty for legacy and ordinary single-page feedback. The singular
+    /// canvas fields above mirror the first screen for backward compatibility.
+    #[serde(default)]
+    pub screens: Vec<FeedbackScreenRecord>,
     pub voice_filename: Option<String>,
     pub voice_transcript: Option<String>,
     pub window_width: u32,
@@ -111,6 +197,139 @@ pub struct FeedbackRecord {
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub lineage_job_id: Option<String>,
+    /// Immutable revision ancestry. Historical records deserialize as
+    /// revision 1; revising from the Lineage view creates a new feedback
+    /// record and links both directions without rewriting this record's
+    /// original canvas/text payload.
+    #[serde(default)]
+    pub revision: FeedbackRevision,
+    /// Set when the feedback was captured by the desktop overlay on top of
+    /// another application (global shortcut) rather than inside Evolvo.
+    /// `None` means the feedback is about Evolvo / the NewApp itself.
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    /// Desktop captures: the frozen frame *without* annotations
+    /// (`frame.png`). Revisions reopen this as the backdrop so the user
+    /// redraws over the original screen, not over their old strokes.
+    #[serde(default)]
+    pub background_filename: Option<String>,
+    /// Desktop overlay "Run the new version as soon as it's ready". Off:
+    /// the user is notified and starts it from the menu bar / Lineage.
+    #[serde(default)]
+    pub auto_launch: bool,
+}
+
+/// The external application a desktop-overlay capture was taken over.
+/// Everything here is best-effort metadata read from the OS at shortcut
+/// time; agents use it to recognise the app and locate its source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetApp {
+    pub name: String,
+    #[serde(default)]
+    pub window_title: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
+    /// Local git checkout believed to hold the app's source. Only set when
+    /// resolved (auto-detected from the executable path or chosen by the
+    /// user); `None` means the job needs a source repo before it can run.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    /// How `repo_path` was obtained: `"executable"` (walked up from the
+    /// running binary), `"remembered"` (an earlier resolution for the same
+    /// app), `"local"` (found under the user's code folders), `"cloned"`
+    /// (upstream located and cloned into the workspace) or `"user"`.
+    /// Empty when unresolved.
+    #[serde(default)]
+    pub repo_source: String,
+    /// Upstream clone URL when known (self-describing, survives export —
+    /// unlike `repo_path`, which is a host path).
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    /// `""` (not attempted), `"resolving"`, `"resolved"` or `"failed"`.
+    #[serde(default)]
+    pub repo_status: String,
+    /// Why the last resolution attempt failed, for the Lineage card.
+    #[serde(default)]
+    pub repo_error: Option<String>,
+    /// Set when the capture was taken over a version Evolvo launched for an
+    /// earlier job: the new request continues from that job's worktree.
+    #[serde(default)]
+    pub based_on_job: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackRevision {
+    #[serde(default = "default_feedback_revision_number")]
+    pub number: u32,
+    #[serde(default)]
+    pub parent_feedback_id: Option<String>,
+    #[serde(default)]
+    pub superseded_by_feedback_id: Option<String>,
+}
+
+const fn default_feedback_revision_number() -> u32 {
+    1
+}
+
+impl Default for FeedbackRevision {
+    fn default() -> Self {
+        Self {
+            number: default_feedback_revision_number(),
+            parent_feedback_id: None,
+            superseded_by_feedback_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackScreenRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_images: Vec<String>,
+    pub screenshot_filename: Option<String>,
+    pub window_width: u32,
+    pub window_height: u32,
+}
+
+/// Read-only projection used to hydrate an existing feedback into the canvas
+/// editor. Attachments are returned as data URLs so no host filesystem paths
+/// cross into the webview.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableFeedback {
+    pub feedback: FeedbackRecord,
+    pub screens: Vec<EditableFeedbackScreen>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableFeedbackScreen {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_image_data_urls: Vec<String>,
+    pub window_width: u32,
+    pub window_height: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -185,6 +404,13 @@ pub struct LineageJobRecord {
     /// and are treated as iteration 1 when they run.
     #[serde(default)]
     pub iteration: u32,
+    /// Architectural freedom granted to the agent on this job. Defaults
+    /// to `Auto` (derive from `iteration` + `feedback_type`) and is
+    /// resolved to a concrete value the first time the job runs; the
+    /// reviewer can override the stored value to force e.g. `Maturation`
+    /// on an early-iteration job or `Bootstrap` on a late one.
+    #[serde(default)]
+    pub freedom: FreedomLevel,
     /// Multi-stage planner pipeline progress for NewApp iterations. Empty
     /// for classic single-session runs (bug fixes, small features). Each
     /// entry is appended when the corresponding stage starts and mutated
@@ -198,6 +424,37 @@ pub struct LineageJobRecord {
     /// silently flips to Claude half-way through.
     #[serde(default)]
     pub agent: AgentKind,
+    /// Plan-review gate: when true, the multi-stage pipeline stops after
+    /// the BackendPlan stage validates green, flips the job to `Planned`,
+    /// and waits for the reviewer to approve (resume implementation) or
+    /// reject. Catching a wrong plan here costs a re-plan; catching it
+    /// after implementation costs the whole pipeline. Defaults to false —
+    /// the historical fire-and-forget behaviour.
+    #[serde(default)]
+    pub pause_after_plan: bool,
+    /// Unix-ms timestamp of the reviewer's plan approval. The pause above
+    /// only fires while this is `None`, so resuming an approved job never
+    /// re-pauses at BackendPlan.
+    #[serde(default)]
+    pub plan_approved_at_unix_ms: Option<u64>,
+    /// Branch the source repo had checked out when the worktree for this
+    /// job was created (captured by `runner::prepare_run`). Promotion
+    /// refuses to merge if the source repo's checked-out branch has since
+    /// moved away from this value — merging into whatever branch happens
+    /// to be checked out at promote-time would silently land the change
+    /// somewhere the reviewer didn't intend. `None` for jobs that never
+    /// reached `Implementing` (or predate this field).
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Unix-ms timestamp of a successful promotion merge. `None` until
+    /// `promotion::promote_job` lands the merge commit.
+    #[serde(default)]
+    pub promoted_at_unix_ms: Option<u64>,
+    /// SHA of the commit created (or fast-forwarded to) in the source repo
+    /// by promotion. A self-describing value — not a pointer into host
+    /// state — so it round-trips through export/import per I-P4.
+    #[serde(default)]
+    pub promoted_commit: Option<String>,
 }
 
 /// Which stage of the multi-stage NewApp pipeline a `StageState` represents.
@@ -240,8 +497,25 @@ impl StageKind {
         }
     }
 
+    /// Inverse of [`slug`](Self::slug). Used by the `evolvo_desktop
+    /// validate` CLI so an in-worktree agent can name the stage it wants
+    /// to self-check.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::pipeline().iter().copied().find(|k| k.slug() == slug)
+    }
+
     pub fn is_planner(self) -> bool {
         matches!(self, Self::BackendPlan | Self::FrontendPlan | Self::E2EPlan)
+    }
+
+    /// True for the three implementation stages (`backend_impl`,
+    /// `frontend_impl`, `e2e_impl`). The local-model delegation gate
+    /// uses this to enable delegation only when the supervisor is
+    /// writing code — never during planning or final review, where the
+    /// supervisor's own reasoning is load-bearing and cheaper to keep
+    /// in one head.
+    pub fn is_impl(self) -> bool {
+        matches!(self, Self::BackendImpl | Self::FrontendImpl | Self::E2EImpl)
     }
 
     /// Canonical order for the pipeline.
@@ -343,6 +617,11 @@ pub struct SubmitFeedbackPayload {
     #[serde(default)]
     pub pasted_images_base64: Vec<String>,
     pub screenshot_base64: Option<String>,
+    /// Ordered screens for a NewApp storyboard. When non-empty these are the
+    /// canonical visual inputs; the singular fields mirror screen one so an
+    /// older host can still accept submissions from a newer UI.
+    #[serde(default)]
+    pub screens: Vec<FeedbackScreenPayload>,
     pub voice_base64: Option<String>,
     pub voice_mime_type: Option<String>,
     pub voice_transcript: Option<String>,
@@ -361,6 +640,45 @@ pub struct SubmitFeedbackPayload {
     /// wants the agent to start immediately).
     #[serde(default)]
     pub auto_evolve: bool,
+    /// When true, the NewApp pipeline pauses after the backend plan
+    /// validates so the reviewer can read `plan.json` (including its
+    /// `openQuestions`) before any implementation runs. Approving the
+    /// `Planned` job resumes the pipeline. Defaults to false on the wire
+    /// so older UI builds keep behaving as before.
+    #[serde(default)]
+    pub pause_after_plan: bool,
+    /// Direct parent when this submission was opened from "Revise on
+    /// Canvas". The backend resolves and validates the ancestry; callers
+    /// never choose the revision number themselves.
+    #[serde(default)]
+    pub parent_feedback_id: Option<String>,
+    /// Desktop-overlay captures carry the external app they were drawn on.
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    /// Desktop captures: the clean frozen frame (no annotations), base64.
+    #[serde(default)]
+    pub background_base64: Option<String>,
+    /// See `FeedbackRecord::auto_launch`.
+    #[serde(default)]
+    pub auto_launch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackScreenPayload {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_images_base64: Vec<String>,
+    pub screenshot_base64: Option<String>,
+    pub window_width: u32,
+    pub window_height: u32,
 }
 
 /// Availability of a given agent CLI on the host. Returned by the
@@ -430,10 +748,71 @@ pub struct AppHealth {
     pub app_version: String,
     pub workspace_path: String,
     pub launched_at_unix_ms: u64,
+    /// Number of agent CLI sessions (lineage jobs actively running an
+    /// agent) currently holding a concurrency slot. See `concurrency.rs`.
+    /// `#[serde(default)]` so older UI builds that don't send/expect this
+    /// field keep round-tripping.
+    #[serde(default)]
+    pub active_agent_sessions: usize,
+    /// The configured concurrency cap (`EVOLVO_MAX_CONCURRENT_JOBS`, or the
+    /// default). `#[serde(default)]` for the same forward-compat reason.
+    #[serde(default)]
+    pub max_concurrent_agent_sessions: usize,
+    /// Total number of entity files (feedback + lineage jobs) quarantined
+    /// into a sibling `.corrupted/` directory because they failed to
+    /// parse as JSON on the most recent listing. Non-zero is a signal
+    /// worth surfacing to the user — see `store::list_json_entities`.
+    /// `#[serde(default)]` for the same forward-compat reason as the
+    /// concurrency fields above.
+    #[serde(default)]
+    pub corrupted_entity_count: usize,
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn answer_plan_payload_wire_contract() {
+        // Exact JSON the UI sends (pinned by ui/src/types.rs).
+        let p: AnswerPlanQuestionsPayload = serde_json::from_str(
+            r#"{"id":"job-1","answers":[{"question":"Q?","answer":"A"}],"replan":true}"#,
+        )
+        .unwrap();
+        assert_eq!(p.id, "job-1");
+        assert_eq!(p.answers[0].answer, "A");
+        assert!(p.replan);
+    }
+
+    #[test]
+    fn save_design_payload_wire_contract() {
+        // Exact JSON the UI's SaveDesignPayload serialises to (pinned by
+        // ui/src/types.rs::design_contract_tests).
+        let raw = r#"{"id":null,"name":"Login","feedbackType":"new_app","feedbackText":"t","screens":[{"id":"screen-1","name":"Home","description":"d","intendedRoute":"/","annotations":[{"type":"rect"}],"pastedImagesBase64":["AAAA"],"windowWidth":1280,"windowHeight":800}],"thumbnailPngBase64":null,"sourceDesignId":"design-1"}"#;
+        let p: SaveDesignPayload = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.name, "Login");
+        assert_eq!(p.feedback_type, Some(FeedbackType::NewApp));
+        assert_eq!(p.screens[0].intended_route, "/");
+        assert_eq!(p.screens[0].pasted_images_base64, vec!["AAAA".to_string()]);
+        assert_eq!(p.source_design_id.as_deref(), Some("design-1"));
+        let summary = serde_json::to_value(DesignSummary {
+            id: "design-1".into(),
+            name: "A".into(),
+            screen_count: 1,
+            shape_count: 2,
+            thumbnail_data_url: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        })
+        .unwrap();
+        for key in [
+            "screenCount",
+            "shapeCount",
+            "thumbnailDataUrl",
+            "updatedAtUnixMs",
+        ] {
+            assert!(summary.get(key).is_some(), "{key}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -442,6 +821,33 @@ mod tests {
         assert_eq!(raw, "\"bug\"");
         let back: FeedbackType = serde_json::from_str("\"feature_request\"").unwrap();
         assert_eq!(back, FeedbackType::FeatureRequest);
+    }
+
+    #[test]
+    fn stage_kind_from_slug_round_trips_pipeline() {
+        for kind in StageKind::pipeline().iter().copied() {
+            assert_eq!(StageKind::from_slug(kind.slug()), Some(kind));
+        }
+        assert_eq!(StageKind::from_slug("not_a_stage"), None);
+        assert_eq!(StageKind::from_slug(""), None);
+    }
+
+    #[test]
+    fn stage_kind_planner_and_impl_are_disjoint() {
+        // The per-stage delegation policy depends on `is_planner` and
+        // `is_impl` partitioning the stage set with `FinalReview` in
+        // neither bucket. Catch any future variant that drifts out of
+        // this partition.
+        for kind in StageKind::pipeline() {
+            let p = kind.is_planner();
+            let i = kind.is_impl();
+            assert!(!(p && i), "stage {kind:?} is both planner and impl");
+            if matches!(kind, StageKind::FinalReview) {
+                assert!(!p && !i, "FinalReview must be neither planner nor impl");
+            } else {
+                assert!(p ^ i, "stage {kind:?} must be exactly one of planner/impl");
+            }
+        }
     }
 
     #[test]
@@ -464,6 +870,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 800,
@@ -471,6 +878,10 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             lineage_job_id: None,
+            revision: Default::default(),
+            target_app: None,
+            background_filename: None,
+            auto_launch: false,
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"feedbackType\":\"bug\""));
@@ -527,6 +938,39 @@ mod tests {
         // new variant rather than failing the deserialise.
         let legacy: AgentKind = serde_json::from_str("\"open_code\"").unwrap();
         assert_eq!(legacy, AgentKind::Forge);
+        let grok: AgentKind = serde_json::from_str("\"grok_cli\"").unwrap();
+        assert_eq!(grok, AgentKind::GrokCli);
+    }
+
+    #[test]
+    fn feedback_written_with_the_removed_local_worker_still_loads() {
+        // Records from builds that had the pi + Ollama "Local worker"
+        // carry a `localDelegate` object; it is simply ignored now.
+        let json = r#"{"id":"fb-1","feedbackType":"bug","status":"new","pageRoute":"/",
+            "feedbackText":"x","screenshotFilename":null,"voiceFilename":null,
+            "voiceTranscript":null,"windowWidth":1,"windowHeight":1,
+            "createdAtUnixMs":1,"updatedAtUnixMs":1,"lineageJobId":null,
+            "localDelegate":{"provider":"ollama","model":"gemma4"}}"#;
+        let fb: FeedbackRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(fb.id, "fb-1");
+        let payload: SubmitFeedbackPayload = serde_json::from_str(
+            r#"{"feedbackType":"bug","feedbackText":"x","screenshotBase64":null,
+                "voiceBase64":null,"voiceMimeType":null,"voiceTranscript":null,
+                "windowWidth":1,"windowHeight":1,
+                "localDelegate":{"provider":"ollama","model":"gemma4"}}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.feedback_text, "x");
+    }
+
+    #[test]
+    fn retired_agents_load_but_run_as_claude() {
+        for retired in [AgentKind::GeminiCli, AgentKind::Forge] {
+            assert!(retired.is_retired());
+            assert_eq!(retired.runnable(), AgentKind::ClaudeCode);
+            assert!(!AgentKind::all().contains(&retired));
+        }
+        assert_eq!(AgentKind::GrokCli.runnable(), AgentKind::GrokCli);
     }
 
     #[test]
@@ -565,5 +1009,155 @@ mod tests {
         assert_eq!(back.id, "fb-1");
         assert!(back.annotations.is_empty());
         assert!(back.pasted_images.is_empty());
+        assert_eq!(back.revision.number, 1);
+        assert!(back.revision.parent_feedback_id.is_none());
     }
+}
+
+// --- Plan review: answer the planner's open questions ----------------------
+
+/// Max answers per call and max characters per answer.
+pub const MAX_PLAN_ANSWERS: usize = 50;
+pub const MAX_PLAN_ANSWER_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanAnswerPayload {
+    pub question: String,
+    #[serde(default)]
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerPlanQuestionsPayload {
+    pub id: String,
+    #[serde(default)]
+    pub answers: Vec<PlanAnswerPayload>,
+    /// `true` = re-run the planner with the answers ("Answer & re-plan");
+    /// `false` = just record them (e.g. right before Approve).
+    #[serde(default)]
+    pub replan: bool,
+}
+
+// --- Saved canvas designs -------------------------------------------------
+
+/// Reserved id of the single autosaved draft (hidden from the design list).
+pub const DESIGN_DRAFT_ID: &str = "draft";
+
+/// A saved canvas design: every storyboard screen (vector annotations +
+/// pasted images by reference), plus the description and feedback type the
+/// user had selected, so reopening it restores the panel exactly. Portable
+/// (I-P4): image references are filenames inside the design's own asset
+/// directory, never host paths.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub feedback_type: Option<FeedbackType>,
+    #[serde(default)]
+    pub feedback_text: String,
+    #[serde(default)]
+    pub screens: Vec<DesignScreenRecord>,
+    /// Asset filename of a small preview PNG, if one was provided.
+    #[serde(default)]
+    pub thumbnail: Option<String>,
+    /// For the autosaved draft: the saved design it is an unsaved edit of,
+    /// so reopening after a restart still saves back to the right design.
+    #[serde(default)]
+    pub source_design_id: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignScreenRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    /// Asset filenames, in the order `annotations[*].assetIndex` refers to.
+    #[serde(default)]
+    pub pasted_images: Vec<String>,
+    #[serde(default)]
+    pub window_width: u32,
+    #[serde(default)]
+    pub window_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDesignPayload {
+    /// `None` creates a new design; `Some(id)` overwrites that design.
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub feedback_type: Option<FeedbackType>,
+    #[serde(default)]
+    pub feedback_text: String,
+    #[serde(default)]
+    pub screens: Vec<SaveDesignScreenPayload>,
+    #[serde(default)]
+    pub thumbnail_png_base64: Option<String>,
+    #[serde(default)]
+    pub source_design_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDesignScreenPayload {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_images_base64: Vec<String>,
+    #[serde(default)]
+    pub window_width: u32,
+    #[serde(default)]
+    pub window_height: u32,
+}
+
+/// List-view row: enough to render a picker without loading images.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignSummary {
+    pub id: String,
+    pub name: String,
+    pub screen_count: usize,
+    pub shape_count: usize,
+    #[serde(default)]
+    pub thumbnail_data_url: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+/// A design hydrated for the editor: screens carry image data URLs in the
+/// same shape as a feedback revision, so the UI restores both the same way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableDesign {
+    pub summary: DesignSummary,
+    #[serde(default)]
+    pub source_design_id: Option<String>,
+    #[serde(default)]
+    pub feedback_type: Option<FeedbackType>,
+    #[serde(default)]
+    pub feedback_text: String,
+    pub screens: Vec<EditableFeedbackScreen>,
 }

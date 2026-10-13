@@ -3,6 +3,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{Element, PointerEvent};
 
 use crate::canvas::{CanvasController, DrawingTool};
+use crate::sketch::{SketchPrompt, SketchState};
 
 const SWATCHES: &[(&str, &str)] = &[
     ("Red", "#ef4444"),
@@ -21,6 +22,7 @@ enum Popover {
     Tool,
     Color,
     More,
+    Sketch,
 }
 
 #[component]
@@ -28,6 +30,7 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
     let offset: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let drag_origin: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
     let open: RwSignal<Option<Popover>> = RwSignal::new(None);
+    let sketch_state = SketchState::new();
 
     let toggle = move |which: Popover| {
         open.update(|v| {
@@ -89,12 +92,46 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
                 class="pill-btn"
                 title="Undo (Cmd/Ctrl+Z)"
                 aria-label="Undo"
+                disabled={
+                    let ctrl = controller.clone();
+                    move || ctrl.sketch_busy.get() || !ctrl.history.with(|h| h.can_undo())
+                }
                 on:click={
                     let ctrl = controller.clone();
                     move |_| ctrl.undo()
                 }
             >
                 "↶"
+            </button>
+
+            <button
+                class="pill-btn"
+                title="Redo (Shift+Cmd/Ctrl+Z)"
+                aria-label="Redo"
+                disabled={
+                    let ctrl = controller.clone();
+                    move || ctrl.sketch_busy.get() || !ctrl.history.with(|h| h.can_redo())
+                }
+                on:click={
+                    let ctrl = controller.clone();
+                    move |_| ctrl.redo()
+                }
+            >
+                "↷"
+            </button>
+
+            <button
+                class="pill-btn pill-sketch"
+                title="Describe a sketch with AI (experimental)"
+                aria-label="Describe a sketch with AI"
+                class:active=move || open.get() == Some(Popover::Sketch)
+                class:busy={
+                    let ctrl = controller.clone();
+                    move || ctrl.sketch_busy.get()
+                }
+                on:click=move |_| toggle(Popover::Sketch)
+            >
+                "✦"
             </button>
 
             <button
@@ -119,6 +156,13 @@ pub fn Toolbar(controller: CanvasController) -> impl IntoView {
                     Some(Popover::Color) => view! {
                         <ColorPicker
                             controller=ctrl.clone()
+                            close=move || open.set(None)
+                        />
+                    }.into_any(),
+                    Some(Popover::Sketch) => view! {
+                        <SketchPrompt
+                            controller=ctrl.clone()
+                            state=sketch_state
                             close=move || open.set(None)
                         />
                     }.into_any(),
@@ -166,8 +210,8 @@ where
     view! {
         <button
             class="pill-btn pill-color"
-            title="Stroke color"
-            aria-label="Change stroke color"
+            title="Color — also recolors the selected shape"
+            aria-label="Change color"
             on:click=move |_| toggle(Popover::Color)
         >
             <span class="pill-color-dot" style:background-color=bg></span>
@@ -189,7 +233,7 @@ fn StrokeCycle(controller: CanvasController) -> impl IntoView {
     view! {
         <button
             class="pill-btn pill-stroke"
-            title="Stroke width (click to cycle, [ / ] keys)"
+            title="Stroke width — also applies to the selected shape (click to cycle, [ / ] keys)"
             aria-label="Stroke width"
             on:click={
                 let ctrl = controller.clone();
@@ -258,7 +302,7 @@ where
                         aria-label=format!("Color: {label}")
                         style:background-color=hex.clone()
                         on:click=move |_| {
-                            ctrl_click.stroke_color.set(hex_click.clone());
+                            ctrl_click.set_stroke_color(hex_click.clone());
                             close();
                         }
                     ></button>

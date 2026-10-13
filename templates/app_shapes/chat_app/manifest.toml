@@ -1,0 +1,51 @@
+# See ../SCHEMA.md for the full schema.
+[template]
+name = "chat_app"
+description = "Multi-conversation chat UI: thread sidebar + message stream + composer."
+tags = ["chat", "conversation", "messaging", "llm"]
+
+[layout]
+host_module = "app/src-tauri/src/app_shapes/chat_app.rs"
+register_in = "app/src-tauri/src/lib.rs"
+ui_app      = "app/ui/src/app_shape_chat_app.rs"
+ui_modules  = []
+styles_file = "app/ui/styles.css"
+
+[data_interface]
+default      = "json_store"
+storage_path = "chat_app/conversations"
+
+  [data_interface.entity]
+  name   = "Conversation"
+  # A Conversation owns its message list inline so the entire thread is one
+  # JSON document — fast to load, fast to write, no joins. Switch to
+  # message-per-row at the sqlite seam if conversations grow past ~10k
+  # messages.
+  fields = [
+    { name = "id",            ty = "String",       required = true },
+    { name = "title",         ty = "String",       required = true },
+    { name = "messages",      ty = "Vec<Message>", required = true },
+    { name = "createdAt",     ty = "u64",          required = true },
+    { name = "updatedAt",     ty = "u64",          required = true },
+  ]
+
+  [data_interface.commands]
+  list   = "list_conversations"
+  load   = "load_conversation"
+  save   = "save_conversation"
+  delete = "delete_conversation"
+
+[backend_seams]
+openrouter = "Replace ChatStore default — when the user sends a message, queue an assistant turn that calls openrouter.chat_completion with the conversation history and streams the reply back. The seam wraps the openrouter integration's existing chat session helpers."
+sqlite     = "Replace JsonChatStore with sqlite-backed `conversations(id, title, created_at, updated_at)` + `messages(id, conversation_id, role, content, created_at)`. Faster for big threads; survives JSON corruption better."
+http_json  = "Proxy CRUD to a remote chat backend. `list_conversations` → GET /conversations, etc."
+
+[fill_markers]
+required = [
+  "FILL: assistant turn handling",
+  "FILL: system prompt",
+]
+optional = [
+  "FILL: keyboard shortcuts",
+  "FILL: streaming UI affordance",
+]

@@ -1,0 +1,72 @@
+/* --------------------------------------------------------------------------
+   Evolvo — design tokens (PROTECTED)
+
+   This file is the shared design vocabulary every layer (shell chrome,
+   base primitives, and iteration-owned app CSS) draws from. An iteration
+   MAY change token *values* — that's the creative dial that lets each
+   NewApp have its own palette/rhythm/type without inventing raw literals
+   everywhere. An iteration MUST NOT delete or rename a token: the design
+   lint (`validate_frontend_impl` / `validate_final` in
+   app/src-tauri/src/validators.rs) checks for the presence of every name
+   below, and app.css is required to reference tokens instead of raw
+   hex/rgb/hsl values.
+   -------------------------------------------------------------------------- */
+
+:root {
+    /* ---- Legacy / shell tokens (unchanged names — do not rename) ---- */
+    --bg: #ffffff;
+    --fg: #0f172a;
+    --muted: #64748b;
+    --border: #e2e8f0;
+    --panel-bg: rgba(255, 255, 255, 0.97);
+    --panel-shadow: 0 20px 40px rgba(15, 23, 42, 0.12);
+    --accent: #2563eb;
+    --accent-fg: #ffffff;
+    --accent-hover: #1d4ed8;
+    --danger: #dc2626;
+    --success: #16a34a;
+    --radius: 10px;
+    --tool-size: 36px;
+
+    /* ---- Spacing scale ---- */
+    --space-1: 0.25rem;
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-5: 1.5rem;
+    --space-6: 2rem;
+    --space-7: 3rem;
+    --space-8: 4rem;
+
+    /* ---- Type scale ---- */
+    --text-xs: 0.75rem;
+    --text-sm: 0.8125rem;
+    --text-base: 0.9375rem;
+    --text-lg: 1.0625rem;
+    --text-xl: 1.375rem;
+    --text-2xl: 1.75rem;
+
+    --weight-normal: 400;
+    --weight-medium: 500;
+    --weight-semibold: 600;
+    --weight-bold: 700;
+
+    /* ---- Semantic surfaces ---- */
+    --surface: #ffffff;
+    --surface-raised: #ffffff;
+    --surface-sunken: #f8fafc;
+    --fg-strong: #0f172a;
+
+    /* ---- Elevation ---- */
+    --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.06);
+    --shadow-2: 0 8px 20px rgba(15, 23, 42, 0.1);
+    --shadow-3: 0 20px 40px rgba(15, 23, 42, 0.12);
+
+    /* ---- Motion ---- */
+    --transition-fast: 120ms ease;
+    --transition-base: 200ms ease;
+
+    /* ---- Radii ---- */
+    --radius-sm: 6px;
+    --radius-full: 999px;
+}

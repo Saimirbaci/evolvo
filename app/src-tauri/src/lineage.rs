@@ -15,12 +15,89 @@
 
 use crate::store::{Store, StoreError};
 use crate::types::{
-    current_time_unix_ms, AgentKind, FeedbackRecord, FeedbackStatus, LineageJobRecord,
-    LineageJobStatus, StageKind, StageState, StageStatus,
+    current_time_unix_ms, AgentKind, FeedbackRecord, FeedbackStatus, FreedomLevel,
+    LineageJobRecord, LineageJobStatus, StageKind, StageState, StageStatus,
 };
 
 pub struct LineageEngine<'a> {
     store: &'a Store,
+}
+
+/// Per-job write lock serialising every load-mutate-save on a
+/// `LineageJobRecord`. The runner thread and the Tauri command thread both
+/// mutate the same JSON file through this engine; without the lock, two
+/// interleaved read-modify-write cycles silently drop one side's update
+/// (e.g. a note appended by the runner vanishes when a status write from
+/// the main thread lands a millisecond later — the race documented at
+/// `commands::resume_lineage_job`). Process-wide because engines are
+/// constructed ad-hoc per call; atomic file writes alone cannot fix this,
+/// only serialise the torn file, so the lock is load-bearing.
+pub(crate) fn job_write_lock(job_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.entry(job_id.to_string()).or_default().clone()
+}
+
+/// Serialises the *decision + worktree mutation* phase of
+/// `commands::retry_lineage_job` per job id. Deliberately a **separate**
+/// lock map from [`job_write_lock`]: the retry flow calls
+/// `LineageEngine::append_note` / `force_status` internally while this
+/// lock is held, and those methods take `job_write_lock` themselves —
+/// reusing the same map would self-deadlock (`std::sync::Mutex` is not
+/// reentrant). This lock only ever guards
+/// check-worktree-then-reset-or-teardown, never a call back into
+/// `LineageEngine`.
+pub(crate) fn job_retry_lock(job_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.entry(job_id.to_string()).or_default().clone()
+}
+
+/// Retrying wrapper around `LineageEngine::force_status` for **failure
+/// paths** on background threads (runner/promotion). A job's terminal
+/// status write is not advisory the way a note is — if it silently fails
+/// (e.g. a transient `StoreError::Io` from a momentarily-locked file,
+/// full disk, etc.) the job is stuck saying `Implementing`/`Merging`
+/// forever with nothing left alive to retry it, since the thread that
+/// would have written the failure is about to exit. Retries a few times
+/// with a short backoff (acceptable here — these are already
+/// failure-path calls on background threads, not the interactive path)
+/// and logs loudly with the job id if every attempt fails, so the
+/// failure is at least visible in the process log even though the UI
+/// won't reflect it.
+///
+/// Note-append calls remain best-effort `let _ = engine.append_note(...)`
+/// — notes are informational; only the terminal status write gets this
+/// treatment.
+pub fn force_status_with_retry(engine: &LineageEngine<'_>, job_id: &str, status: LineageJobStatus) {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match engine.force_status(job_id, status) {
+            Ok(_) => return,
+            Err(e) => {
+                if attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(BACKOFF);
+                } else {
+                    eprintln!(
+                        "evolvo: job {job_id} failed to write status {status:?} after {MAX_ATTEMPTS} attempts — job may be stuck; last error: {e}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +121,13 @@ impl Transition {
                 | (T::Plan, S::Triaging)
                 | (T::StartImplementation, S::Planned)
                 | (T::MarkBuildReady, S::Implementing)
-                | (T::Approve, S::Pending | S::Planned | S::BuildReady)
+                // NOTE: `BuildReady` is deliberately excluded here. Promoting
+                // out of `BuildReady` must go through the real merge in
+                // `promotion::start_promotion` (BuildReady -> Merging ->
+                // Promoted/BuildReady), never this direct status flip — see
+                // `commands::approve_lineage_job`, which intercepts
+                // `BuildReady` before it ever reaches `LineageEngine::transition`.
+                | (T::Approve, S::Pending | S::Planned)
                 | (T::Reject, _)
                 | (T::Fail, _)
         )
@@ -93,8 +176,14 @@ impl<'a> LineageEngine<'a> {
             log_path: None,
             source_repo: None,
             iteration: 0,
+            freedom: FreedomLevel::Auto,
             stages: Vec::new(),
             agent,
+            pause_after_plan: false,
+            plan_approved_at_unix_ms: None,
+            base_branch: None,
+            promoted_at_unix_ms: None,
+            promoted_commit: None,
         };
         self.store.save_lineage_job(&job)?;
 
@@ -110,6 +199,8 @@ impl<'a> LineageEngine<'a> {
         job_id: &str,
         transition: Transition,
     ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -126,6 +217,8 @@ impl<'a> LineageEngine<'a> {
     }
 
     pub fn append_note(&self, job_id: &str, note: &str) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -147,6 +240,8 @@ impl<'a> LineageEngine<'a> {
         job_id: &str,
         status: LineageJobStatus,
     ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -166,6 +261,8 @@ impl<'a> LineageEngine<'a> {
         job_id: &str,
         stages: &[StageKind],
     ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -192,6 +289,8 @@ impl<'a> LineageEngine<'a> {
     where
         F: FnOnce(&mut StageState),
     {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -219,8 +318,44 @@ impl<'a> LineageEngine<'a> {
         Ok(job)
     }
 
+    /// Arm the plan-review gate on a job: the pipeline will stop after the
+    /// BackendPlan stage validates and wait for reviewer approval.
+    pub fn request_plan_review(&self, job_id: &str) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut job = self
+            .store
+            .load_lineage_job(job_id)?
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+        job.pause_after_plan = true;
+        job.updated_at_unix_ms = current_time_unix_ms();
+        self.store.save_lineage_job(&job)?;
+        Ok(job)
+    }
+
+    /// Record the reviewer's approval of the backend plan. Once set, the
+    /// plan-review pause never fires again for this job, so resuming the
+    /// pipeline proceeds straight into implementation.
+    pub fn mark_plan_approved(&self, job_id: &str) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut job = self
+            .store
+            .load_lineage_job(job_id)?
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+        let now = current_time_unix_ms();
+        job.plan_approved_at_unix_ms = Some(now);
+        job.updated_at_unix_ms = now;
+        self.store.save_lineage_job(&job)?;
+        Ok(job)
+    }
+
     /// Record the worktree / branch / log / source paths produced by the
-    /// runner when a job first enters `Implementing`.
+    /// runner when a job first enters `Implementing`. `base_branch` is the
+    /// branch the source repo had checked out at worktree-creation time
+    /// (`None` if it could not be resolved, e.g. detached HEAD) — promotion
+    /// later refuses to merge if the source repo has since switched to a
+    /// different branch, so this snapshot is load-bearing, not cosmetic.
     pub fn set_run_artifacts(
         &self,
         job_id: &str,
@@ -228,7 +363,10 @@ impl<'a> LineageEngine<'a> {
         branch_name: String,
         log_path: String,
         source_repo: String,
+        base_branch: Option<String>,
     ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut job = self
             .store
             .load_lineage_job(job_id)?
@@ -237,6 +375,60 @@ impl<'a> LineageEngine<'a> {
         job.branch_name = Some(branch_name);
         job.log_path = Some(log_path);
         job.source_repo = Some(source_repo);
+        job.base_branch = base_branch;
+        job.updated_at_unix_ms = current_time_unix_ms();
+        self.store.save_lineage_job(&job)?;
+        Ok(job)
+    }
+
+    /// Retired agents (Gemini, Forge) can't run any more: switch the job to
+    /// the agent that will actually run it and say so in the notes, so the
+    /// record stays truthful about who did the new run.
+    pub fn ensure_runnable_agent(
+        &self,
+        job: LineageJobRecord,
+    ) -> Result<LineageJobRecord, StoreError> {
+        if !job.agent.is_retired() {
+            return Ok(job);
+        }
+        let replacement = job.agent.runnable();
+        let note = format!(
+            "{} is no longer supported — this run uses {}",
+            job.agent.label(),
+            replacement.label()
+        );
+        {
+            let lock = job_write_lock(&job.id);
+            let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut fresh = self
+                .store
+                .load_lineage_job(&job.id)?
+                .ok_or_else(|| format!("lineage job not found: {}", job.id))?;
+            fresh.agent = replacement;
+            fresh.updated_at_unix_ms = current_time_unix_ms();
+            self.store.save_lineage_job(&fresh)?;
+        }
+        self.append_note(&job.id, &note)
+    }
+
+    /// Stamp a successful promotion merge onto the job record:
+    /// `promotedAtUnixMs` + `promotedCommit`. Does NOT change `status` —
+    /// callers pair this with `force_status(.., Promoted)` (see
+    /// `promotion::stamp_promoted`), kept separate so each write stays a
+    /// single clear responsibility under the job lock.
+    pub fn stamp_promotion(
+        &self,
+        job_id: &str,
+        merge_sha: &str,
+    ) -> Result<LineageJobRecord, StoreError> {
+        let lock = job_write_lock(job_id);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut job = self
+            .store
+            .load_lineage_job(job_id)?
+            .ok_or_else(|| format!("lineage job not found: {job_id}"))?;
+        job.promoted_at_unix_ms = Some(current_time_unix_ms());
+        job.promoted_commit = Some(merge_sha.to_string());
         job.updated_at_unix_ms = current_time_unix_ms();
         self.store.save_lineage_job(&job)?;
         Ok(job)
@@ -270,6 +462,7 @@ mod tests {
             annotations: vec![],
             pasted_images: vec![],
             screenshot_filename: None,
+            screens: vec![],
             voice_filename: None,
             voice_transcript: None,
             window_width: 100,
@@ -277,7 +470,52 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             lineage_job_id: None,
+            revision: Default::default(),
+            target_app: None,
+            background_filename: None,
+            auto_launch: false,
         }
+    }
+
+    #[test]
+    fn concurrent_note_appends_do_not_lose_updates() {
+        // The documented lost-update race: runner thread and main thread
+        // both load-mutate-save the same job record. With the per-job
+        // write lock every append survives; without it this test flakes
+        // hard (interleaved read-modify-write drops notes).
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = mk_feedback("fb-race");
+        store.save_feedback(&fb).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
+
+        let store_t = store.clone();
+        let id_t = job.id.clone();
+        let t = std::thread::spawn(move || {
+            let engine = LineageEngine::new(&store_t);
+            for i in 0..50 {
+                engine
+                    .append_note(&id_t, &format!("thread note {i}"))
+                    .unwrap();
+            }
+        });
+        for i in 0..50 {
+            engine
+                .append_note(&job.id, &format!("main note {i}"))
+                .unwrap();
+        }
+        t.join().unwrap();
+
+        let back = store.load_lineage_job(&job.id).unwrap().unwrap();
+        assert_eq!(
+            back.notes.len(),
+            100,
+            "every append from both threads must survive"
+        );
     }
 
     #[test]
@@ -287,7 +525,9 @@ mod tests {
         store.init_workspace().unwrap();
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
 
         let pipeline = [
             crate::types::StageKind::BackendPlan,
@@ -295,7 +535,10 @@ mod tests {
         ];
         let seeded = engine.seed_stages(&job.id, &pipeline).unwrap();
         assert_eq!(seeded.stages.len(), 2);
-        assert!(seeded.stages.iter().all(|s| matches!(s.status, crate::types::StageStatus::Pending)));
+        assert!(seeded
+            .stages
+            .iter()
+            .all(|s| matches!(s.status, crate::types::StageStatus::Pending)));
 
         let updated = engine
             .update_stage(&job.id, crate::types::StageKind::BackendPlan, |s| {
@@ -343,7 +586,9 @@ mod tests {
 
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
 
         assert_eq!(fb.lineage_job_id.as_deref(), Some(job.id.as_str()));
         assert_eq!(fb.status, FeedbackStatus::InLineage);
@@ -360,7 +605,9 @@ mod tests {
 
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
 
         // Pending -> Triaging ok
         let j2 = engine.transition(&job.id, Transition::Triage).unwrap();
@@ -380,9 +627,17 @@ mod tests {
             .unwrap();
         assert_eq!(ready.status, LineageJobStatus::BuildReady);
 
-        // BuildReady -> Approve -> Promoted
-        let promoted = engine.transition(&job.id, Transition::Approve).unwrap();
-        assert_eq!(promoted.status, LineageJobStatus::Promoted);
+        // BuildReady -> Approve is deliberately NOT a valid direct
+        // transition through the engine: promotion out of BuildReady must
+        // go through the real merge in `promotion::start_promotion`
+        // (BuildReady -> Merging -> Promoted/BuildReady), which
+        // `commands::approve_lineage_job` intercepts before it ever calls
+        // `transition`. See the NOTE on `Transition::is_valid_from`.
+        let rejected_direct_promote = engine.transition(&job.id, Transition::Approve);
+        assert!(
+            rejected_direct_promote.is_err(),
+            "BuildReady -> Promoted must not be reachable as a direct engine transition"
+        );
     }
 
     #[test]
@@ -393,7 +648,9 @@ mod tests {
 
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
         let out = engine.transition(&job.id, Transition::Reject).unwrap();
         assert_eq!(out.status, LineageJobStatus::Rejected);
     }
@@ -406,10 +663,59 @@ mod tests {
 
         let engine = LineageEngine::new(&store);
         let mut fb = mk_feedback("fb-1");
-        let job = engine.enqueue_job_for_feedback(&mut fb, AgentKind::default()).unwrap();
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
         let j2 = engine.append_note(&job.id, "needs more detail").unwrap();
         assert_eq!(j2.notes, vec!["needs more detail"]);
         let j3 = engine.append_note(&job.id, "   ").unwrap();
         assert_eq!(j3.notes.len(), 1);
+    }
+
+    #[test]
+    fn force_status_with_retry_succeeds_on_first_try_for_a_real_job() {
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+        let mut fb = mk_feedback("fb-1");
+        let job = engine
+            .enqueue_job_for_feedback(&mut fb, AgentKind::default())
+            .unwrap();
+
+        force_status_with_retry(&engine, &job.id, LineageJobStatus::Failed);
+
+        let back = store.load_lineage_job(&job.id).unwrap().unwrap();
+        assert_eq!(back.status, LineageJobStatus::Failed);
+    }
+
+    #[test]
+    fn force_status_with_retry_gives_up_after_max_attempts_without_panicking() {
+        // A job id with no backing record on disk means every
+        // `force_status` attempt returns Err. This must exhaust its
+        // retries and return quietly (logging to stderr) rather than
+        // panicking or looping forever.
+        let temp = tempdir().unwrap();
+        let store = Store::new(temp.path().to_path_buf());
+        store.init_workspace().unwrap();
+        let engine = LineageEngine::new(&store);
+
+        force_status_with_retry(&engine, "job-does-not-exist", LineageJobStatus::Failed);
+        // Reaching this line without panicking/hanging is the assertion.
+    }
+
+    #[test]
+    fn job_retry_lock_is_distinct_from_job_write_lock() {
+        // Regression guard for the self-deadlock this module documents:
+        // `job_retry_lock` and `job_write_lock` must never resolve to the
+        // same underlying Mutex for the same job id, or a caller that
+        // holds the retry lock while calling into `LineageEngine` (which
+        // takes the write lock internally) would deadlock.
+        let retry = job_retry_lock("job-x");
+        let write = job_write_lock("job-x");
+        assert!(
+            !std::sync::Arc::ptr_eq(&retry, &write),
+            "job_retry_lock and job_write_lock must be backed by separate mutexes"
+        );
     }
 }

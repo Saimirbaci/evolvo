@@ -1,0 +1,55 @@
+# See ../SCHEMA.md for the full schema.
+[template]
+name = "dashboard"
+description = "Grid of widget tiles (number / text / mini-chart) that refresh on a schedule."
+tags = ["dashboard", "metrics", "kpi", "monitoring", "overview"]
+
+[layout]
+host_module = "app/src-tauri/src/app_shapes/dashboard.rs"
+register_in = "app/src-tauri/src/lib.rs"
+ui_app      = "app/ui/src/app_shape_dashboard.rs"
+ui_modules  = []
+styles_file = "app/ui/styles.css"
+
+[data_interface]
+default      = "json_store"
+storage_path = "dashboard/widgets"
+
+  [data_interface.entity]
+  name   = "Widget"
+  # Each widget owns its latest reading inline so the dashboard renders
+  # without a follow-up read per tile. Time-series storage is a sqlite
+  # seam concern (see backend_seams).
+  fields = [
+    { name = "id",                ty = "String",            required = true },
+    { name = "title",             ty = "String",            required = true },
+    { name = "kind",              ty = "String",            required = true },
+    { name = "sourceUrl",         ty = "Option<String>",    required = false },
+    { name = "refreshIntervalMs", ty = "Option<u64>",       required = false },
+    { name = "ordinal",           ty = "u32",               required = true },
+    { name = "config",            ty = "serde_json::Value", required = false },
+    { name = "latestValue",       ty = "Option<serde_json::Value>", required = false },
+    { name = "latestFetchedAt",   ty = "Option<u64>",       required = false },
+  ]
+
+  [data_interface.commands]
+  list   = "list_widgets"
+  load   = "load_widget"
+  save   = "save_widget"
+  delete = "delete_widget"
+  # Plus a non-CRUD verb:
+  refresh = "refresh_widget"
+
+[backend_seams]
+http_json = "Replace `refresh_widget` to fetch the widget's `sourceUrl` via the http_json integration's GET helper, then parse + persist the response as `latestValue`. The headline pairing for this scaffold."
+sqlite    = "Add a `widget_readings(widget_id, value_json, fetched_at)` table to keep historical readings beyond the single inline `latestValue`. Required for time-series mini-charts."
+
+[fill_markers]
+required = [
+  "FILL: widget kinds",
+  "FILL: refresh implementation",
+]
+optional = [
+  "FILL: layout customisation",
+  "FILL: chart rendering",
+]

@@ -8,36 +8,43 @@ pub enum AgentKind {
     #[default]
     ClaudeCode,
     CodexCli,
+    GrokCli,
+    /// Retired — only on jobs recorded by older builds.
     GeminiCli,
+    /// Retired — only on jobs recorded by older builds.
     #[serde(alias = "open_code")]
     Forge,
 }
 
 impl AgentKind {
-    pub fn all() -> [AgentKind; 4] {
-        [
-            Self::ClaudeCode,
-            Self::CodexCli,
-            Self::GeminiCli,
-            Self::Forge,
-        ]
+    /// Selectable agents (retired ones are left out).
+    pub fn all() -> [AgentKind; 3] {
+        [Self::ClaudeCode, Self::CodexCli, Self::GrokCli]
+    }
+
+    /// Retired agents run as Claude Code (mirrors the host).
+    pub fn runnable(self) -> AgentKind {
+        match self {
+            Self::GeminiCli | Self::Forge => Self::ClaudeCode,
+            other => other,
+        }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::ClaudeCode => "Claude Code",
             Self::CodexCli => "Codex",
-            Self::GeminiCli => "Gemini",
-            Self::Forge => "Forge",
+            Self::GrokCli => "Grok",
+            Self::GeminiCli => "Gemini (retired)",
+            Self::Forge => "Forge (retired)",
         }
     }
 
     pub fn binary(self) -> &'static str {
         match self {
-            Self::ClaudeCode => "claude",
+            Self::ClaudeCode | Self::GeminiCli | Self::Forge => "claude",
             Self::CodexCli => "codex",
-            Self::GeminiCli => "gemini",
-            Self::Forge => "forge",
+            Self::GrokCli => "grok",
         }
     }
 }
@@ -167,6 +174,8 @@ pub struct FeedbackRecord {
     #[serde(default)]
     pub pasted_images: Vec<String>,
     pub screenshot_filename: Option<String>,
+    #[serde(default)]
+    pub screens: Vec<FeedbackScreenRecord>,
     pub voice_filename: Option<String>,
     pub voice_transcript: Option<String>,
     pub window_width: u32,
@@ -174,6 +183,158 @@ pub struct FeedbackRecord {
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub lineage_job_id: Option<String>,
+    #[serde(default)]
+    pub revision: FeedbackRevision,
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    #[serde(default)]
+    pub background_filename: Option<String>,
+    #[serde(default)]
+    pub auto_launch: bool,
+}
+
+/// External application a desktop-overlay capture was drawn on. Mirrors
+/// `types::TargetApp` on the host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetApp {
+    pub name: String,
+    #[serde(default)]
+    pub window_title: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub repo_source: String,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    /// `""`, `"resolving"`, `"resolved"` or `"failed"`.
+    #[serde(default)]
+    pub repo_status: String,
+    #[serde(default)]
+    pub repo_error: Option<String>,
+    /// Captured over a version Evolvo launched for this earlier job.
+    #[serde(default)]
+    pub based_on_job: Option<String>,
+}
+
+/// Frozen desktop frame the overlay window displays (`desktop.rs` on host).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSession {
+    pub screenshot_base64: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    pub captured_at_unix_ms: u64,
+    /// "Revise on Canvas": the feedback whose annotations to restore.
+    #[serde(default)]
+    pub revision_of: Option<String>,
+    #[serde(default)]
+    pub revision_agent: Option<AgentKind>,
+    /// Visible windows on the captured monitor, front to back, in overlay
+    /// CSS px — the window picker's hit-test targets.
+    #[serde(default)]
+    pub windows: Vec<PickableWindow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PickableWindow {
+    pub id: u32,
+    pub app_name: String,
+    #[serde(default)]
+    pub title: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub focused: bool,
+}
+
+/// One window captured on its own (window mode).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowCapture {
+    pub screenshot_base64: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackRevision {
+    #[serde(default = "default_feedback_revision_number")]
+    pub number: u32,
+    #[serde(default)]
+    pub parent_feedback_id: Option<String>,
+    #[serde(default)]
+    pub superseded_by_feedback_id: Option<String>,
+}
+
+const fn default_feedback_revision_number() -> u32 {
+    1
+}
+
+impl Default for FeedbackRevision {
+    fn default() -> Self {
+        Self {
+            number: default_feedback_revision_number(),
+            parent_feedback_id: None,
+            superseded_by_feedback_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackScreenRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_images: Vec<String>,
+    pub screenshot_filename: Option<String>,
+    pub window_width: u32,
+    pub window_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableFeedback {
+    pub feedback: FeedbackRecord,
+    pub screens: Vec<EditableFeedbackScreen>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableFeedbackScreen {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pasted_image_data_urls: Vec<String>,
+    pub window_width: u32,
+    pub window_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +364,49 @@ pub struct LineageJobRecord {
     pub stages: Vec<StageState>,
     #[serde(default)]
     pub agent: AgentKind,
+    #[serde(default)]
+    pub pause_after_plan: bool,
+    #[serde(default)]
+    pub plan_approved_at_unix_ms: Option<u64>,
+    /// Branch the source repo had checked out when this job's worktree
+    /// was created. Promotion refuses to merge if the source repo has
+    /// since switched away from this branch.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Set once promotion successfully merges this job's lineage branch
+    /// into the source repo.
+    #[serde(default)]
+    pub promoted_at_unix_ms: Option<u64>,
+    /// SHA of the merge (or fast-forward) commit landed by promotion.
+    #[serde(default)]
+    pub promoted_commit: Option<String>,
+}
+
+/// Semantic artifact categories emitted by the host filesystem watcher.
+/// These mirror `evolvo_desktop::lineage_events::ArtifactKind`; raw file
+/// paths intentionally never cross the IPC boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageArtifactKind {
+    Plan,
+    Log,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageArtifactsChanged {
+    pub job_id: String,
+    pub changed_at_unix_ms: u64,
+    #[serde(default)]
+    pub kinds: Vec<LineageArtifactKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageJobUpserted {
+    pub revision: u64,
+    pub job: LineageJobRecord,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,6 +532,8 @@ pub struct SubmitFeedbackPayload {
     pub annotations: Vec<serde_json::Value>,
     pub pasted_images_base64: Vec<String>,
     pub screenshot_base64: Option<String>,
+    #[serde(default)]
+    pub screens: Vec<FeedbackScreenPayload>,
     pub voice_base64: Option<String>,
     pub voice_mime_type: Option<String>,
     pub voice_transcript: Option<String>,
@@ -339,6 +545,37 @@ pub struct SubmitFeedbackPayload {
     /// `submit_feedback` finishes persisting the record.
     #[serde(default)]
     pub auto_evolve: bool,
+    /// Plan-review gate: pause the NewApp pipeline after the backend plan
+    /// validates so the plan (and its open questions) can be reviewed
+    /// before implementation starts. Approving the Planned job resumes it.
+    #[serde(default)]
+    pub pause_after_plan: bool,
+    #[serde(default)]
+    pub parent_feedback_id: Option<String>,
+    /// Set by the desktop overlay: the external app the capture shows.
+    #[serde(default)]
+    pub target_app: Option<TargetApp>,
+    /// Desktop overlay: the clean frozen frame (no annotations), so a later
+    /// revision can redraw over the original screen.
+    #[serde(default)]
+    pub background_base64: Option<String>,
+    /// Desktop overlay: start the new version as soon as it's built.
+    #[serde(default)]
+    pub auto_launch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackScreenPayload {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub intended_route: String,
+    pub annotations: Vec<serde_json::Value>,
+    pub pasted_images_base64: Vec<String>,
+    pub screenshot_base64: Option<String>,
+    pub window_width: u32,
+    pub window_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -348,4 +585,292 @@ pub struct AppHealth {
     pub app_version: String,
     pub workspace_path: String,
     pub launched_at_unix_ms: u64,
+    /// Agent CLI sessions currently running, and the configured cap. Not
+    /// surfaced in the UI yet — mirrored here so the type round-trips.
+    #[serde(default)]
+    pub active_agent_sessions: u64,
+    #[serde(default)]
+    pub max_concurrent_agent_sessions: u64,
+    /// Feedback/lineage-job records quarantined into `.corrupted/`
+    /// because they failed to parse as JSON on the most recent listing.
+    /// Not surfaced in the UI yet — mirrored here so the type round-trips.
+    #[serde(default)]
+    pub corrupted_entity_count: u64,
+}
+
+/// UI mirror of `evolvo_desktop::plan::DesignPlan` — the visual/layout
+/// intent recorded on `plan.json`'s `frontend.design` (read directly out
+/// of the raw plan JSON `read_job_plan` returns, the same channel
+/// `openQuestions` already travels over). Every field defaults so an
+/// absent/legacy `design` object decodes as an all-empty `DesignPlan`
+/// instead of failing the whole plan-review fetch.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignPlan {
+    #[serde(default)]
+    pub layout_pattern: String,
+    #[serde(default)]
+    pub density: String,
+    #[serde(default)]
+    pub theme_overrides: Vec<TokenOverride>,
+    #[serde(default)]
+    pub visual_notes: Vec<RegionDesignNote>,
+}
+
+impl DesignPlan {
+    pub fn is_empty(&self) -> bool {
+        self.layout_pattern.is_empty()
+            && self.density.is_empty()
+            && self.theme_overrides.is_empty()
+            && self.visual_notes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenOverride {
+    pub token: String,
+    pub value: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionDesignNote {
+    pub region: String,
+    pub interpretation: String,
+}
+
+// --- Saved canvas designs (mirror of host types.rs) ----------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDesignPayload {
+    pub id: Option<String>,
+    pub name: String,
+    pub feedback_type: Option<FeedbackType>,
+    pub feedback_text: String,
+    pub screens: Vec<SaveDesignScreenPayload>,
+    pub thumbnail_png_base64: Option<String>,
+    pub source_design_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDesignScreenPayload {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub intended_route: String,
+    pub annotations: Vec<serde_json::Value>,
+    pub pasted_images_base64: Vec<String>,
+    pub window_width: u32,
+    pub window_height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub screen_count: usize,
+    #[serde(default)]
+    pub shape_count: usize,
+    #[serde(default)]
+    pub thumbnail_data_url: Option<String>,
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableDesign {
+    pub summary: DesignSummary,
+    #[serde(default)]
+    pub source_design_id: Option<String>,
+    #[serde(default)]
+    pub feedback_type: Option<FeedbackType>,
+    #[serde(default)]
+    pub feedback_text: String,
+    #[serde(default)]
+    pub screens: Vec<EditableFeedbackScreen>,
+}
+
+#[cfg(test)]
+mod design_contract_tests {
+    use super::*;
+
+    /// Wire contract with the host's `SaveDesignPayload` — the host has the
+    /// mirror test (`types::tests::save_design_payload_wire_contract`)
+    /// deserialising this exact literal.
+    const SAVE_DESIGN_JSON: &str = r#"{"id":null,"name":"Login","feedbackType":"new_app","feedbackText":"t","screens":[{"id":"screen-1","name":"Home","description":"d","intendedRoute":"/","annotations":[{"type":"rect"}],"pastedImagesBase64":["AAAA"],"windowWidth":1280,"windowHeight":800}],"thumbnailPngBase64":null,"sourceDesignId":"design-1"}"#;
+
+    #[test]
+    fn save_design_payload_serialises_to_the_host_contract() {
+        let payload = SaveDesignPayload {
+            id: None,
+            name: "Login".into(),
+            feedback_type: Some(FeedbackType::NewApp),
+            feedback_text: "t".into(),
+            screens: vec![SaveDesignScreenPayload {
+                id: "screen-1".into(),
+                name: "Home".into(),
+                description: "d".into(),
+                intended_route: "/".into(),
+                annotations: vec![serde_json::json!({"type": "rect"})],
+                pasted_images_base64: vec!["AAAA".into()],
+                window_width: 1280,
+                window_height: 800,
+            }],
+            thumbnail_png_base64: None,
+            source_design_id: Some("design-1".into()),
+        };
+        let ours: serde_json::Value = serde_json::to_value(&payload).unwrap();
+        let contract: serde_json::Value = serde_json::from_str(SAVE_DESIGN_JSON).unwrap();
+        assert_eq!(ours, contract);
+    }
+
+    #[test]
+    fn answer_plan_payload_matches_host_contract() {
+        // Host mirror: types::tests::answer_plan_payload_wire_contract.
+        let p = AnswerPlanQuestionsPayload {
+            id: "job-1".into(),
+            answers: vec![PlanAnswerPayload {
+                question: "Q?".into(),
+                answer: "A".into(),
+            }],
+            replan: true,
+        };
+        let ours = serde_json::to_value(&p).unwrap();
+        let contract: serde_json::Value = serde_json::from_str(
+            r#"{"id":"job-1","answers":[{"question":"Q?","answer":"A"}],"replan":true}"#,
+        )
+        .unwrap();
+        assert_eq!(ours, contract);
+    }
+
+    #[test]
+    fn editable_design_deserialises_host_output() {
+        let raw = r#"{"summary":{"id":"design-1","name":"A","screenCount":1,"shapeCount":2,
+            "thumbnailDataUrl":null,"createdAtUnixMs":1,"updatedAtUnixMs":2},
+            "sourceDesignId":null,"feedbackType":"bug","feedbackText":"",
+            "screens":[{"id":"screen-1","name":"S","description":"","intendedRoute":"/",
+            "annotations":[],"pastedImageDataUrls":[],"windowWidth":1,"windowHeight":1}]}"#;
+        let d: EditableDesign = serde_json::from_str(raw).unwrap();
+        assert_eq!(d.summary.shape_count, 2);
+        assert_eq!(d.feedback_type, Some(FeedbackType::Bug));
+        assert_eq!(d.screens.len(), 1);
+    }
+}
+
+/// Experimental AI sketch request (`generate_sketch` command). `shapes` are
+/// the canvas annotations in `Shape::to_json` form; ids are array indices.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SketchRequest {
+    pub prompt: String,
+    pub shapes: Vec<serde_json::Value>,
+    pub selected: Vec<usize>,
+    pub canvas_width: f64,
+    pub canvas_height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SketchOp {
+    pub op: String,
+    #[serde(default)]
+    pub id: Option<usize>,
+    #[serde(default)]
+    pub shape: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SketchResponse {
+    #[serde(default)]
+    pub ops: Vec<SketchOp>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+// --- Plan review answers (mirror of host types.rs) -----------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanAnswerPayload {
+    pub question: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerPlanQuestionsPayload {
+    pub id: String,
+    pub answers: Vec<PlanAnswerPayload>,
+    pub replan: bool,
+}
+
+/// One readable step from the agent's transcript (`activity.rs` on host).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEvent {
+    /// `tool`, `message`, `result` or `output`.
+    pub kind: String,
+    #[serde(default)]
+    pub tool: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseStep {
+    pub key: String,
+    pub label: String,
+    /// `done`, `active`, `failed` or `pending`.
+    pub state: String,
+}
+
+/// Live "what is the agent doing" view of a lineage job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobActivity {
+    pub job_id: String,
+    pub phase: String,
+    #[serde(default)]
+    pub phases: Vec<PhaseStep>,
+    #[serde(default)]
+    pub current: Option<String>,
+    #[serde(default)]
+    pub events: Vec<ActivityEvent>,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub log_updated_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub running: bool,
+    /// The new version Evolvo launched for this job is running.
+    #[serde(default)]
+    pub app_running: bool,
+}
+
+/// What `delete_lineage_job` removed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSummary {
+    pub job_id: String,
+    #[serde(default)]
+    pub removed: Vec<String>,
 }

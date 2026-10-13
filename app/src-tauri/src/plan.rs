@@ -19,6 +19,7 @@
 //! before the first planner session starts and mutated by each subsequent
 //! stage.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -29,20 +30,62 @@ pub const PLAN_FILENAME: &str = "plan.json";
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
 
 /// State of the plan file in terms of which stages have produced content.
-/// Written by each stage's planner *and* by the validator when a stage is
-/// accepted. The runner uses it to decide what to dispatch next.
+/// **Owned by the runtime, not the agent.** `advance_plan_stage` in
+/// `stages.rs` moves it forward monotonically after each validator
+/// passes; the agent should not edit `plan.stage` directly.
+///
+/// The deserialiser is **deliberately forgiving**. Older NewApp
+/// pipelines instructed the agent to mutate this field, which produced
+/// a string-typo deadlock the first time the agent wrote a near-miss
+/// (`"planned"` instead of `"backend_planned"`). Each variant carries
+/// `#[serde(alias = …)]` entries for the most common drift patterns:
+/// the most-upstream stage wins for ambiguous shortenings since
+/// `advance_plan_stage` is monotonic — a wrong intermediate state gets
+/// repaired by the next validator pass.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStage {
     #[default]
     Seeded,
+    #[serde(alias = "planned", alias = "backend_plan", alias = "backendPlanned")]
     BackendPlanned,
+    #[serde(
+        alias = "implemented",
+        alias = "backend_impl",
+        alias = "backendImplemented"
+    )]
     BackendImplemented,
+    #[serde(alias = "frontend_plan", alias = "frontendPlanned")]
     FrontendPlanned,
+    #[serde(alias = "frontend_impl", alias = "frontendImplemented")]
     FrontendImplemented,
+    /// Renamed from the serde-default `e2_e_planned` (which was ugly and
+    /// itself a typo magnet) to `e2e_planned`. Old plan.json files
+    /// still load via the alias.
+    #[serde(
+        rename = "e2e_planned",
+        alias = "e2_e_planned",
+        alias = "e2e_plan",
+        alias = "e2ePlanned"
+    )]
     E2EPlanned,
+    #[serde(
+        rename = "e2e_implemented",
+        alias = "e2_e_implemented",
+        alias = "e2e_impl",
+        alias = "e2eImplemented"
+    )]
     E2EImplemented,
+    #[serde(
+        alias = "complete",
+        alias = "done",
+        alias = "ready",
+        alias = "final",
+        alias = "final_review",
+        alias = "final_reviewed"
+    )]
     Completed,
+    #[serde(alias = "error", alias = "rejected")]
     Failed,
 }
 
@@ -97,6 +140,86 @@ pub struct IterationPlan {
     /// to re-read logs. Never rewritten.
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    /// Ambiguities the planner had to guess on, written as short questions
+    /// ("Should deleting a project cascade to its tasks?"). Surfaced to the
+    /// reviewer at the plan-review pause so a wrong guess is corrected for
+    /// the cost of a re-plan instead of a full implementation run. Planners
+    /// append here; an empty list means "nothing was ambiguous".
+    #[serde(default)]
+    pub open_questions: Vec<String>,
+    /// The reviewer's answers to `open_questions`, given at the plan-review
+    /// pause ("Answer & re-plan"). Binding user decisions: the planner
+    /// re-plans around them and every later stage reads them. Append-only
+    /// per question (a newer answer to the same question replaces the old).
+    #[serde(default)]
+    pub answered_questions: Vec<AnsweredQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweredQuestion {
+    pub question: String,
+    pub answer: String,
+    #[serde(default)]
+    pub answered_at_unix_ms: u64,
+}
+
+/// Normalise a question for matching (planners sometimes re-flow
+/// whitespace when they rewrite the list).
+fn question_key(q: &str) -> String {
+    q.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Upsert reviewer answers keyed by question text. Blank answers are
+/// ignored (= "accept the planner's guess"). Returns how many were stored.
+pub fn record_answers(
+    plan: &mut IterationPlan,
+    answers: &[(String, String)],
+    now_ms: u64,
+) -> usize {
+    let mut stored = 0;
+    for (question, answer) in answers {
+        let (question, answer) = (question.trim(), answer.trim());
+        if question.is_empty() || answer.is_empty() {
+            continue;
+        }
+        let key = question_key(question);
+        plan.answered_questions
+            .retain(|a| question_key(&a.question) != key);
+        plan.answered_questions.push(AnsweredQuestion {
+            question: question.to_string(),
+            answer: answer.to_string(),
+            answered_at_unix_ms: now_ms,
+        });
+        stored += 1;
+    }
+    stored
+}
+
+/// Open questions the reviewer has not answered yet.
+pub fn unanswered_open_questions(plan: &IterationPlan) -> Vec<String> {
+    let answered: std::collections::HashSet<String> = plan
+        .answered_questions
+        .iter()
+        .map(|a| question_key(&a.question))
+        .collect();
+    plan.open_questions
+        .iter()
+        .filter(|q| !answered.contains(&question_key(q)))
+        .cloned()
+        .collect()
+}
+
+/// After an "Answer & re-plan" round, the review is settled when every
+/// open question has an answer and nothing else needs a human decision —
+/// the pipeline may then continue without pausing again.
+pub fn plan_review_settled_by_answers(plan: &IterationPlan) -> bool {
+    !plan.answered_questions.is_empty()
+        && unanswered_open_questions(plan).is_empty()
+        && plan_review_required_reason(plan).is_none()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -148,6 +271,30 @@ pub struct CanvasReference {
     /// region. Deterministic; no LLM involved.
     #[serde(default)]
     pub regions: Vec<CanvasRegion>,
+    /// Ordered NewApp storyboard. Empty for legacy single-canvas feedback.
+    /// The singular fields above mirror the first screen so older plans and
+    /// validators remain readable while every stage can inspect all screens.
+    #[serde(default)]
+    pub screens: Vec<StoryboardScreenReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryboardScreenReference {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub intended_route: String,
+    pub png_path: Option<String>,
+    pub annotations_path: Option<String>,
+    #[serde(default)]
+    pub pasted_image_paths: Vec<String>,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    #[serde(default)]
+    pub regions: Vec<CanvasRegion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -186,6 +333,27 @@ pub struct TemplatesSection {
     /// silently skipping integrations the shape match implies.
     #[serde(default)]
     pub declined: Vec<DeclinedTemplate>,
+    /// Optional name of an app-shape scaffold from
+    /// `templates/app_shapes/<name>/`. The planner picks at most one when
+    /// the user's request matches a recognisable shape (an editor, a
+    /// kanban board, a tabular grid, …). `None` means "build the NewApp
+    /// content area from scratch", which is still the default. The
+    /// implementer copies the scaffold's files into the worktree per
+    /// `templates/app_shapes/<name>/SKILL.md`. Forward-compatible: older
+    /// plans without this field deserialise as `None`.
+    #[serde(default)]
+    pub use_app_shape: Option<String>,
+    /// Map of `<app-shape> → <integration>` recording which integration
+    /// template should replace an app-shape scaffold's default backend
+    /// (its `*Store` trait's default JSON impl). Empty = every chosen
+    /// app-shape uses its default backend. Read alongside
+    /// `use_app_shape` and `use_templates` — a binding only takes effect
+    /// when both the app-shape and the integration are also listed.
+    /// `BTreeMap` so JSON output has deterministic key order for diff
+    /// stability. Forward-compatible: older plans without this field
+    /// deserialise as an empty map.
+    #[serde(default)]
+    pub backend_bindings: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -208,6 +376,77 @@ pub struct BackendSection {
     pub storage: StoragePlan,
     #[serde(default)]
     pub budget: BackendBudget,
+    /// What the app *does*, not just what it stores: every process that
+    /// changes state the screen shows (agents replying, tasks progressing,
+    /// timers ticking, syncs landing). Commands cover what the user clicks;
+    /// behaviours cover what happens because of it — or on its own. A plan
+    /// with commands but no behaviours ships a data-entry mockup.
+    #[serde(default)]
+    pub behaviors: Vec<BehaviorPlan>,
+    /// Explicit opt-out for apps that genuinely have no live behaviour
+    /// (a static reference page, a pure form). Setting it requires a
+    /// reason and always pauses the job for plan review.
+    #[serde(default)]
+    pub static_app: Option<StaticAppJustification>,
+    /// Behaviors the planner intends to fake (canned data, a status a human
+    /// flips by hand, no real model call) instead of implementing — each
+    /// entry names the behavior and why. Non-empty always pauses the job:
+    /// shipping a simulation is the user's call, not the planner's.
+    #[serde(default)]
+    pub simulated_behaviors: Vec<String>,
+}
+
+/// Valid `BehaviorPlan::trigger` values.
+pub const BEHAVIOR_TRIGGERS: &[&str] =
+    &["userAction", "timer", "backgroundWorker", "externalEvent"];
+/// Valid `BehaviorPlan::engine` values. `llm` = a real model call through
+/// an LLM integration template (`claude_cli` or `openrouter`).
+pub const BEHAVIOR_ENGINES: &[&str] = &["deterministic", "llm"];
+/// Integration templates that satisfy an `llm` behaviour.
+pub const LLM_TEMPLATES: &[&str] = &["claude_cli", "openrouter"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BehaviorPlan {
+    /// snake_case identifier (e.g. `agent_replies_to_message`).
+    pub name: String,
+    /// One of [`BEHAVIOR_TRIGGERS`]. Strings, not an enum, so one sloppy
+    /// value fails a validator check instead of poisoning plan.json parse.
+    #[serde(default)]
+    pub trigger: String,
+    /// What fires it: the command name for `userAction`, the cadence for
+    /// `timer`, the event source for `externalEvent`.
+    #[serde(default)]
+    pub triggered_by: String,
+    /// One line: the observable effect ("the target agent's reply appears in
+    /// the message bus and its status returns to idle").
+    #[serde(default)]
+    pub effect: String,
+    /// `Entity.field` paths this behaviour writes.
+    #[serde(default)]
+    pub changes_state: Vec<String>,
+    /// One of [`BEHAVIOR_ENGINES`].
+    #[serde(default)]
+    pub engine: String,
+    /// Host function that performs the behaviour. Must exist in the host
+    /// crate and be reachable (registered command, or called from a
+    /// command / worker / timer).
+    #[serde(default)]
+    pub implemented_in: String,
+    #[serde(default)]
+    pub body_sketch: String,
+    /// Identifiers `implemented_in`'s body must contain (same contract as
+    /// `CommandPlan::anchors`).
+    #[serde(default)]
+    pub anchors: Vec<String>,
+    #[serde(default)]
+    pub motivated_by_regions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticAppJustification {
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,6 +490,31 @@ pub struct CommandPlan {
     /// matches the region(s).
     #[serde(default)]
     pub summary: String,
+    /// Multi-line pseudocode sketch of what the command does. Written by
+    /// the planner so the implementer can't fake the body. The validator
+    /// enforces a minimum length and uses [`anchors`] for cheap
+    /// substring assertions against the implemented body.
+    ///
+    /// Example:
+    /// ```text
+    /// 1. Decode payload into CreateTaskPayload.
+    /// 2. Generate id = format!("task-{}", current_time_unix_ms()).
+    /// 3. Persist via state.store().save_task(&rec).
+    /// 4. Return the persisted Task.
+    /// ```
+    ///
+    /// Forward-compatible default: older plans without this field
+    /// deserialise as empty — validate_backend_plan flags that.
+    #[serde(default)]
+    pub body_sketch: String,
+    /// 1-4 identifier-shaped substrings the implemented body MUST
+    /// contain. Anchors are the concrete contract between the plan and
+    /// the implementation: typically the entity name, the store method
+    /// being called, or a domain function the body must invoke.
+    /// Example: `["save_task", "current_time_unix_ms"]`. Empty falls
+    /// back to body_sketch identifier extraction.
+    #[serde(default)]
+    pub anchors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +569,27 @@ impl Default for BackendBudget {
     }
 }
 
+/// System floor for the backend budget, scaled by the canvas region
+/// count. The planner is free to **raise** these values in its own
+/// output; `validate_backend_plan` enforces the max of the plan's
+/// declared budget and this floor, so a "lazy" planner can't downgrade
+/// the targets below what the canvas demands.
+///
+/// Heuristic:
+/// - `min_commands = max(4, regions * 2)` — every region the user drew
+///   typically needs two commands (e.g. a create + a list per region).
+/// - `min_entities = max(1, regions / 2)` — multiple regions can share
+///   an entity, so we're conservative here.
+/// - `min_tests = max(3, regions)` — one test per region is the floor.
+pub fn budget_floor_for_regions(region_count: usize) -> BackendBudget {
+    let regions = region_count as u32;
+    BackendBudget {
+        min_entities: (regions / 2).max(1),
+        min_commands: (regions.saturating_mul(2)).max(4),
+        min_tests: regions.max(3),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FrontendSection {
@@ -314,6 +599,75 @@ pub struct FrontendSection {
     pub components: Vec<ComponentPlan>,
     #[serde(default)]
     pub budget: FrontendBudget,
+    /// Visual/layout intent for this iteration — the part of a NewApp's
+    /// design that was previously invisible to the reviewer and left to
+    /// the implementing agent's whim. See `DesignPlan` below.
+    #[serde(default)]
+    pub design: DesignPlan,
+}
+
+/// Explicit, reviewable design intent for the iteration: layout shape,
+/// density, any token re-values the plan commits to, and the planner's
+/// interpretation of ambiguous canvas marks. Written by `FrontendPlan`,
+/// read by `FrontendImpl` (which must realise `theme_overrides` in
+/// `app/ui/styles/app.css`) and rendered in the Lineage review UI
+/// alongside `openQuestions`.
+///
+/// Forward-compatible: every field is `#[serde(default)]` so plans written
+/// before this section existed still deserialise (all-empty DesignPlan),
+/// and `validate_frontend_plan` treats an empty `layoutPattern` as
+/// "legacy plan, not enforced" rather than a FAIL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignPlan {
+    /// One of: "stack" | "sidebar" | "grid" | "dashboard" | "split".
+    /// Empty string means the planner didn't commit to a pattern (legacy
+    /// plan or a deliberately unstructured page) — not validated in that
+    /// case.
+    #[serde(default)]
+    pub layout_pattern: String,
+    /// "comfortable" (default) | "compact". Empty defaults to comfortable
+    /// at the presentation layer; the validator does not require a value.
+    #[serde(default)]
+    pub density: String,
+    /// Token re-values this iteration commits to, each with a reason tied
+    /// back to the user's request or a canvas region. Every `token` must
+    /// be a name from `validators::REQUIRED_TOKEN_NAMES`; the implementer
+    /// realises these as a `:root { ... }` block at the top of
+    /// `app/ui/styles/app.css` (tokens.css itself is never edited).
+    #[serde(default)]
+    pub theme_overrides: Vec<TokenOverride>,
+    /// The planner's interpretation of ambiguous canvas marks — e.g. "a
+    /// red box usually means emphasis, not a literal red background".
+    /// Keeps that judgment call visible to the human reviewer instead of
+    /// buried in the implementing agent's head.
+    #[serde(default)]
+    pub visual_notes: Vec<RegionDesignNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenOverride {
+    /// CSS custom property name, e.g. `--accent`. Must be a member of
+    /// `validators::REQUIRED_TOKEN_NAMES`.
+    pub token: String,
+    /// The new value, e.g. `#7c3aed`. Free-form but scanned for
+    /// CSS/markup injection characters (`;`, `{`, `}`, `<`, newline).
+    pub value: String,
+    /// Why — tie back to user text or a region id, e.g. "user drew the
+    /// header purple (R2)".
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionDesignNote {
+    /// Canvas region id this note interprets, e.g. "R2".
+    pub region: String,
+    /// The planner's reading of what the mark means, e.g. "red box around
+    /// delete = destructive emphasis, not literal red bg".
+    pub interpretation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -377,6 +731,10 @@ pub struct E2EScenario {
     pub steps: Vec<String>,
     #[serde(default)]
     pub motivated_by_regions: Vec<String>,
+    /// Behaviour names (from `backend.behaviors`) whose *effect* this
+    /// scenario asserts — something the user didn't directly type.
+    #[serde(default)]
+    pub verifies_behaviors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -434,15 +792,15 @@ pub fn load_plan(job_dir: &Path) -> Result<Option<IterationPlan>, StoreError> {
     Ok(Some(plan))
 }
 
-/// Atomically write the plan to disk (tmp + rename) so a crash mid-write
-/// can't leave a half-written JSON behind.
+/// Atomically write the plan to disk (tmp + rename, via
+/// `fsutil::write_atomic`) so a crash mid-write can't leave a half-written
+/// JSON behind — the same primitive `store.rs` uses for feedback/lineage
+/// job records.
 pub fn save_plan(job_dir: &Path, plan: &IterationPlan) -> Result<PathBuf, StoreError> {
     std::fs::create_dir_all(job_dir)?;
     let final_path = job_dir.join(PLAN_FILENAME);
-    let tmp_path = job_dir.join(format!("{PLAN_FILENAME}.tmp"));
     let json = serde_json::to_string_pretty(plan)?;
-    std::fs::write(&tmp_path, json)?;
-    std::fs::rename(&tmp_path, &final_path)?;
+    crate::fsutil::write_atomic(&final_path, json.as_bytes())?;
     Ok(final_path)
 }
 
@@ -468,24 +826,57 @@ pub fn append_history(
 /// interpretation, no LLM — just connected-component-style clustering by
 /// bounding-box proximity.
 ///
-/// Input shape (what `canvas.rs` writes today):
+/// Input shape (what `canvas.rs` writes today — see `Shape::to_json`):
 /// - Each annotation is a JSON object with a geometric shape. We look for
-///   any of `bounds: {x, y, w, h}`, `points: [{x, y}, …]`, `x`+`y`+`w`+`h`
-///   at the top level, or a `text` field with `x`+`y`.
+///   any of `bounds: {x, y, w, h}`, `points: [[x, y], …]` or
+///   `points: [{x, y}, …]`, `from`/`to` endpoint pairs (line / arrow),
+///   `x`+`y`+`w`+`h` at the top level, or a `text` field with `x`+`y`.
 /// - A `stroke` / `color` / `strokeColor` field contributes the dominant
 ///   color.
 /// - A `text` field contributes a `labels[]` entry verbatim.
 ///
+/// canvas.rs stores coordinates as **normalised ratios (0..1)** so strokes
+/// re-render at any canvas size; region bboxes and the clustering pad are
+/// in **pixels**, so ratio-shaped annotations are scaled up by the
+/// viewport recorded with the feedback. Pixel-shaped inputs (hand-written
+/// fixtures, older records) are detected by extent and left untouched.
+///
 /// Unknown / unparseable shapes are skipped silently — this is a
 /// best-effort index, never the source of truth (the PNG is).
-pub fn extract_regions(annotations: &[serde_json::Value]) -> Vec<CanvasRegion> {
+pub fn extract_regions(
+    annotations: &[serde_json::Value],
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Vec<CanvasRegion> {
     let mut raw: Vec<RawAnnotation> = Vec::new();
     for ann in annotations {
-        if let Some(r) = parse_annotation(ann) {
+        if let Some(mut r) = parse_annotation(ann) {
+            scale_ratio_bbox(&mut r.bbox, viewport_width, viewport_height);
+            // Degenerate strokes (points, zero-size rects) still occupy at
+            // least one pixel so the overlap test has something to work on.
+            r.bbox[2] = r.bbox[2].max(1.0);
+            r.bbox[3] = r.bbox[3].max(1.0);
             raw.push(r);
         }
     }
     cluster(&raw)
+}
+
+/// Scale a bbox from normalised ratio space (0..1) to viewport pixels when
+/// it looks ratio-shaped. The clamp at 2.0 (not 1.0) tolerates strokes that
+/// run slightly off-canvas; anything larger is already in pixels.
+fn scale_ratio_bbox(bbox: &mut [f32; 4], viewport_width: u32, viewport_height: u32) {
+    if viewport_width == 0 || viewport_height == 0 {
+        return;
+    }
+    let looks_ratio =
+        bbox[0] >= -0.5 && bbox[1] >= -0.5 && bbox[0] + bbox[2] <= 2.0 && bbox[1] + bbox[3] <= 2.0;
+    if looks_ratio {
+        bbox[0] *= viewport_width as f32;
+        bbox[2] *= viewport_width as f32;
+        bbox[1] *= viewport_height as f32;
+        bbox[3] *= viewport_height as f32;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -529,7 +920,9 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
             label,
         });
     }
-    // Shape C: polyline / freehand with `points[]`.
+    // Shape C: polyline / freehand with `points[]`. canvas.rs `path`
+    // shapes serialise points as `[x, y]` arrays; tolerate `{x, y}`
+    // objects too (older fixtures and hand-written feedback).
     if let Some(points) = v.get("points").and_then(|p| p.as_array()) {
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;
@@ -537,9 +930,7 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
         let mut max_y = f32::MIN;
         let mut count = 0u32;
         for p in points {
-            let x = p.get("x").and_then(|n| n.as_f64()).map(|n| n as f32);
-            let y = p.get("y").and_then(|n| n.as_f64()).map(|n| n as f32);
-            if let (Some(x), Some(y)) = (x, y) {
+            if let Some((x, y)) = point_xy(p) {
                 min_x = min_x.min(x);
                 min_y = min_y.min(y);
                 max_x = max_x.max(x);
@@ -548,13 +939,19 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
             }
         }
         if count > 0 {
-            let bbox = [min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0)];
-            return Some(RawAnnotation {
-                bbox,
-                color,
-                label,
-            });
+            let bbox = [min_x, min_y, max_x - min_x, max_y - min_y];
+            return Some(RawAnnotation { bbox, color, label });
         }
+    }
+    // Shape E: line / arrow with `from` / `to` endpoint pairs.
+    if let (Some(from), Some(to)) = (
+        v.get("from").and_then(point_xy),
+        v.get("to").and_then(point_xy),
+    ) {
+        let min_x = from.0.min(to.0);
+        let min_y = from.1.min(to.1);
+        let bbox = [min_x, min_y, (from.0 - to.0).abs(), (from.1 - to.1).abs()];
+        return Some(RawAnnotation { bbox, color, label });
     }
     // Shape D: text note with just x/y.
     if let (Some(x), Some(y)) = (
@@ -562,7 +959,7 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
         v.get("y").and_then(|n| n.as_f64()),
     ) {
         return Some(RawAnnotation {
-            bbox: [x as f32, y as f32, 1.0, 1.0],
+            bbox: [x as f32, y as f32, 0.0, 0.0],
             color,
             label,
         });
@@ -570,21 +967,37 @@ fn parse_annotation(v: &serde_json::Value) -> Option<RawAnnotation> {
     None
 }
 
+/// Read one point as either a 2-element `[x, y]` array (what canvas.rs
+/// emits) or an `{x, y}` object.
+fn point_xy(p: &serde_json::Value) -> Option<(f32, f32)> {
+    if let Some(arr) = p.as_array() {
+        if arr.len() < 2 {
+            return None;
+        }
+        let x = arr[0].as_f64()?;
+        let y = arr[1].as_f64()?;
+        return Some((x as f32, y as f32));
+    }
+    let x = p.get("x").and_then(|n| n.as_f64())?;
+    let y = p.get("y").and_then(|n| n.as_f64())?;
+    Some((x as f32, y as f32))
+}
+
 fn read_xywh(v: &serde_json::Value) -> Option<[f32; 4]> {
     let x = v.get("x").and_then(|n| n.as_f64())?;
     let y = v.get("y").and_then(|n| n.as_f64())?;
+    // No minimum clamp here — ratio-shaped boxes (w/h in 0..1) must survive
+    // until `scale_ratio_bbox` has run; extract_regions clamps post-scale.
     let w = v
         .get("w")
         .or_else(|| v.get("width"))
         .and_then(|n| n.as_f64())
-        .unwrap_or(0.0)
-        .max(1.0);
+        .unwrap_or(0.0);
     let h = v
         .get("h")
         .or_else(|| v.get("height"))
         .and_then(|n| n.as_f64())
-        .unwrap_or(0.0)
-        .max(1.0);
+        .unwrap_or(0.0);
     Some([x as f32, y as f32, w as f32, h as f32])
 }
 
@@ -688,7 +1101,12 @@ fn cluster_bbox(members: &[usize], raws: &[RawAnnotation]) -> [f32; 4] {
         max_x = max_x.max(b[0] + b[2]);
         max_y = max_y.max(b[1] + b[3]);
     }
-    [min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0)]
+    [
+        min_x,
+        min_y,
+        (max_x - min_x).max(1.0),
+        (max_y - min_y).max(1.0),
+    ]
 }
 
 fn dominant_color(members: &[usize], raws: &[RawAnnotation]) -> Option<String> {
@@ -715,6 +1133,9 @@ pub fn owned_region_ids(plan: &IterationPlan) -> Vec<String> {
     for c in &plan.backend.commands {
         ids.extend(c.motivated_by_regions.iter().cloned());
     }
+    for b in &plan.backend.behaviors {
+        ids.extend(b.motivated_by_regions.iter().cloned());
+    }
     for r in &plan.frontend.routes {
         ids.extend(r.motivated_by_regions.iter().cloned());
     }
@@ -727,6 +1148,125 @@ pub fn owned_region_ids(plan: &IterationPlan) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// Words that mark a request as AI-shaped: the drawn app is about agents,
+/// assistants or model output, so its behaviour has to call a real model.
+const AI_SIGNAL_WORDS: &[&str] = &[
+    "agent",
+    "agents",
+    "assistant",
+    "assistants",
+    "ai",
+    "llm",
+    "llms",
+    "chatbot",
+    "copilot",
+    "gpt",
+    "claude",
+    "gemini",
+    "prompt",
+    "prompts",
+];
+
+/// AI-signal words found in the user's own words and the canvas labels.
+/// The planner's own `app.oneLiner` / `domain` count too, since it often
+/// names the domain the drawing implies ("multi-agent orchestration").
+pub fn ai_signals(plan: &IterationPlan) -> Vec<String> {
+    let mut corpus = String::new();
+    corpus.push_str(&plan.user_text);
+    corpus.push(' ');
+    if let Some(v) = &plan.voice_transcript {
+        corpus.push_str(v);
+        corpus.push(' ');
+    }
+    corpus.push_str(&plan.app.one_liner);
+    corpus.push(' ');
+    corpus.push_str(&plan.app.domain);
+    for region in &plan.canvas.regions {
+        for label in &region.labels {
+            corpus.push(' ');
+            corpus.push_str(label);
+        }
+    }
+    let mut found: Vec<String> = corpus
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|w| AI_SIGNAL_WORDS.contains(&w.as_str()))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Backstop for planners that bury a simulation guess in `openQuestions`
+/// instead of `backend.simulatedBehaviors`. Deliberately narrow: only
+/// wording that means *the app's behaviour is faked*. Generic words such as
+/// "placeholder", "stub" or "hardcoded" are excluded — they routinely
+/// describe legitimate assumptions ("generic placeholder thresholds",
+/// "hardcoded currency") and caused false pauses.
+const SIMULATION_PHRASES: &[&str] = &[
+    "simulated",
+    "simulate ",
+    "simulation",
+    "bookkeeping only",
+    "bookkeeping records",
+    "mocked",
+    "mock data",
+    "mock behavio",
+    "fake data",
+    "fake repl",
+    "faked",
+    "no real model",
+    "no real llm",
+    "no real execution",
+    "not actually run",
+    "canned repl",
+    "canned respons",
+];
+
+/// Open questions that assume a simulated / mocked app.
+pub fn simulation_assumptions(plan: &IterationPlan) -> Vec<String> {
+    plan.open_questions
+        .iter()
+        .filter(|q| {
+            let lower = q.to_ascii_lowercase();
+            SIMULATION_PHRASES.iter().any(|p| lower.contains(p))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Why this plan must stop for human review before implementation, if it
+/// must: the planner opted out of live behaviour, or assumed a simulation.
+pub fn plan_review_required_reason(plan: &IterationPlan) -> Option<String> {
+    if let Some(static_app) = &plan.backend.static_app {
+        return Some(format!(
+            "planner marked the app static (no live behaviour): {}",
+            static_app.reason.trim()
+        ));
+    }
+    let declared: Vec<&str> = plan
+        .backend
+        .simulated_behaviors
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !declared.is_empty() {
+        return Some(format!(
+            "planner wants to simulate behavior instead of building it — confirm before building: {}",
+            declared.join(" | ")
+        ));
+    }
+    let assumptions = simulation_assumptions(plan);
+    if !assumptions.is_empty() {
+        return Some(format!(
+            "planner assumed simulated behaviour — confirm before building: {}",
+            assumptions.join(" | ")
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -763,6 +1303,9 @@ mod tests {
             output: "Thing".into(),
             motivated_by_regions: vec!["R1".into()],
             summary: "Create a Thing".into(),
+            body_sketch: "1. Decode payload. 2. Generate id. 3. Save via store.save_thing. 4. Return."
+                .into(),
+            anchors: vec!["save_thing".into()],
         });
 
         save_plan(dir.path(), &plan).unwrap();
@@ -793,7 +1336,7 @@ mod tests {
             json!({"x": 25, "y": 15, "w": 20, "h": 20, "color": "#ff0000"}),
             json!({"x": 400, "y": 400, "w": 10, "h": 10, "color": "#00ff00"}),
         ];
-        let regions = extract_regions(&ann);
+        let regions = extract_regions(&ann, 1440, 900);
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].id, "R1");
         assert_eq!(regions[0].stroke_count, 2);
@@ -811,7 +1354,7 @@ mod tests {
             ],
             "color": "#0000ff"
         })];
-        let regions = extract_regions(&ann);
+        let regions = extract_regions(&ann, 1440, 900);
         assert_eq!(regions.len(), 1);
         let bbox = regions[0].bbox;
         assert!((bbox[0] - 100.0).abs() < 0.01);
@@ -824,7 +1367,7 @@ mod tests {
             json!({"x": 10, "y": 10, "w": 20, "h": 20, "text": "MISSING!"}),
             json!({"x": 15, "y": 12, "w": 20, "h": 20, "text": "FIX THIS"}),
         ];
-        let regions = extract_regions(&ann);
+        let regions = extract_regions(&ann, 1440, 900);
         assert_eq!(regions.len(), 1);
         assert!(regions[0].labels.contains(&"MISSING!".to_string()));
         assert!(regions[0].labels.contains(&"FIX THIS".to_string()));
@@ -832,8 +1375,101 @@ mod tests {
 
     #[test]
     fn extract_regions_empty_input_yields_empty() {
-        let regions = extract_regions(&[]);
+        let regions = extract_regions(&[], 1440, 900);
         assert!(regions.is_empty());
+    }
+
+    // --- Fixtures below mirror `Shape::to_json` in app/ui/src/canvas.rs
+    // verbatim: array-shaped points, from/to endpoints, and normalised
+    // ratio coordinates (0..1). These are the shapes real feedback
+    // submissions carry; regressions here silently gut the planner's
+    // region index (budget floor collapses to the minimum).
+
+    #[test]
+    fn extract_regions_parses_canvas_path_with_array_points() {
+        // Freehand pen stroke, exactly as canvas.rs serialises it.
+        let ann = vec![json!({
+            "type": "path",
+            "points": [[0.10, 0.20], [0.13, 0.24], [0.15, 0.25]],
+            "color": "#ef4444",
+            "width": 4.0
+        })];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(regions.len(), 1, "pen strokes must produce a region");
+        let bbox = regions[0].bbox;
+        assert!(
+            (bbox[0] - 144.0).abs() < 0.5,
+            "x scaled to pixels: {bbox:?}"
+        );
+        assert!(
+            (bbox[1] - 180.0).abs() < 0.5,
+            "y scaled to pixels: {bbox:?}"
+        );
+        assert!((bbox[2] - 72.0).abs() < 0.5, "w scaled to pixels: {bbox:?}");
+        assert!((bbox[3] - 45.0).abs() < 0.5, "h scaled to pixels: {bbox:?}");
+        assert_eq!(regions[0].dominant_color.as_deref(), Some("#ef4444"));
+    }
+
+    #[test]
+    fn extract_regions_parses_canvas_line_and_arrow_endpoints() {
+        let ann = vec![
+            json!({"type": "line", "from": [0.50, 0.50], "to": [0.60, 0.55], "color": "#22c55e", "width": 3.0}),
+            json!({"type": "arrow", "from": [0.58, 0.54], "to": [0.62, 0.60], "color": "#22c55e", "width": 3.0}),
+        ];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(
+            regions.len(),
+            1,
+            "overlapping line + arrow cluster into one region"
+        );
+        assert_eq!(regions[0].stroke_count, 2);
+        let bbox = regions[0].bbox;
+        assert!((bbox[0] - 720.0).abs() < 0.5, "from.x scaled: {bbox:?}");
+    }
+
+    #[test]
+    fn extract_regions_scales_ratio_rects_and_separates_distant_strokes() {
+        // Two rects far apart in ratio space (0.05 vs 0.85). Unscaled they
+        // would be 0.8 "pixels" apart — inside the 32 px clustering pad —
+        // and wrongly merge into one region. Scaled they are ~1150 px
+        // apart and must stay separate.
+        let ann = vec![
+            json!({"type": "rect", "x": 0.05, "y": 0.05, "w": 0.10, "h": 0.10, "color": "#ef4444", "width": 2.0}),
+            json!({"type": "rect", "x": 0.85, "y": 0.80, "w": 0.10, "h": 0.10, "color": "#3b82f6", "width": 2.0}),
+        ];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(
+            regions.len(),
+            2,
+            "distant ratio strokes must not cluster after scaling"
+        );
+        let bbox = regions[0].bbox;
+        assert!(
+            (bbox[2] - 144.0).abs() < 0.5,
+            "ratio width scaled: {bbox:?}"
+        );
+    }
+
+    #[test]
+    fn extract_regions_parses_canvas_text_shape() {
+        let ann = vec![json!({
+            "type": "text", "x": 0.30, "y": 0.40,
+            "text": "ADD A CHART HERE", "color": "#ef4444", "fontSize": 16.0
+        })];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].labels.contains(&"ADD A CHART HERE".to_string()));
+        assert!((regions[0].bbox[0] - 432.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn extract_regions_leaves_pixel_coordinates_unscaled() {
+        // Hand-written / legacy pixel annotations (coords > 2) pass through
+        // untouched even when a viewport is provided.
+        let ann = vec![json!({"x": 400, "y": 300, "w": 50, "h": 40, "color": "#ff0000"})];
+        let regions = extract_regions(&ann, 1440, 900);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].bbox, [400.0, 300.0, 50.0, 40.0]);
     }
 
     #[test]
@@ -907,6 +1543,114 @@ mod tests {
     }
 
     #[test]
+    fn templates_section_app_shape_round_trips() {
+        // New TemplatesSection fields (use_app_shape, backend_bindings)
+        // serialize and deserialize symmetrically, and survive a save +
+        // reload through the on-disk plan format.
+        let dir = tempdir().unwrap();
+        let mut plan = IterationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            app: AppIdentity {
+                name: "Demo".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        plan.templates.use_templates = vec!["sqlite".into()];
+        plan.templates.use_app_shape = Some("markdown_editor".into());
+        plan.templates
+            .backend_bindings
+            .insert("markdown_editor".into(), "sqlite".into());
+
+        save_plan(dir.path(), &plan).unwrap();
+        let back = load_plan(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            back.templates.use_app_shape.as_deref(),
+            Some("markdown_editor")
+        );
+        assert_eq!(
+            back.templates.backend_bindings.get("markdown_editor"),
+            Some(&"sqlite".to_string())
+        );
+        assert_eq!(back.templates.use_templates, vec!["sqlite".to_string()]);
+    }
+
+    #[test]
+    fn templates_section_tolerates_missing_app_shape_fields() {
+        // Older plans (written before use_app_shape / backend_bindings
+        // existed) decode cleanly: missing fields fall back to None /
+        // empty map, the rest of the section is preserved.
+        let raw = r#"{
+            "schemaVersion": 1,
+            "app": {"name": "Older"},
+            "stage": "backend_planned",
+            "canvas": {"route": "/"},
+            "templates": {
+                "useTemplates": ["openrouter"],
+                "declined": [{"name": "sqlite", "reason": "no relational data"}]
+            }
+        }"#;
+        let plan: IterationPlan = serde_json::from_str(raw).unwrap();
+        assert!(plan.templates.use_app_shape.is_none());
+        assert!(plan.templates.backend_bindings.is_empty());
+        assert_eq!(plan.templates.use_templates, vec!["openrouter".to_string()]);
+        assert_eq!(plan.templates.declined.len(), 1);
+    }
+
+    #[test]
+    fn design_plan_round_trips() {
+        let dir = tempdir().unwrap();
+        let mut plan = IterationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            app: AppIdentity {
+                name: "Demo".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        plan.frontend.design.layout_pattern = "sidebar".into();
+        plan.frontend.design.density = "compact".into();
+        plan.frontend.design.theme_overrides.push(TokenOverride {
+            token: "--accent".into(),
+            value: "#7c3aed".into(),
+            reason: "user drew the header purple (R2)".into(),
+        });
+        plan.frontend.design.visual_notes.push(RegionDesignNote {
+            region: "R2".into(),
+            interpretation: "red box around delete = destructive emphasis, not literal red bg"
+                .into(),
+        });
+
+        save_plan(dir.path(), &plan).unwrap();
+        let back = load_plan(dir.path()).unwrap().unwrap();
+        assert_eq!(back.frontend.design.layout_pattern, "sidebar");
+        assert_eq!(back.frontend.design.density, "compact");
+        assert_eq!(back.frontend.design.theme_overrides.len(), 1);
+        assert_eq!(back.frontend.design.theme_overrides[0].token, "--accent");
+        assert_eq!(back.frontend.design.visual_notes.len(), 1);
+        assert_eq!(back.frontend.design.visual_notes[0].region, "R2");
+    }
+
+    #[test]
+    fn design_plan_tolerates_legacy_plans_without_it() {
+        // Plans written before DesignPlan existed decode cleanly: the
+        // field is entirely absent from the JSON, not just empty.
+        let raw = r#"{
+            "schemaVersion": 1,
+            "app": {"name": "Older"},
+            "stage": "frontend_planned",
+            "canvas": {"route": "/"},
+            "frontend": {
+                "routes": [{"path": "/", "component": "Home"}],
+                "components": [{"name": "Home"}]
+            }
+        }"#;
+        let plan: IterationPlan = serde_json::from_str(raw).unwrap();
+        assert_eq!(plan.frontend.design, DesignPlan::default());
+        assert!(plan.frontend.design.layout_pattern.is_empty());
+    }
+
+    #[test]
     fn owned_region_ids_aggregates_across_sections() {
         let mut plan = IterationPlan::default();
         plan.backend.entities.push(EntityPlan {
@@ -923,5 +1667,233 @@ mod tests {
         });
         let ids = owned_region_ids(&plan);
         assert_eq!(ids, vec!["R1", "R2", "R3"]);
+    }
+
+    #[test]
+    fn plan_stage_canonical_strings_round_trip() {
+        // Canonical names. Critically, `e2e_planned` (NOT
+        // `e2_e_planned`) is the on-disk form going forward.
+        let pairs: &[(&str, PlanStage)] = &[
+            ("seeded", PlanStage::Seeded),
+            ("backend_planned", PlanStage::BackendPlanned),
+            ("backend_implemented", PlanStage::BackendImplemented),
+            ("frontend_planned", PlanStage::FrontendPlanned),
+            ("frontend_implemented", PlanStage::FrontendImplemented),
+            ("e2e_planned", PlanStage::E2EPlanned),
+            ("e2e_implemented", PlanStage::E2EImplemented),
+            ("completed", PlanStage::Completed),
+            ("failed", PlanStage::Failed),
+        ];
+        for (s, variant) in pairs {
+            let raw = format!("\"{s}\"");
+            let decoded: PlanStage =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{s} should decode: {e}"));
+            assert_eq!(decoded, *variant);
+            let encoded = serde_json::to_string(variant).unwrap();
+            assert_eq!(encoded, raw, "{:?} should re-encode to {s}", variant);
+        }
+    }
+
+    #[test]
+    fn plan_stage_tolerates_common_agent_typos() {
+        // The exact case that produced "reload plan: serde: unknown
+        // variant `planned`": an agent in a backend_plan stage wrote
+        // "planned" instead of "backend_planned". We now route it.
+        let cases: &[(&str, PlanStage)] = &[
+            ("planned", PlanStage::BackendPlanned),
+            ("backend_plan", PlanStage::BackendPlanned),
+            ("backendPlanned", PlanStage::BackendPlanned),
+            ("implemented", PlanStage::BackendImplemented),
+            ("backend_impl", PlanStage::BackendImplemented),
+            ("frontend_plan", PlanStage::FrontendPlanned),
+            ("frontend_impl", PlanStage::FrontendImplemented),
+            ("e2e_plan", PlanStage::E2EPlanned),
+            ("e2e_impl", PlanStage::E2EImplemented),
+            ("done", PlanStage::Completed),
+            ("complete", PlanStage::Completed),
+            ("ready", PlanStage::Completed),
+            ("final_review", PlanStage::Completed),
+            ("error", PlanStage::Failed),
+            ("rejected", PlanStage::Failed),
+        ];
+        for (raw, expected) in cases {
+            let v: PlanStage = serde_json::from_str(&format!("\"{raw}\""))
+                .unwrap_or_else(|e| panic!("{raw} should be aliased: {e}"));
+            assert_eq!(v, *expected, "alias `{raw}` should map to {:?}", expected);
+        }
+    }
+
+    #[test]
+    fn plan_stage_back_compat_for_old_e2_e_serialization() {
+        // Plans saved before the e2_e_* → e2e_* rename must still load.
+        let v: PlanStage = serde_json::from_str("\"e2_e_planned\"").unwrap();
+        assert_eq!(v, PlanStage::E2EPlanned);
+        let v: PlanStage = serde_json::from_str("\"e2_e_implemented\"").unwrap();
+        assert_eq!(v, PlanStage::E2EImplemented);
+    }
+
+    #[test]
+    fn plan_stage_still_rejects_outright_garbage() {
+        // Robustness is bounded — we only accept variants we can map
+        // to a real stage. A completely foreign value still errors so
+        // the runner sees the problem.
+        let bad = serde_json::from_str::<PlanStage>("\"totally_unknown_value\"");
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn plan_stage_load_survives_aliased_string_in_plan_json() {
+        // End-to-end: a plan.json with an aliased stage value loads via
+        // the full IterationPlan path (which is what `load_plan` does
+        // in stages.rs and is the path that previously crashed).
+        let raw = r#"{
+            "schemaVersion": 1,
+            "app": {"name": "Demo"},
+            "stage": "planned",
+            "canvas": {"pngPath": null, "annotationsPath": null, "route": "/"},
+            "backend": {},
+            "frontend": {},
+            "e2e": {}
+        }"#;
+        let plan: IterationPlan = serde_json::from_str(raw).unwrap();
+        assert_eq!(plan.stage, PlanStage::BackendPlanned);
+    }
+
+    #[test]
+    fn ai_signals_match_whole_words_only() {
+        let mut plan = IterationPlan {
+            user_text: "A travel planner with a chat ASSISTANT; maintain lists".into(),
+            ..Default::default()
+        };
+        assert_eq!(ai_signals(&plan), vec!["assistant".to_string()]);
+        plan.user_text = "Maintain a paid ledger".into();
+        assert!(
+            ai_signals(&plan).is_empty(),
+            "substrings like 'maintain'/'paid' must not match"
+        );
+        plan.canvas.regions.push(CanvasRegion {
+            id: "R1".into(),
+            bbox: [0.0; 4],
+            stroke_count: 1,
+            dominant_color: None,
+            labels: vec!["Agents".into()],
+        });
+        assert_eq!(ai_signals(&plan), vec!["agents".to_string()]);
+    }
+
+    #[test]
+    fn plan_review_reason_flags_static_apps_and_simulation_guesses() {
+        let mut plan = IterationPlan::default();
+        assert!(plan_review_required_reason(&plan).is_none());
+        plan.open_questions = vec!["Monthly or weekly totals? Assumed monthly.".into()];
+        assert!(plan_review_required_reason(&plan).is_none());
+        plan.open_questions
+            .push("Agents are bookkeeping records — assumed SIMULATED.".into());
+        assert!(plan_review_required_reason(&plan)
+            .unwrap()
+            .contains("simulated behaviour"));
+        plan.backend.static_app = Some(StaticAppJustification {
+            reason: "pure reference page".into(),
+        });
+        assert!(plan_review_required_reason(&plan)
+            .unwrap()
+            .contains("static"));
+    }
+
+    #[test]
+    fn ordinary_assumptions_do_not_trigger_plan_review() {
+        let plan = IterationPlan {
+            open_questions: vec![
+                "Auditorium compliance thresholds are generic placeholders, not a specific jurisdiction's code — which code should apply?".into(),
+                "Currency hardcoded to a single currency (integer cents). Correct?".into(),
+                "Stub the PDF export for now? Assumed a CSV export instead.".into(),
+                "Matches the mockup layout — sidebar on the left. Correct?".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(plan_review_required_reason(&plan), None);
+    }
+
+    #[test]
+    fn declared_simulated_behaviors_always_trigger_plan_review() {
+        let mut plan = IterationPlan::default();
+        plan.backend.simulated_behaviors = vec!["   ".into()];
+        assert_eq!(
+            plan_review_required_reason(&plan),
+            None,
+            "blank entries ignored"
+        );
+        plan.backend.simulated_behaviors =
+            vec!["agent replies: canned text until a model is chosen".into()];
+        assert!(plan_review_required_reason(&plan)
+            .unwrap()
+            .contains("simulate behavior"));
+    }
+
+    #[test]
+    fn answers_upsert_by_question_and_ignore_blanks() {
+        let mut plan = IterationPlan {
+            open_questions: vec![
+                "Currency single? Assumed USD.".into(),
+                "Auth: tokens?".into(),
+            ],
+            ..Default::default()
+        };
+        let n = record_answers(
+            &mut plan,
+            &[
+                (
+                    "Currency single? Assumed USD.".into(),
+                    "EUR, store a code".into(),
+                ),
+                ("Auth: tokens?".into(), "   ".into()),
+            ],
+            1,
+        );
+        assert_eq!(n, 1);
+        assert_eq!(
+            unanswered_open_questions(&plan),
+            vec!["Auth: tokens?".to_string()]
+        );
+        assert!(!plan_review_settled_by_answers(&plan));
+
+        // Re-answering replaces; whitespace/case differences still match.
+        record_answers(
+            &mut plan,
+            &[("currency  single? assumed USD.".into(), "USD".into())],
+            2,
+        );
+        assert_eq!(plan.answered_questions.len(), 1);
+        assert_eq!(plan.answered_questions[0].answer, "USD");
+
+        record_answers(
+            &mut plan,
+            &[("Auth: tokens?".into(), "yes, hashed".into())],
+            3,
+        );
+        assert!(plan_review_settled_by_answers(&plan));
+    }
+
+    #[test]
+    fn settled_requires_answers_and_no_forced_reason() {
+        let mut plan = IterationPlan::default();
+        assert!(
+            !plan_review_settled_by_answers(&plan),
+            "no answers = no settlement"
+        );
+        record_answers(&mut plan, &[("q".into(), "a".into())], 1);
+        assert!(plan_review_settled_by_answers(&plan));
+        plan.backend.simulated_behaviors = vec!["replies: canned".into()];
+        assert!(!plan_review_settled_by_answers(&plan));
+    }
+
+    #[test]
+    fn legacy_plans_without_behaviors_still_parse() {
+        let raw = r#"{"app": {"name": "x"}, "canvas": {}, "backend": {"commands": []},
+                      "e2e": {"scenarios": [{"id": "a", "title": "t", "steps": []}]}}"#;
+        let plan: IterationPlan = serde_json::from_str(raw).unwrap();
+        assert!(plan.backend.behaviors.is_empty());
+        assert!(plan.backend.static_app.is_none());
+        assert!(plan.e2e.scenarios[0].verifies_behaviors.is_empty());
     }
 }

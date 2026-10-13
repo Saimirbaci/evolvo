@@ -2,6 +2,8 @@
 
 Copy-in modules the NewApp agent can drop into `app/src-tauri/src/integrations/` (host) and `app/ui/src/integrations/` (UI). Each template is self-contained: a `README.md` with wiring instructions, `host.rs` with the Tauri commands, `ui.rs` with the Leptos helper, and `deps.toml` listing the Cargo dependencies to merge into the workspace.
 
+> Looking for whole-app scaffolds (an editor, a kanban board, a tabular grid)? See [`../app_shapes/`](../app_shapes/README.md). Integration templates are *capabilities* the NewApp pulls in; app-shape templates are *shapes* that wrap a UI + persistence contract around them. The two compose: an app-shape's `manifest.toml` `[backend_seams]` table lists the integrations that can replace its default backend.
+
 ## How the agent uses these
 
 1. Pick the templates the NewApp actually needs — don't copy all of them.
@@ -14,6 +16,7 @@ Copy-in modules the NewApp agent can drop into `app/src-tauri/src/integrations/`
 
 | Template | Purpose | Secret model |
 |---|---|---|
+| `claude_cli/` | Real model calls for the app's own behaviour (agents, replies, summaries) via the local `claude` CLI; `LlmEngine` seam + test engine | None — uses the user's Claude Code login |
 | `openrouter/` | Multi-model LLM chat (OpenAI, Anthropic, Gemini, …) with persistent sessions | API key via OS keyring |
 | `google_oauth/` | Google Sign-In via OAuth2 PKCE + loopback redirect; unlocks Gmail / Drive / Calendar | Refresh token in keyring; ships a dev `client_id` the user must swap |
 | `http_json/` | Thin `reqwest` wrapper for arbitrary REST APIs | Bearer token in keyring (optional) |

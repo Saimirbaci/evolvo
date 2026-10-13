@@ -191,9 +191,7 @@ async fn begin_recording(
     {
         let state = state.clone();
         let on_error = Closure::wrap(Box::new(move |_: Event| {
-            state
-                .status_message
-                .set(Some("Recording error".into()));
+            state.status_message.set(Some("Recording error".into()));
         }) as Box<dyn FnMut(Event)>);
         recorder.set_onerror(Some(on_error.as_ref().unchecked_ref()));
         on_error.forget();
@@ -255,9 +253,7 @@ fn finish_recording(state: VoiceState, chunks: Rc<RefCell<Vec<Blob>>>, mime: Str
             if let Some(data_url) = value.as_string() {
                 if let Some(b64) = data_url.split(',').nth(1) {
                     state_onload.base64.set(Some(b64.to_string()));
-                    state_onload
-                        .mime_type
-                        .set(Some(mime_onload.clone()));
+                    state_onload.mime_type.set(Some(mime_onload.clone()));
                     state_onload
                         .status_message
                         .set(Some("Voice note captured".into()));

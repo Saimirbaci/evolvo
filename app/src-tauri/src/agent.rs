@@ -1,7 +1,7 @@
 //! Per-CLI coding-agent backends.
 //!
 //! This module isolates every piece of knowledge that differs between the
-//! supported agent CLIs (Claude Code, Codex, Gemini, Forge) so the rest
+//! supported agent CLIs (Claude Code, Codex, Grok) so the rest
 //! of the runner can stay agent-agnostic.
 //!
 //! The selected agent lives on the `LineageJobRecord` so Retry / Resume
@@ -14,10 +14,10 @@
 //! 2. Add a concrete impl of [`AgentBackend`] below.
 //! 3. Extend [`backend_for`] to map the new variant.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::collections::HashMap;
 
 use crate::types::{AgentAvailability, AgentKind};
 
@@ -52,8 +52,10 @@ pub fn backend_for(kind: AgentKind) -> Box<dyn AgentBackend> {
     match kind {
         AgentKind::ClaudeCode => Box::new(ClaudeBackend),
         AgentKind::CodexCli => Box::new(CodexBackend),
-        AgentKind::GeminiCli => Box::new(GeminiBackend),
-        AgentKind::Forge => Box::new(ForgeBackend),
+        AgentKind::GrokCli => Box::new(GrokBackend),
+        // Retired agents: old jobs keep their recorded kind, but anything
+        // that would spawn them runs Claude Code instead.
+        AgentKind::GeminiCli | AgentKind::Forge => Box::new(ClaudeBackend),
     }
 }
 
@@ -61,13 +63,13 @@ pub fn backend_for(kind: AgentKind) -> Box<dyn AgentBackend> {
 /// Finder/Dock on macOS, which inherits a minimal PATH — without this list
 /// `which claude` would fail even when the CLI is installed under a common
 /// user-local prefix.
-fn enriched_path() -> String {
+pub(crate) fn enriched_path() -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         parts.push(format!("{home}/.cargo/bin"));
         parts.push(format!("{home}/.local/bin"));
         parts.push(format!("{home}/.bun/bin"));
-        parts.push(format!("{home}/.forge/bin"));
+        parts.push(format!("{home}/.grok/bin"));
         parts.push(format!("{home}/.volta/bin"));
         parts.push(format!("{home}/.nvm/versions/node/current/bin"));
         parts.push(format!("{home}/.npm-global/bin"));
@@ -156,71 +158,38 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Gemini CLI (Google). `gemini -p <prompt> --yolo` is the non-interactive
-/// form. Output is human-readable by default; unlike Claude/Codex there is
-/// no stable JSONL stream, so the log is a plain transcript.
-pub struct GeminiBackend;
+/// Grok Build CLI (xAI). `grok -p <prompt>` is the single-turn headless
+/// mode; `--always-approve` auto-approves tool calls (the same safety
+/// envelope as Claude's `--dangerously-skip-permissions` inside a lineage
+/// worktree) and `--output-format streaming-messages-json` streams NDJSON
+/// in the Anthropic Messages format, so `activity.rs` reads it like a
+/// Claude transcript. Grok loads AGENTS.md / CLAUDE.md only in folders the
+/// user trusted; Evolvo's prompts tell the agent to read the guide anyway.
+pub struct GrokBackend;
 
-impl AgentBackend for GeminiBackend {
+impl AgentBackend for GrokBackend {
     fn id(&self) -> AgentKind {
-        AgentKind::GeminiCli
+        AgentKind::GrokCli
     }
     fn binary(&self) -> &'static str {
-        "gemini"
+        "grok"
     }
     fn log_filename(&self) -> &'static str {
-        "gemini.log"
+        "grok.log"
     }
     fn context_files(&self) -> &'static [&'static str] {
-        &["GEMINI.md", "AGENTS.md"]
-    }
-
-    fn build_command(&self, prompt: &str, worktree: &Path) -> Command {
-        let mut cmd = Command::new(self.binary());
-        // `--skip-trust` suppresses the interactive "do you trust this
-        // workspace?" prompt that gemini-cli puts up the first time it
-        // runs in a directory it hasn't seen before. The lineage worktree
-        // is always a fresh path, so without this flag every run blocks on
-        // a TTY prompt and `--yolo` alone isn't enough — `--yolo` only
-        // disables tool-confirmation, not workspace trust.
-        cmd.arg("--yolo")
-            .arg("--skip-trust")
-            .arg("-p")
-            .arg(prompt)
-            .current_dir(worktree)
-            .env("PATH", enriched_path())
-            .stdin(Stdio::null());
-        cmd
-    }
-}
-
-/// ForgeCode (forgecode.dev). `forge -p <prompt>` runs a single
-/// non-interactive turn ("One-Shot CLI Mode" in the upstream README).
-/// Provider / model selection lives in `forge.yaml` at the worktree root
-/// or via `forge provider login` once per host. Forge picks up `AGENTS.md`
-/// as its project guide, the same convention Codex uses, so the runner's
-/// existing `AGENTS.md → CLAUDE.md` symlink continues to wire up the right
-/// context for free.
-pub struct ForgeBackend;
-
-impl AgentBackend for ForgeBackend {
-    fn id(&self) -> AgentKind {
-        AgentKind::Forge
-    }
-    fn binary(&self) -> &'static str {
-        "forge"
-    }
-    fn log_filename(&self) -> &'static str {
-        "forge.log"
-    }
-    fn context_files(&self) -> &'static [&'static str] {
-        &["AGENTS.md", "forge.yaml"]
+        &["AGENTS.md", "CLAUDE.md"]
     }
 
     fn build_command(&self, prompt: &str, worktree: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
         cmd.arg("-p")
             .arg(prompt)
+            .arg("--always-approve")
+            .arg("--cwd")
+            .arg(worktree)
+            .arg("--output-format")
+            .arg("streaming-messages-json")
             .current_dir(worktree)
             .env("PATH", enriched_path())
             .stdin(Stdio::null());
@@ -294,10 +263,7 @@ mod tests {
         let worktree = PathBuf::from("/tmp/worktree");
         let cmd = ClaudeBackend.build_command("hello", &worktree);
         assert_eq!(cmd.get_program(), "claude");
-        let args: Vec<&str> = cmd
-            .get_args()
-            .map(|s| s.to_str().unwrap_or(""))
-            .collect();
+        let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap_or("")).collect();
         assert_eq!(
             args,
             vec![
@@ -315,10 +281,7 @@ mod tests {
     fn codex_backend_uses_exec_json_and_bypass() {
         let cmd = CodexBackend.build_command("hi", Path::new("/tmp/w"));
         assert_eq!(cmd.get_program(), "codex");
-        let args: Vec<&str> = cmd
-            .get_args()
-            .map(|s| s.to_str().unwrap_or(""))
-            .collect();
+        let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap_or("")).collect();
         assert_eq!(
             args,
             vec![
@@ -331,25 +294,29 @@ mod tests {
     }
 
     #[test]
-    fn gemini_backend_uses_yolo_and_prompt() {
-        let cmd = GeminiBackend.build_command("hi", Path::new("/tmp/w"));
-        assert_eq!(cmd.get_program(), "gemini");
-        let args: Vec<&str> = cmd
-            .get_args()
-            .map(|s| s.to_str().unwrap_or(""))
-            .collect();
-        assert_eq!(args, vec!["--yolo", "--skip-trust", "-p", "hi"]);
+    fn grok_backend_runs_headless_with_messages_json() {
+        let cmd = GrokBackend.build_command("hi", Path::new("/tmp/w"));
+        assert_eq!(cmd.get_program(), "grok");
+        let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap_or("")).collect();
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "hi",
+                "--always-approve",
+                "--cwd",
+                "/tmp/w",
+                "--output-format",
+                "streaming-messages-json",
+            ]
+        );
     }
 
     #[test]
-    fn forge_backend_uses_prompt_flag() {
-        let cmd = ForgeBackend.build_command("hi", Path::new("/tmp/w"));
-        assert_eq!(cmd.get_program(), "forge");
-        let args: Vec<&str> = cmd
-            .get_args()
-            .map(|s| s.to_str().unwrap_or(""))
-            .collect();
-        assert_eq!(args, vec!["-p", "hi"]);
+    fn retired_agents_spawn_claude() {
+        for retired in [AgentKind::GeminiCli, AgentKind::Forge] {
+            assert_eq!(backend_for(retired).binary(), "claude");
+        }
     }
 
     #[test]

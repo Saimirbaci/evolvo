@@ -19,16 +19,24 @@
 //! The shell exposes `panel_open` via context so children can react to the
 //! Canvas overlay being open (e.g. to hide copy from a page screenshot).
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use send_wrapper::SendWrapper;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::canvas::{CanvasController, CanvasSurface};
-use crate::feedback_panel::FeedbackPanel;
+use crate::feedback_panel::{FeedbackPanel, FeedbackRevisionRequest};
 use crate::interop;
 use crate::toolbar::Toolbar;
-use crate::types::{AppHealth, LineageJobRecord, PreviewSummary};
+use crate::types::{
+    AppHealth, DesignPlan, FeedbackRecord, JobActivity, LineageJobRecord, LineageJobStatus,
+    PreviewSummary,
+};
 
 /// GitHub URL the "Star Us" nav shortcut opens. Update this if the repo
 /// moves. Kept as a constant rather than a build-time env var so the binary
@@ -93,6 +101,7 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
     let controller = CanvasController::new();
     let health: RwSignal<Option<AppHealth>> = RwSignal::new(None);
     let panel_open: RwSignal<bool> = RwSignal::new(false);
+    let revision_request: RwSignal<Option<FeedbackRevisionRequest>> = RwSignal::new(None);
 
     provide_context(PanelOpen(panel_open));
 
@@ -147,7 +156,13 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
 
             {move || match view_sig.get() {
                 View::Home => children().into_any(),
-                View::Lineage => view! { <LineagePage /> }.into_any(),
+                View::Lineage => view! {
+                    <LineagePage
+                        view_sig=view_sig
+                        panel_open=panel_open
+                        revision_request=revision_request
+                    />
+                }.into_any(),
             }}
 
             {move || {
@@ -157,16 +172,21 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
                             <Toolbar controller=ctrl_toolbar.clone() />
                             <CanvasSurface controller=ctrl_canvas.clone() />
                         </div>
-                        <FeedbackPanel
-                            controller=ctrl_panel.clone()
-                            route=route
-                            is_open=panel_open
-                        />
                     }.into_any()
                 } else {
                     view! { <span></span> }.into_any()
                 }
             }}
+
+            // Keep the editor mounted while closed so a partially edited
+            // multi-screen revision retains its draft and ancestry. The
+            // visible canvas overlay remains conditional above.
+            <FeedbackPanel
+                controller=ctrl_panel.clone()
+                route=route
+                is_open=panel_open
+                revision_request=revision_request
+            />
 
             <FeedbackFab controller=ctrl_fab.clone() is_open=panel_open />
         </div>
@@ -205,10 +225,7 @@ fn FeedbackFab(controller: CanvasController, is_open: RwSignal<bool>) -> impl In
             pill_expanded.set(false);
             pill_seen.set(true);
         });
-        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
-            cb.unchecked_ref(),
-            2500,
-        );
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(cb.unchecked_ref(), 2500);
     };
 
     view! {
@@ -299,7 +316,6 @@ fn FeedbackFabGlyphs() -> impl IntoView {
     }
 }
 
-
 #[derive(Copy, Clone)]
 pub struct LineageDetailState {
     pub fix_open: RwSignal<bool>,
@@ -339,10 +355,20 @@ impl LineageDetailState {
 }
 
 #[component]
-fn LineagePage() -> impl IntoView {
+fn LineagePage(
+    view_sig: RwSignal<View>,
+    panel_open: RwSignal<bool>,
+    revision_request: RwSignal<Option<FeedbackRevisionRequest>>,
+) -> impl IntoView {
     let items: RwSignal<Option<Result<Vec<LineageJobRecord>, String>>> = RwSignal::new(None);
-    let reload = RwSignal::new(0_u32);
+    // Live state arrives through Tauri events. This signal is reserved for
+    // initial loading and quiet recovery reconciliation.
+    let reconcile = RwSignal::new(0_u32);
+    let artifact_reload = RwSignal::new(0_u32);
     let selected: RwSignal<Option<String>> = RwSignal::new(None);
+    // Per-card delete: which job is showing its inline confirmation.
+    let confirm_delete: RwSignal<Option<String>> = RwSignal::new(None);
+    let deleting = RwSignal::new(false);
     // Sort order for the sidebar list. `true` = newest first (default), which
     // matches the user's mental model — recent work sits at the top.
     let newest_first: RwSignal<bool> = RwSignal::new(true);
@@ -354,19 +380,109 @@ fn LineagePage() -> impl IntoView {
     let action_success: RwSignal<Option<String>> = RwSignal::new(None);
     let detail_state = LineageDetailState::new();
     Effect::new(move |_: Option<()>| {
-        let _ = reload.get();
+        let _ = reconcile.get();
         spawn_local(async move {
             let result = interop::list_lineage_jobs().await;
-            items.set(Some(result));
+            match result {
+                Ok(records) => {
+                    // Do not invalidate the view when a safety pass returns
+                    // the same durable snapshot.
+                    let unchanged = matches!(
+                        items.get_untracked(),
+                        Some(Ok(existing)) if existing == records
+                    );
+                    if !unchanged {
+                        items.set(Some(Ok(records)));
+                    }
+                }
+                Err(error) => {
+                    // Preserve an already usable snapshot across transient
+                    // reconciliation errors. Initial-load failures still
+                    // render through the existing error state.
+                    if items.get_untracked().is_none() {
+                        items.set(Some(Err(error)));
+                    }
+                }
+            }
         });
     });
 
-    // Poll the backend every 2s so that (a) status changes driven by the
-    // background claude run surface without a user action and (b) edits made
-    // directly to the lineage_jobs JSON on disk are picked up without an app
-    // restart. The backend reads from disk on each call, so a simple reload
-    // bump is sufficient.
-    spawn_interval(reload, 2000);
+    // Register one set of listeners per mount. Each handle owns its JS
+    // callback and unlisten function, including the async-unmount race.
+    // `on_cleanup` is Send+Sync in Leptos even for CSR. These values are JS
+    // thread-affine, so SendWrapper documents and enforces same-thread access
+    // while allowing the cleanup registration to satisfy that API boundary.
+    let listeners: SendWrapper<Rc<RefCell<Vec<interop::TauriEventListener>>>> =
+        SendWrapper::new(Rc::new(RefCell::new(Vec::new())));
+    let disposed = SendWrapper::new(Rc::new(Cell::new(false)));
+    let seen_revisions = Rc::new(RefCell::new(HashMap::<String, u64>::new()));
+    {
+        let listeners = Rc::clone(&listeners);
+        let disposed = Rc::clone(&disposed);
+        let seen_revisions = Rc::clone(&seen_revisions);
+        spawn_local(async move {
+            let listener = interop::listen_lineage_job_upserted(move |event| {
+                let mut revisions = seen_revisions.borrow_mut();
+                let last = revisions.entry(event.job.id.clone()).or_default();
+                if event.revision <= *last {
+                    return;
+                }
+                *last = event.revision;
+                drop(revisions);
+                upsert_lineage_job(items, event.job);
+            })
+            .await;
+            if let Ok(listener) = listener {
+                if disposed.get() {
+                    drop(listener);
+                } else {
+                    listeners.borrow_mut().push(listener);
+                }
+            }
+        });
+    }
+    {
+        let listeners = Rc::clone(&listeners);
+        let disposed = Rc::clone(&disposed);
+        spawn_local(async move {
+            let listener = interop::listen_lineage_artifacts_changed(move |event| {
+                if selected.get_untracked().as_deref() == Some(event.job_id.as_str()) {
+                    artifact_reload.update(|value| *value = value.wrapping_add(1));
+                }
+            })
+            .await;
+            if let Ok(listener) = listener {
+                if disposed.get() {
+                    drop(listener);
+                } else {
+                    listeners.borrow_mut().push(listener);
+                }
+            }
+        });
+    }
+    {
+        let listeners = Rc::clone(&listeners);
+        let disposed = Rc::clone(&disposed);
+        spawn_local(async move {
+            let listener = interop::listen_lineage_snapshot_invalidated(move |_| {
+                reconcile.update(|value| *value = value.wrapping_add(1));
+            })
+            .await;
+            if let Ok(listener) = listener {
+                if disposed.get() {
+                    drop(listener);
+                } else {
+                    listeners.borrow_mut().push(listener);
+                }
+            }
+        });
+    }
+    on_cleanup(move || {
+        disposed.set(true);
+        listeners.borrow_mut().clear();
+    });
+
+    spawn_reconciliation(reconcile, 60_000);
 
     // Keep selection valid — if nothing selected but records exist, select the
     // first; if the selected id disappeared, fall back.
@@ -400,17 +516,15 @@ fn LineagePage() -> impl IntoView {
 
     let import_click = move |_| {
         let Some(win) = web_sys::window() else { return };
-        let Ok(Some(bundle_path)) = win.prompt_with_message(
-            "Path to .evolvo-bundle file:",
-        ) else {
+        let Ok(Some(bundle_path)) = win.prompt_with_message("Path to .evolvo-bundle file:") else {
             return;
         };
         if bundle_path.trim().is_empty() {
             return;
         }
-        let Ok(Some(target_root)) = win.prompt_with_message(
-            "Target workspace root for the new app (must be empty):",
-        ) else {
+        let Ok(Some(target_root)) =
+            win.prompt_with_message("Target workspace root for the new app (must be empty):")
+        else {
             return;
         };
         if target_root.trim().is_empty() {
@@ -479,8 +593,48 @@ fn LineagePage() -> impl IntoView {
                                         let id = r.id.clone();
                                         let id_for_click = id.clone();
                                         let is_active = move || selected.get().as_deref() == Some(&id);
+                                        // Delete is unavailable while an agent or merge
+                                        // is running on the job (the host refuses too).
+                                        let busy = matches!(
+                                            r.status,
+                                            LineageJobStatus::Implementing
+                                                | LineageJobStatus::Triaging
+                                                | LineageJobStatus::Merging
+                                        );
+                                        let ask_id = r.id.clone();
+                                        let confirm_id = r.id.clone();
+                                        let do_id = r.id.clone();
+                                        let confirming = move || confirm_delete.get().as_deref() == Some(confirm_id.as_str());
+                                        let confirming_btn = confirming.clone();
+                                        let delete_now = move |_| {
+                                            let id = do_id.clone();
+                                            deleting.set(true);
+                                            action_error.set(None);
+                                            spawn_local(async move {
+                                                match interop::delete_lineage_job(&id).await {
+                                                    Ok(summary) => {
+                                                        items.update(|items| {
+                                                            if let Some(Ok(list)) = items {
+                                                                list.retain(|j| j.id != id);
+                                                            }
+                                                        });
+                                                        if selected.get_untracked().as_deref() == Some(id.as_str()) {
+                                                            selected.set(None);
+                                                        }
+                                                        action_success.set(Some(format!(
+                                                            "Deleted {} — removed {}.",
+                                                            summary.job_id,
+                                                            summary.removed.join(", ")
+                                                        )));
+                                                    }
+                                                    Err(e) => action_error.set(Some(e)),
+                                                }
+                                                confirm_delete.set(None);
+                                                deleting.set(false);
+                                            });
+                                        };
                                         view! {
-                                            <li>
+                                            <li class="lineage-list-row">
                                                 <button
                                                     class="lineage-list-item"
                                                     class:active=is_active
@@ -496,6 +650,45 @@ fn LineagePage() -> impl IntoView {
                                         </div>
                                         <span class="list-card-status">{r.status.label()}</span>
                                                 </button>
+                                                <button
+                                                    class="lineage-delete-btn"
+                                                    class:active=confirming_btn
+                                                    prop:disabled=busy
+                                                    title=if busy {
+                                                        "Can't delete while the agent or a merge is running"
+                                                    } else {
+                                                        "Delete this job and everything under it"
+                                                    }
+                                                    aria-label="Delete lineage job"
+                                                    on:click=move |_| confirm_delete.set(Some(ask_id.clone()))
+                                                >
+                                                    <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">
+                                                        <path d="M9 3h6l1 2h4v2H4V5h4l1-2zm-3 6h12l-1 12H7L6 9zm4 2v8h2v-8h-2zm4 0v8h2v-8h-2z"/>
+                                                    </svg>
+                                                </button>
+                                                {move || confirming().then(|| {
+                                                    let delete_now = delete_now.clone();
+                                                    view! {
+                                                        <div class="lineage-delete-confirm" role="alertdialog" aria-label="Confirm delete">
+                                                            <span>"Delete this job, its worktree and branch, logs, and the feedback that created it? This can't be undone."</span>
+                                                            <div class="lineage-delete-actions">
+                                                                <button
+                                                                    class="btn btn-danger"
+                                                                    prop:disabled=move || deleting.get()
+                                                                    on:click=delete_now
+                                                                >
+                                                                    {move || if deleting.get() { "Deleting…" } else { "Delete" }}
+                                                                </button>
+                                                                <button
+                                                                    class="btn btn-ghost"
+                                                                    on:click=move |_| confirm_delete.set(None)
+                                                                >
+                                                                    "Cancel"
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    }
+                                                })}
                                             </li>
                                         }
                                     }).collect_view()}
@@ -536,7 +729,19 @@ fn LineagePage() -> impl IntoView {
                     let Some(record) = records.into_iter().find(|r| r.id == id) else {
                         return view! { <div class="empty-state">"No selection."</div> }.into_any();
                     };
-                    view! { <LineageDetail record=record reload=reload action_error=action_error action_success=action_success detail_state=detail_state /> }.into_any()
+                    view! {
+                        <LineageDetail
+                            record=record
+                            reload=reconcile
+                            artifact_reload=artifact_reload
+                            action_error=action_error
+                            action_success=action_success
+                            detail_state=detail_state
+                            view_sig=view_sig
+                            panel_open=panel_open
+                            revision_request=revision_request
+                        />
+                    }.into_any()
                 }}
             </section>
         </div>
@@ -547,14 +752,42 @@ fn LineagePage() -> impl IntoView {
 fn LineageDetail(
     record: LineageJobRecord,
     reload: RwSignal<u32>,
+    artifact_reload: RwSignal<u32>,
     // Surface for backend errors from Evolve / Reject / Run / Fix. Owned by
     // `LineagePage` so the message outlives this component's reconstruction
     // when `items` reloads right after an action fires.
     action_error: RwSignal<Option<String>>,
     action_success: RwSignal<Option<String>>,
     detail_state: LineageDetailState,
+    view_sig: RwSignal<View>,
+    panel_open: RwSignal<bool>,
+    revision_request: RwSignal<Option<FeedbackRevisionRequest>>,
 ) -> impl IntoView {
     let can_approve = record.status.can_approve();
+    // The primary action means different things per state: start the
+    // iteration (Pending), accept a paused plan (Planned + plan-review gate),
+    // or merge a finished build (BuildReady). Label it accordingly — the
+    // review banner tells the user to "Approve", so a button that only ever
+    // says "Evolve" reads as missing.
+    let awaiting_plan_approval = matches!(record.status, LineageJobStatus::Planned)
+        && record.pause_after_plan
+        && record.plan_approved_at_unix_ms.is_none();
+    let awaiting_merge = matches!(record.status, LineageJobStatus::BuildReady);
+    // Reviewer's draft answers to the planner's open questions, keyed by
+    // question text. Blank = accept the planner's guess.
+    let plan_answers: RwSignal<std::collections::HashMap<String, String>> =
+        RwSignal::new(std::collections::HashMap::new());
+    let collect_answers = move || -> Vec<crate::types::PlanAnswerPayload> {
+        plan_answers.with_untracked(|m| {
+            m.iter()
+                .filter(|(_, a)| !a.trim().is_empty())
+                .map(|(q, a)| crate::types::PlanAnswerPayload {
+                    question: q.clone(),
+                    answer: a.trim().to_string(),
+                })
+                .collect()
+        })
+    };
     let can_retry = record.status.can_retry();
     let can_run = record.status.can_run() && record.worktree_path.is_some();
     // Resume is offered when a multi-stage pipeline has progress on disk
@@ -574,6 +807,10 @@ fn LineageDetail(
     let run_id = record.id.clone();
     let resume_id = record.id.clone();
     let fork_id = record.id.clone();
+    let revise_request = FeedbackRevisionRequest {
+        feedback_id: record.feedback_id.clone(),
+        agent: record.agent,
+    };
 
     let fix_open = detail_state.fix_open;
     let fix_text = detail_state.fix_text;
@@ -631,6 +868,47 @@ fn LineageDetail(
         action_error.set(None);
         open_evolve_modal();
     };
+
+    // Plan review: save any typed answers, then either approve (build as
+    // planned + answers) or re-plan with them.
+    let answer_id = approve_id.clone();
+    let submit_plan_review = move |replan: bool| {
+        if evolve_submitting.get_untracked() {
+            return;
+        }
+        let answers = collect_answers();
+        if replan && answers.is_empty() {
+            action_error.set(Some(
+                "Type an answer to at least one question to re-plan — or Approve plan to accept the guesses."
+                    .into(),
+            ));
+            return;
+        }
+        evolve_submitting.set(true);
+        action_error.set(None);
+        let id = answer_id.clone();
+        spawn_local(async move {
+            let saved = if answers.is_empty() {
+                Ok(())
+            } else {
+                interop::answer_plan_questions(&id, answers, replan)
+                    .await
+                    .map(|_| ())
+            };
+            let result = match saved {
+                Ok(()) if !replan => interop::approve_lineage_job(&id).await.map(|_| ()),
+                other => other,
+            };
+            if let Err(e) = result {
+                action_error.set(Some(e));
+            } else {
+                plan_answers.set(std::collections::HashMap::new());
+            }
+            evolve_submitting.set(false);
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+    let replan_from_banner = submit_plan_review.clone();
     let do_reject = move || {
         let id = reject_id.clone();
         action_error.set(None);
@@ -641,6 +919,9 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
+    // Second handle for the plan-review "Reject plan" button; the original
+    // moves into the ⋯ menu closure.
+    let do_reject_plan = do_reject.clone();
     let do_run = move || {
         let id = run_id.clone();
         action_error.set(None);
@@ -650,7 +931,6 @@ fn LineageDetail(
             }
             reload.update(|v| *v = v.wrapping_add(1));
         });
-        schedule_reloads(reload, &[1500, 4000, 10_000]);
     };
     let do_fork = move || {
         // Operationalises product invariant I-P4 — bundle this lineage and
@@ -699,9 +979,6 @@ fn LineageDetail(
             }
             reload.update(|v| *v = v.wrapping_add(1));
         });
-        // The pipeline runs on a background thread; nudge the UI to pick up
-        // stage transitions as Claude advances.
-        schedule_reloads(reload, &[2000, 6000, 15_000, 30_000]);
     };
     let submit_fix = move || {
         if fix_submitting.get_untracked() {
@@ -727,6 +1004,29 @@ fn LineageDetail(
             reload.update(|v| *v = v.wrapping_add(1));
         });
     };
+    let feedback_record: RwSignal<Option<FeedbackRecord>> = RwSignal::new(None);
+    let do_revise = move || {
+        // Desktop feedback was drawn over another app's frozen screen —
+        // revise it in the desktop overlay over that same frame, not on
+        // Evolvo's own canvas where the screen it describes isn't visible.
+        let is_desktop = feedback_record
+            .get_untracked()
+            .is_some_and(|f| f.target_app.is_some());
+        if is_desktop {
+            let request = revise_request.clone();
+            spawn_local(async move {
+                if let Err(e) =
+                    interop::open_desktop_revision(&request.feedback_id, request.agent).await
+                {
+                    action_error.set(Some(e));
+                }
+            });
+            return;
+        }
+        revision_request.set(Some(revise_request.clone()));
+        view_sig.set(View::Home);
+        panel_open.set(true);
+    };
 
     let branch = record.branch_name.clone();
     let worktree = record.worktree_path.clone();
@@ -739,6 +1039,117 @@ fn LineageDetail(
     let created = format_time(record.created_at_unix_ms);
     let stages = record.stages.clone();
     let agent_label = record.agent.label();
+
+    let feedback_id = record.feedback_id.clone();
+    // Re-read on every lineage reload: an external app's repo resolution
+    // updates the feedback's `targetApp` (resolving → resolved/failed) while
+    // this detail stays open.
+    Effect::new(move |_| {
+        reload.track();
+        artifact_reload.track();
+        let feedback_id = feedback_id.clone();
+        spawn_local(async move {
+            if let Ok(Some(feedback)) = interop::load_feedback(&feedback_id).await {
+                feedback_record.set(Some(feedback));
+            }
+        });
+    });
+    // Live agent activity: refreshed when the watcher reports a log/worktree
+    // change for this job (artifact_reload) or the job record changes.
+    let activity: RwSignal<Option<JobActivity>> = RwSignal::new(None);
+    let activity_job_id = record.id.clone();
+    Effect::new(move |_| {
+        reload.track();
+        artifact_reload.track();
+        let id = activity_job_id.clone();
+        spawn_local(async move {
+            if let Ok(a) = interop::read_job_activity(&id).await {
+                activity.set(Some(a));
+            }
+        });
+    });
+    let repo_input: RwSignal<String> = RwSignal::new(String::new());
+    let repo_busy: RwSignal<bool> = RwSignal::new(false);
+    let resolve_job_id = record.id.clone();
+    let can_change_repo = matches!(
+        record.status,
+        LineageJobStatus::Pending | LineageJobStatus::Failed
+    );
+    let resolve_repo = move |repo: Option<String>| {
+        if repo_busy.get_untracked() {
+            return;
+        }
+        repo_busy.set(true);
+        action_error.set(None);
+        let id = resolve_job_id.clone();
+        spawn_local(async move {
+            match interop::resolve_target_repo(&id, repo.as_deref()).await {
+                Ok(_) => repo_input.set(String::new()),
+                Err(e) => action_error.set(Some(e)),
+            }
+            repo_busy.set(false);
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+
+    // Planner's open questions from plan.json — the guesses it recorded on
+    // ambiguous points. Most important while the job is parked in `Planned`
+    // by the plan-review gate, but shown whenever non-empty so the context
+    // survives into implementation. The scoped watcher refreshes this only
+    // when an artifact for the selected job changes.
+    let open_questions: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    // Answers the reviewer already gave in an earlier "Answer & re-plan".
+    let answered_questions: RwSignal<Vec<(String, String)>> = RwSignal::new(Vec::new());
+    // Planner's design intent — layout pattern, density, theme overrides,
+    // and its interpretation of ambiguous canvas marks. Lives at
+    // `plan.frontend.design` in the same plan.json payload as
+    // `openQuestions`; extracted from the raw JSON `Value` the same way
+    // (no new Tauri command — `read_job_plan` already returns the whole
+    // document).
+    let design_plan: RwSignal<DesignPlan> = RwSignal::new(DesignPlan::default());
+    let awaiting_plan_review = matches!(record.status, LineageJobStatus::Planned);
+    let plan_id = record.id.clone();
+    Effect::new(move |_| {
+        let _ = artifact_reload.get();
+        let id = plan_id.clone();
+        spawn_local(async move {
+            if let Ok(Some(plan)) = interop::read_job_plan(&id).await {
+                let qs: Vec<String> = plan
+                    .get("openQuestions")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|q| q.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                open_questions.set(qs);
+                let answered: Vec<(String, String)> = plan
+                    .get("answeredQuestions")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| {
+                                Some((
+                                    e.get("question")?.as_str()?.to_string(),
+                                    e.get("answer")?.as_str()?.to_string(),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                answered_questions.set(answered);
+
+                let design: DesignPlan = plan
+                    .get("frontend")
+                    .and_then(|f| f.get("design"))
+                    .and_then(|d| serde_json::from_value(d.clone()).ok())
+                    .unwrap_or_default();
+                design_plan.set(design);
+            }
+        });
+    });
 
     view! {
         <div class="lineage-detail-inner">
@@ -760,6 +1171,268 @@ fn LineageDetail(
             </header>
 
             <p class="lineage-detail-summary">{summary}</p>
+
+            // Desktop-overlay feedback about another application: which app it
+            // targets, where its source repo is (resolved automatically —
+            // local checkout or cloned upstream), and a manual override.
+            {move || feedback_record.get().and_then(|feedback| feedback.target_app).map(|app| {
+                let title = if app.window_title.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", app.window_title)
+                };
+                let (repo_line, unresolved) = match (app.repo_status.as_str(), app.repo_path.clone()) {
+                    ("resolving", _) => ("Finding the source repo… (see notes below)".to_string(), false),
+                    (_, Some(p)) => {
+                        let how = match app.repo_source.as_str() {
+                            "executable" => "next to the running app",
+                            "remembered" => "remembered",
+                            "local" => "local checkout",
+                            "cloned" => "cloned upstream",
+                            "user" => "chosen by you",
+                            _ => "resolved",
+                        };
+                        (format!("Source repo: {p} ({how})"), false)
+                    }
+                    ("failed", None) => (
+                        format!(
+                            "Source repo not found — {}",
+                            app.repo_error.clone().unwrap_or_else(|| "unknown error".into())
+                        ),
+                        true,
+                    ),
+                    _ => ("Source repo not resolved yet — Evolve finds it first".to_string(), true),
+                };
+                let upstream = app.repo_url.clone();
+                let resolving = app.repo_status == "resolving";
+                let use_repo = resolve_repo.clone();
+                let find_repo = resolve_repo.clone();
+                view! {
+                    <div class="lineage-target-card">
+                        <div>
+                            <span class="lineage-target-label">"External app"</span>
+                            <strong>{app.name}</strong>
+                            <span>{title}</span>
+                        </div>
+                        <span class="lineage-target-repo" class:lineage-target-unresolved=unresolved>
+                            {repo_line}
+                        </span>
+                        {upstream.map(|u| view! { <span class="lineage-target-note">{format!("Upstream: {u}")}</span> })}
+                        {(can_change_repo && !resolving).then(|| view! {
+                            <div class="lineage-target-actions">
+                                <input
+                                    class="input lineage-target-input"
+                                    type="text"
+                                    placeholder="Local path or https git URL"
+                                    aria-label="Source repo path or git URL"
+                                    prop:value=move || repo_input.get()
+                                    on:input=move |ev| repo_input.set(event_target_value(&ev))
+                                />
+                                <button
+                                    class="btn"
+                                    title="Use this local checkout or clone this URL as the app's source"
+                                    disabled=move || repo_busy.get() || repo_input.get().trim().is_empty()
+                                    on:click=move |_| use_repo(Some(repo_input.get_untracked()))
+                                >
+                                    "Use"
+                                </button>
+                                <button
+                                    class="btn btn-ghost"
+                                    title="Search local code folders and the web for this app's source, cloning it if needed"
+                                    disabled=move || repo_busy.get()
+                                    on:click=move |_| find_repo(None)
+                                >
+                                    "Find automatically"
+                                </button>
+                            </div>
+                        })}
+                    </div>
+                }
+            })}
+
+            {move || activity.get().filter(show_activity).map(|a| view! {
+                <ActivityPanel activity=a action_error=action_error reload=reload />
+            })}
+
+            {move || feedback_record.get().and_then(|feedback| {
+                let revision = feedback.revision;
+                if revision.number <= 1 && revision.superseded_by_feedback_id.is_none() {
+                    return None;
+                }
+                let ancestry = revision.parent_feedback_id
+                    .map(|parent| format!("Revision {} of {parent}", revision.number))
+                    .unwrap_or_else(|| format!("Original feedback · revision {}", revision.number));
+                Some(view! {
+                    <div class="lineage-revision-card">
+                        <strong>{ancestry}</strong>
+                        {revision.superseded_by_feedback_id.map(|next| view! {
+                            <span>{format!("Superseded by {next}")}</span>
+                        })}
+                    </div>
+                })
+            })}
+
+            {move || {
+                let qs = open_questions.get();
+                let answered = answered_questions.get();
+                if qs.is_empty() && answered.is_empty() {
+                    return view! { <span></span> }.into_any();
+                }
+                let class = if awaiting_plan_review {
+                    "plan-questions plan-questions-review"
+                } else {
+                    "plan-questions"
+                };
+                let hint = if awaiting_plan_approval {
+                    "The plan is paused for your review. Answer any question where the planner guessed wrong (leave it blank to accept the guess), then Answer & re-plan — or Approve plan to build it as planned."
+                } else if awaiting_plan_review {
+                    "The plan is paused for your review. These are the guesses the planner made on ambiguous points."
+                } else {
+                    "Guesses the planner recorded on ambiguous points in this iteration's plan."
+                };
+                let replan = replan_from_banner.clone();
+                view! {
+                    <section class=class aria-label="Planner's open questions">
+                        <h4>"Planner's open questions"</h4>
+                        <p class="plan-questions-hint">{hint}</p>
+                        <ul class="plan-questions-list">
+                            {qs.into_iter().enumerate().map(|(idx, q)| {
+                                let key = q.clone();
+                                let key_input = q.clone();
+                                let input_id = format!("plan-answer-{idx}");
+                                view! {
+                                    <li>
+                                        <span class="plan-question-text">{q}</span>
+                                        {awaiting_plan_approval.then(|| view! {
+                                            <textarea
+                                                id=input_id.clone()
+                                                class="input plan-answer"
+                                                rows="2"
+                                                maxlength="2000"
+                                                aria-label="Your answer (leave blank to accept the planner's guess)"
+                                                placeholder="Your answer — leave blank to accept the planner's guess"
+                                                prop:value=move || plan_answers.with(|m| m.get(&key).cloned().unwrap_or_default())
+                                                on:input=move |ev| {
+                                                    let value = event_target::<web_sys::HtmlTextAreaElement>(&ev).value();
+                                                    let key = key_input.clone();
+                                                    plan_answers.update(|m| {
+                                                        if value.trim().is_empty() {
+                                                            m.remove(&key);
+                                                        } else {
+                                                            m.insert(key, value);
+                                                        }
+                                                    });
+                                                }
+                                            ></textarea>
+                                        })}
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ul>
+                        {(!answered.is_empty()).then(|| view! {
+                            <details class="plan-answered" open=awaiting_plan_approval>
+                                <summary>{format!("Your earlier answers ({})", answered.len())}</summary>
+                                <ul class="plan-questions-list">
+                                    {answered.into_iter().map(|(q, a)| view! {
+                                        <li>
+                                            <span class="plan-question-text">{q}</span>
+                                            <span class="plan-answer-given">{a}</span>
+                                        </li>
+                                    }).collect_view()}
+                                </ul>
+                            </details>
+                        })}
+                        {awaiting_plan_approval.then(|| {
+                            let replan = replan.clone();
+                            view! {
+                                <div class="plan-answer-actions">
+                                    <span class="plan-answer-count">
+                                        {move || {
+                                            let n = plan_answers.with(|m| m.len());
+                                            if n == 0 {
+                                                "No answers yet".to_string()
+                                            } else {
+                                                format!("{n} answered")
+                                            }
+                                        }}
+                                    </span>
+                                    <button
+                                        class="secondary-btn plan-replan-btn"
+                                        prop:disabled=move || evolve_submitting.get() || plan_answers.with(|m| m.is_empty())
+                                        title="Re-run the planner with your answers. It continues straight into implementation if nothing is left to decide, otherwise it pauses here again."
+                                        on:click=move |_| replan(true)
+                                    >
+                                        {move || if evolve_submitting.get() { "Working…" } else { "Answer & re-plan" }}
+                                    </button>
+                                </div>
+                            }
+                        })}
+                    </section>
+                }.into_any()
+            }}
+
+            {move || {
+                let design = design_plan.get();
+                if design.is_empty() {
+                    return view! { <span></span> }.into_any();
+                }
+                let layout_badge = if design.layout_pattern.is_empty() {
+                    None
+                } else {
+                    Some(design.layout_pattern.clone())
+                };
+                let density_badge = if design.density.is_empty() {
+                    None
+                } else {
+                    Some(design.density.clone())
+                };
+                view! {
+                    <section class="plan-design" aria-label="Planner's design intent">
+                        <h4>"Design"</h4>
+                        {move || {
+                            if layout_badge.is_none() && density_badge.is_none() {
+                                return view! { <span></span> }.into_any();
+                            }
+                            view! {
+                                <div class="plan-design-badges">
+                                    {layout_badge.clone().map(|p| view! {
+                                        <span class="badge badge-accent">{p}</span>
+                                    })}
+                                    {density_badge.clone().map(|d| view! {
+                                        <span class="badge">{d}</span>
+                                    })}
+                                </div>
+                            }.into_any()
+                        }}
+                        {(!design.theme_overrides.is_empty()).then(|| view! {
+                            <ul class="plan-design-tokens">
+                                {design.theme_overrides.iter().cloned().map(|ov| {
+                                    let reason = if ov.reason.is_empty() {
+                                        None
+                                    } else {
+                                        Some(view! { <span class="plan-design-reason">{format!(" — {}", ov.reason)}</span> })
+                                    };
+                                    view! {
+                                        <li>
+                                            <code>{ov.token}</code>
+                                            " → "
+                                            <code>{ov.value}</code>
+                                            {reason}
+                                        </li>
+                                    }
+                                }).collect_view()}
+                            </ul>
+                        })}
+                        {(!design.visual_notes.is_empty()).then(|| view! {
+                            <ul class="plan-design-notes">
+                                {design.visual_notes.iter().cloned().map(|n| view! {
+                                    <li><strong>{n.region}</strong>{": "}{n.interpretation}</li>
+                                }).collect_view()}
+                            </ul>
+                        })}
+                    </section>
+                }.into_any()
+            }}
 
             {match branch {
                 Some(b) => view! {
@@ -873,6 +1546,14 @@ fn LineageDetail(
             }}
 
             <div class="lineage-detail-actions">
+                <button
+                    class="secondary-btn"
+                    on:click=move |_| do_revise()
+                    aria-label="Revise this feedback on the canvas"
+                    title="Restore this iteration's drawing as a new immutable feedback revision"
+                >
+                    "Revise on Canvas"
+                </button>
                 // Secondary: Run — preview the current iteration's app.
                 <button
                     class="secondary-btn"
@@ -963,17 +1644,66 @@ fn LineageDetail(
                     }}
                 </div>
 
-                // Primary: Evolve — gated behind the dry-run modal so the
-                // reviewer sees what's about to happen before committing.
-                <button
-                    class="primary-btn lineage-evolve-btn"
-                    prop:disabled=!can_approve
-                    on:click=move |_| do_approve()
-                    aria-label="Evolve — plan and implement the next iteration"
-                    title="Preview, then plan & implement the next iteration from this feedback"
-                >
-                    "Evolve"
-                </button>
+                // Plan review: Reject sits next to Approve (it's otherwise
+                // buried in the ⋯ menu) so both answers to the banner's
+                // question are one click away.
+                {
+                    let do_reject = do_reject_plan.clone();
+                    awaiting_plan_approval.then(|| view! {
+                        <button
+                            class="secondary-btn lineage-reject-plan-btn"
+                            on:click=move |_| do_reject()
+                            aria-label="Reject this plan"
+                            title="Reject — stops this job for good. Resubmit the feedback with answers to the open questions."
+                        >
+                            "Reject plan"
+                        </button>
+                    })
+                }
+
+                // Primary action. Starting an iteration goes through the
+                // dry-run modal so the reviewer sees what's about to happen;
+                // approving a paused plan is a direct click — the plan and
+                // its open questions are already on screen.
+                {
+                    let submit_plan_review = submit_plan_review.clone();
+                    let (label, aria, title) = if awaiting_plan_approval {
+                        (
+                            "Approve plan",
+                            "Approve the plan and start implementation",
+                            "Start implementing — with your answers where you gave them, the planner's guesses elsewhere",
+                        )
+                    } else if awaiting_merge {
+                        (
+                            "Approve & merge",
+                            "Approve the build and merge it into the source repo",
+                            "Preview, then merge this iteration's branch into the source repo (checks run after merge; rolled back on failure)",
+                        )
+                    } else {
+                        (
+                            "Evolve",
+                            "Evolve — plan and implement the next iteration",
+                            "Preview, then plan & implement the next iteration from this feedback",
+                        )
+                    };
+                    view! {
+                        <button
+                            class="primary-btn lineage-evolve-btn"
+                            prop:disabled=move || !can_approve || evolve_submitting.get()
+                            on:click=move |_| {
+                                if awaiting_plan_approval {
+                                    submit_plan_review(false);
+                                } else {
+                                    do_approve();
+                                }
+                            }
+                            aria-label=aria
+                            title=title
+                        >
+                            {move || if awaiting_plan_approval && evolve_submitting.get() { "Approving…" } else { label }}
+                        </button>
+                    }
+                }
             </div>
 
             {move || {
@@ -1022,19 +1752,17 @@ fn EvolveConfirmation(
             return;
         }
         let close_kbd = close_for_kbd.clone();
-        let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-            move |ev: web_sys::KeyboardEvent| {
+        let cb =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
                 if !is_open.get_untracked() {
                     return;
                 }
                 if ev.key() == "Escape" {
                     close_kbd();
                 }
-            },
-        );
+            });
         if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-            let _ = doc
-                .add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+            let _ = doc.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
         }
         cb.forget();
     });
@@ -1156,54 +1884,204 @@ fn EvolveConfirmation(
     }
 }
 
+/// Worth showing once there is something to show: a run in progress,
+/// transcript lines, or changes on disk.
+fn show_activity(a: &JobActivity) -> bool {
+    a.running || !a.events.is_empty() || !a.changed_files.is_empty()
+}
+
+fn format_duration(ms: u64) -> String {
+    let mins = ms / 60_000;
+    if mins >= 60 {
+        format!("{}h {}m", mins / 60, mins % 60)
+    } else if mins >= 1 {
+        format!("{mins}m")
+    } else {
+        format!("{}s", ms / 1000)
+    }
+}
+
+/// Phase stepper + "now" line + recent agent actions + changed files.
+#[component]
+fn ActivityPanel(
+    activity: JobActivity,
+    action_error: RwSignal<Option<String>>,
+    reload: RwSignal<u32>,
+) -> impl IntoView {
+    let stop_job_id = activity.job_id.clone();
+    let stop = move |_| {
+        let id = stop_job_id.clone();
+        spawn_local(async move {
+            if let Err(e) = interop::stop_lineage_run(&id).await {
+                action_error.set(Some(e));
+            }
+            reload.update(|v| *v = v.wrapping_add(1));
+        });
+    };
+    let app_running = activity.app_running;
+    let now = js_sys::Date::now() as u64;
+    let timing = match (
+        activity.duration_ms,
+        activity.started_at_unix_ms,
+        activity.running,
+    ) {
+        (Some(d), _, false) => Some(format!("Agent took {}", format_duration(d))),
+        (_, Some(start), true) => Some(format!(
+            "Running for {}",
+            format_duration(now.saturating_sub(start))
+        )),
+        _ => None,
+    };
+    let cost = activity.cost_usd.map(|c| format!("${c:.2}"));
+    let meta = [timing, cost]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let running = activity.running;
+    let now_line = activity.current.clone().filter(|_| running);
+    let events_count = activity.events.len();
+    let files_count = activity.changed_files.len();
+    // Newest first: the reader cares about what just happened.
+    let events: Vec<_> = activity.events.iter().rev().cloned().collect();
+    let files = activity.changed_files.clone();
+    view! {
+        <section class="activity-panel" aria-label="Agent activity">
+            <div class="activity-head">
+                <strong>{if running { "Agent activity · live" } else { "Agent activity" }}</strong>
+                <span class="activity-meta">{meta}</span>
+            </div>
+            <ol class="activity-steps">
+                {activity.phases.into_iter().map(|p| {
+                    let class = format!("activity-step activity-step-{}", p.state);
+                    view! { <li class=class>{p.label}</li> }
+                }).collect_view()}
+            </ol>
+            {now_line.map(|line| view! {
+                <div class="activity-now" role="status">
+                    <span class="activity-pulse" aria-hidden="true"></span>
+                    <span>{line}</span>
+                </div>
+            })}
+            {app_running.then(|| view! {
+                <div class="activity-now activity-app-running" role="status">
+                    <span class="activity-pulse" aria-hidden="true"></span>
+                    <span>"The new version is running — try your change."</span>
+                    <button
+                        class="btn btn-ghost activity-stop"
+                        title="Stop the version Evolvo launched for this job"
+                        on:click=stop
+                    >
+                        "Stop"
+                    </button>
+                </div>
+            })}
+            {(events_count > 0).then(|| view! {
+                <details class="activity-section" open=running>
+                    <summary>{format!("Recent steps ({events_count})")}</summary>
+                    <ul class="activity-feed">
+                        {events.into_iter().map(|e| {
+                            let icon = match (e.kind.as_str(), e.tool.as_deref()) {
+                                ("message", _) => "💬",
+                                ("result", _) => "✓",
+                                (_, Some("Edit" | "MultiEdit" | "Write" | "NotebookEdit")) => "✎",
+                                (_, Some("Bash")) => "▸",
+                                (_, Some("Read" | "Grep" | "Glob")) => "◎",
+                                (_, Some("WebSearch" | "WebFetch")) => "🌐",
+                                _ => "·",
+                            };
+                            let class = format!("activity-item activity-item-{}", e.kind);
+                            view! {
+                                <li class=class>
+                                    <span class="activity-icon" aria-hidden="true">{icon}</span>
+                                    <span>{e.text}</span>
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                </details>
+            })}
+            {(files_count > 0).then(|| view! {
+                <details class="activity-section">
+                    <summary>{format!("Changed files ({files_count})")}</summary>
+                    <ul class="activity-files">
+                        {files.into_iter().map(|f| view! { <li><code>{f}</code></li> }).collect_view()}
+                    </ul>
+                </details>
+            })}
+        </section>
+    }
+}
+
 fn format_time(ms: u64) -> String {
     let date = js_sys::Date::new(&JsValue::from_f64(ms as f64));
     String::from(date.to_iso_string())
 }
 
-/// Bump `reload` on a fixed interval until the component unmounts. Used by
-/// `LineagePage` so that (a) status changes from the background claude run
-/// surface without user action and (b) manual edits to `lineage_jobs/*.json`
-/// on disk are picked up without an app restart. `setInterval` keeps firing
-/// forever unless we clear it, so register an `on_cleanup` to stop when the
-/// Lineage view is unmounted.
-fn spawn_interval(reload: RwSignal<u32>, interval_ms: i32) {
+fn upsert_lineage_job(
+    items: RwSignal<Option<Result<Vec<LineageJobRecord>, String>>>,
+    incoming: LineageJobRecord,
+) {
+    let next = match items.get_untracked() {
+        Some(Ok(mut records)) => {
+            if let Some(existing) = records.iter_mut().find(|record| record.id == incoming.id) {
+                // Filesystem watcher events can duplicate the immediate
+                // persistence event. They can also arrive after a newer
+                // write, so never regress a record by timestamp.
+                if incoming.updated_at_unix_ms < existing.updated_at_unix_ms
+                    || existing == &incoming
+                {
+                    return;
+                }
+                *existing = incoming;
+            } else {
+                records.push(incoming);
+            }
+            records
+        }
+        _ => vec![incoming],
+    };
+    items.set(Some(Ok(next)));
+}
+
+/// Reconcile on focus and every 60 seconds as a missed-event safety net.
+/// Equality checking in the loader means an unchanged pass does not touch the
+/// rendered tree. Both browser callbacks are owned until component cleanup;
+/// unlike the old poller this leaves no leaked closures across route mounts.
+fn spawn_reconciliation(reload: RwSignal<u32>, interval_ms: i32) {
     let Some(win) = web_sys::window() else {
         return;
     };
-    let cb = Closure::<dyn FnMut()>::new(move || {
+
+    let interval_cb = Closure::<dyn FnMut()>::new(move || {
         reload.update(|v| *v = v.wrapping_add(1));
     });
     let handle = win
         .set_interval_with_callback_and_timeout_and_arguments_0(
-            cb.as_ref().unchecked_ref(),
+            interval_cb.as_ref().unchecked_ref(),
             interval_ms,
         )
         .ok();
-    // The closure must outlive the interval; `forget` leaks it for the life
-    // of the page (one per LineagePage mount — bounded).
-    cb.forget();
-    on_cleanup(move || {
-        if let Some(h) = handle {
-            if let Some(win) = web_sys::window() {
-                win.clear_interval_with_handle(h);
-            }
-        }
-    });
-}
 
-/// Bump `reload` after each delay (ms). Used to surface asynchronous lineage
-/// notes (e.g. the Run button's background-thread spawn result) without
-/// requiring the user to navigate away and back.
-fn schedule_reloads(reload: RwSignal<u32>, delays_ms: &[i32]) {
-    let Some(win) = web_sys::window() else {
-        return;
-    };
-    for &ms in delays_ms {
-        let r = reload;
-        let cb = Closure::once_into_js(move || {
-            r.update(|v| *v = v.wrapping_add(1));
-        });
-        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(cb.unchecked_ref(), ms);
-    }
+    let focus_reload = reload;
+    let focus_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        focus_reload.update(|v| *v = v.wrapping_add(1));
+    });
+    let focus_installed = win
+        .add_event_listener_with_callback("focus", focus_cb.as_ref().unchecked_ref())
+        .is_ok();
+
+    let cleanup = SendWrapper::new((win, handle, focus_installed, interval_cb, focus_cb));
+    on_cleanup(move || {
+        let (win, handle, focus_installed, interval_cb, focus_cb) = cleanup.take();
+        if let Some(h) = handle {
+            win.clear_interval_with_handle(h);
+        }
+        if focus_installed {
+            let _ =
+                win.remove_event_listener_with_callback("focus", focus_cb.as_ref().unchecked_ref());
+        }
+        drop(interval_cb);
+        drop(focus_cb);
+    });
 }

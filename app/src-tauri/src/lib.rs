@@ -1,13 +1,28 @@
+pub mod activity;
 pub mod agent;
+pub mod apprun;
 pub mod bundle;
 pub mod commands;
+pub mod concurrency;
+pub mod deletion;
+pub mod designs;
+pub mod desktop;
+pub mod external;
+pub mod fsutil;
 pub mod lineage;
+pub mod lineage_events;
+pub mod notify;
 pub mod plan;
+pub mod proc;
+pub mod promotion;
 pub mod runner;
+pub mod sketch;
 pub mod stages;
 pub mod state;
 pub mod store;
+pub mod tray;
 pub mod types;
+pub mod validate_cli;
 pub mod validators;
 
 pub use agent::{backend_for, AgentBackend};
@@ -15,7 +30,8 @@ pub use lineage::{LineageEngine, Transition};
 pub use state::AppState;
 pub use store::{default_workspace_root, Store, StoreError, WorkspaceLayout};
 pub use types::{
-    current_time_unix_ms, AgentAvailability, AgentKind, AppHealth, EntityIdPayload,
-    FeedbackRecord, FeedbackStatus, FeedbackType, LineageJobRecord, LineageJobStatus,
-    PreviewSummary, StageKind, StageState, StageStatus, SubmitFeedbackPayload,
+    current_time_unix_ms, AgentAvailability, AgentKind, AppHealth, EditableFeedback,
+    EditableFeedbackScreen, EntityIdPayload, FeedbackRecord, FeedbackRevision, FeedbackStatus,
+    FeedbackType, LineageJobRecord, LineageJobStatus, PreviewSummary, StageKind, StageState,
+    StageStatus, SubmitFeedbackPayload, TargetApp,
 };

@@ -1,0 +1,45 @@
+# See ../SCHEMA.md for the full schema.
+[template]
+name = "kanban_board"
+description = "Three-column kanban (Todo / Doing / Done) with draggable cards."
+tags = ["task-tracking", "board", "drag-and-drop", "project-management"]
+
+[layout]
+host_module = "app/src-tauri/src/app_shapes/kanban_board.rs"
+register_in = "app/src-tauri/src/lib.rs"
+ui_app      = "app/ui/src/app_shape_kanban_board.rs"
+ui_modules  = []
+styles_file = "app/ui/styles.css"
+
+[data_interface]
+default      = "json_store"
+storage_path = "kanban_board"
+
+  [data_interface.entity]
+  name   = "BoardState"
+  # The whole board is one document. Cards live inside it, keyed by id.
+  fields = [
+    { name = "version",   ty = "u32",         required = true },
+    { name = "columns",   ty = "Vec<Column>", required = true },
+    { name = "updatedAt", ty = "u64",         required = true },
+  ]
+
+  [data_interface.commands]
+  list   = "list_boards"          # () -> Vec<BoardState>      (single-element list today)
+  load   = "load_board"           # () -> BoardState           (no id — there's one board)
+  save   = "save_board"           # SaveBoardPayload -> BoardState
+  delete = "reset_board"          # () -> bool                 (reset to default columns)
+
+[backend_seams]
+sqlite       = "Replace JsonBoardStore with a sqlite-backed store: one row per board (singleton key 'default'), one row per card. Adapter at templates/integrations/sqlite/seam_kanban_board.rs (write when binding is selected)."
+http_json    = "Proxy CRUD to a remote REST API at <base>/board, <base>/cards. Useful for multi-device sync."
+
+[fill_markers]
+required = [
+  "FILL: card-level domain fields",
+  "FILL: column customisation",
+]
+optional = [
+  "FILL: keyboard shortcuts",
+  "FILL: per-column WIP limits",
+]
